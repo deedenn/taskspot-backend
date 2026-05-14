@@ -36,7 +36,7 @@ function createInvitationExpiresAt() {
 }
 
 function frontendUrl() {
-  return process.env.CLIENT_URL || "http://localhost:5173";
+  return process.env.CLIENT_URL || (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://localhost:5173");
 }
 
 function invitationUrl(token) {

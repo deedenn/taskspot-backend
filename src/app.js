@@ -11,9 +11,13 @@ import { tasksRouter } from "./routes/tasks.js";
 
 export function createApp() {
   const app = express();
-  const clientUrl = process.env.CLIENT_URL || "http://127.0.0.1:5173";
+  const clientUrl =
+    process.env.CLIENT_URL ||
+    (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://127.0.0.1:5173");
   const allowedOrigins = new Set([
     clientUrl,
+    "https://taskspot.ru",
+    "https://www.taskspot.ru",
     "http://localhost:5173",
     "http://127.0.0.1:5173"
   ]);

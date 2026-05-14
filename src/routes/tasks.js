@@ -85,6 +85,10 @@ function addActivity(task, actor, action, fields = {}) {
   });
 }
 
+function frontendUrl() {
+  return process.env.CLIENT_URL || (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://localhost:5173");
+}
+
 async function notifyUser({ user, project, task, message }) {
   if (!user) return;
 
@@ -111,7 +115,7 @@ async function sendTaskEmail({ user, project, task, message }) {
       projectName: projectDoc?.name || "Taskspot",
       taskDescription: taskDoc?.description || "Задача",
       message,
-      taskUrl: `${(process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "")}/app/tasks/${task}`
+      taskUrl: `${frontendUrl().replace(/\/$/, "")}/app/tasks/${task}`
     });
   } catch (error) {
     console.error("Failed to send task email", error);
