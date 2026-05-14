@@ -14,12 +14,17 @@ export function createApp() {
   const clientUrl =
     process.env.CLIENT_URL ||
     (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://127.0.0.1:5173");
+  const extraOrigins = (process.env.CORS_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
   const allowedOrigins = new Set([
     clientUrl,
     "https://taskspot.ru",
     "https://www.taskspot.ru",
     "http://localhost:5173",
-    "http://127.0.0.1:5173"
+    "http://127.0.0.1:5173",
+    ...extraOrigins
   ]);
 
   app.use(
@@ -29,7 +34,7 @@ export function createApp() {
           return callback(null, true);
         }
 
-        callback(new Error("Origin is not allowed by CORS"));
+        return callback(null, false);
       }
     })
   );
