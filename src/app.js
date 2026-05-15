@@ -8,6 +8,7 @@ import { organizationsRouter } from "./routes/organizations.js";
 import { projectsRouter } from "./routes/projects.js";
 import { reportsRouter } from "./routes/reports.js";
 import { tasksRouter } from "./routes/tasks.js";
+import { uploadsRouter } from "./routes/uploads.js";
 
 export function createApp() {
   const app = express();
@@ -56,6 +57,7 @@ export function createApp() {
   app.use("/api/organizations", organizationsRouter);
   app.use("/api/projects", projectsRouter);
   app.use("/api/tasks", tasksRouter);
+  app.use("/api/uploads", uploadsRouter);
   app.use("/api/dashboard", dashboardRouter);
   app.use("/api/notifications", notificationsRouter);
   app.use("/api/reports", reportsRouter);

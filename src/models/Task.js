@@ -85,7 +85,21 @@ const attachmentSchema = new mongoose.Schema(
     url: {
       type: String,
       trim: true,
-      required: true
+      default: ""
+    },
+    key: {
+      type: String,
+      trim: true,
+      default: ""
+    },
+    mimeType: {
+      type: String,
+      trim: true,
+      default: ""
+    },
+    size: {
+      type: Number,
+      default: 0
     },
     addedBy: {
       type: mongoose.Schema.Types.ObjectId,

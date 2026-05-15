@@ -8,6 +8,7 @@ import { Task, TASK_PRIORITIES, TASK_STATUSES } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendTaskNotificationEmail } from "../services/email.js";
 import { limitExceeded, organizationUsage, planFor } from "../services/plans.js";
+import { downloadUrlForKey } from "../services/storage.js";
 
 export const tasksRouter = express.Router();
 
@@ -160,20 +161,38 @@ function normalizeChecklist(checklist) {
     }));
 }
 
-function normalizeAttachments(attachments, existingAttachments, userId) {
+function normalizeAttachments(attachments, existingAttachments, userId, { projectId, taskId } = {}) {
   const existingById = new Map(
     existingAttachments.map((item) => [asString(item._id), item])
   );
+  const requiredPrefix = projectId && taskId ? `attachments/${projectId}/${taskId}/` : "";
 
   return ensureArray(attachments, "Attachments must be an array")
-    .filter((item) => item?.name?.trim() && item?.url?.trim())
+    .filter((item) => item?.name?.trim() && (item?.url?.trim() || item?.key?.trim()))
     .map((item) => {
       const existing = item._id ? existingById.get(asString(item._id)) : null;
+      const key = String(item.key || existing?.key || "").trim();
+      const url = String(item.url || existing?.url || "").trim();
+
+      if (!existing && !key) {
+        const error = new Error("New attachments must be uploaded as files");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      if (key && requiredPrefix && !key.startsWith(requiredPrefix)) {
+        const error = new Error("Attachment key does not belong to this task");
+        error.statusCode = 400;
+        throw error;
+      }
 
       return {
         ...(item._id ? { _id: item._id } : {}),
         name: item.name.trim(),
-        url: item.url.trim(),
+        url,
+        key,
+        mimeType: String(item.mimeType || existing?.mimeType || "").trim(),
+        size: Number(item.size || existing?.size || 0),
         addedBy: existing?.addedBy || userId
       };
     });
@@ -232,6 +251,28 @@ async function respondWithTask(res, task) {
 
 tasksRouter.get("/:taskId", loadTask, async (req, res) => {
   await respondWithTask(res, req.task);
+});
+
+tasksRouter.get("/:taskId/attachments/:attachmentId/download-url", loadTask, async (req, res) => {
+  const attachment = req.task.attachments.id(req.params.attachmentId);
+
+  if (!attachment) {
+    return res.status(404).json({ message: "Attachment not found" });
+  }
+
+  if (attachment.key) {
+    try {
+      return res.json({ url: downloadUrlForKey(attachment.key) });
+    } catch (error) {
+      return res.status(error.statusCode || 500).json({ message: error.message });
+    }
+  }
+
+  if (attachment.url) {
+    return res.json({ url: attachment.url });
+  }
+
+  res.status(404).json({ message: "Attachment URL not found" });
 });
 
 tasksRouter.get("/", async (req, res) => {
@@ -397,7 +438,8 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   const isAssignee = asString(req.task.assignee) === asString(userId);
   const canEditDetails = isAdmin || isCreator;
   const canUpdateChecklist = canEditDetails || isAssignee;
-  const detailFields = ["description", "dueDate", "categories", "assignee", "observers", "priority", "attachments", "recurrence"];
+  const canUpdateAttachments = canEditDetails || isAssignee;
+  const detailFields = ["description", "dueDate", "categories", "assignee", "observers", "priority", "recurrence"];
   const hasDetailChanges = detailFields.some((field) => hasOwn(req.body, field));
 
   if (hasDetailChanges && !canEditDetails) {
@@ -406,6 +448,10 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
 
   if (hasOwn(req.body, "checklist") && !canUpdateChecklist) {
     return res.status(403).json({ message: "Only project admin, task creator or assignee can edit checklist" });
+  }
+
+  if (hasOwn(req.body, "attachments") && !canUpdateAttachments) {
+    return res.status(403).json({ message: "Only project admin, task creator or assignee can edit attachments" });
   }
 
   if (hasOwn(req.body, "priority")) {
@@ -589,7 +635,10 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   if (hasOwn(req.body, "attachments")) {
     let nextAttachments;
     try {
-      nextAttachments = normalizeAttachments(attachments, req.task.attachments, userId);
+      nextAttachments = normalizeAttachments(attachments, req.task.attachments, userId, {
+        projectId: req.project._id,
+        taskId: req.task._id
+      });
     } catch (error) {
       return res.status(error.statusCode || 400).json({ message: error.message });
     }
