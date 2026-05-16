@@ -39,6 +39,7 @@ const activitySchema = new mongoose.Schema(
         "priority_changed",
         "checklist_changed",
         "attachment_added",
+        "attachment_removed",
         "recurrence_changed",
         "comment_added"
       ],

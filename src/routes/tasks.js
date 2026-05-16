@@ -8,7 +8,7 @@ import { Task, TASK_PRIORITIES, TASK_STATUSES } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendTaskNotificationEmail } from "../services/email.js";
 import { limitExceeded, organizationUsage, planFor } from "../services/plans.js";
-import { downloadUrlForKey } from "../services/storage.js";
+import { deleteObjectForKey, downloadUrlForKey } from "../services/storage.js";
 
 export const tasksRouter = express.Router();
 
@@ -38,6 +38,14 @@ function isVisibleTask(task, project, userId) {
     asString(task.creator) === asString(userId) ||
     asString(task.assignee) === asString(userId) ||
     task.observers.some((observer) => asString(observer) === asString(userId))
+  );
+}
+
+function canUpdateTaskAttachments(task, project, userId) {
+  return (
+    isProjectAdmin(project, userId) ||
+    asString(task.creator) === asString(userId) ||
+    asString(task.assignee) === asString(userId)
   );
 }
 
@@ -198,6 +206,18 @@ function normalizeAttachments(attachments, existingAttachments, userId, { projec
     });
 }
 
+function normalizeNewAttachment(attachment, userId, { projectId, taskId }) {
+  const [normalized] = normalizeAttachments([attachment], [], userId, { projectId, taskId });
+
+  if (!normalized) {
+    const error = new Error("Attachment name and file key are required");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return normalized;
+}
+
 function normalizeRecurrence(recurrence, fallbackDueDate) {
   const enabled = Boolean(recurrence?.enabled);
   const frequency = enabled ? recurrence.frequency || "weekly" : "none";
@@ -238,7 +258,7 @@ async function loadTask(req, res, next) {
 
 async function respondWithTask(res, task) {
   await task.populate([
-    { path: "project", select: "name categories" },
+    { path: "project", select: "name categories members" },
     { path: "creator", select: "name email" },
     { path: "assignee", select: "name email" },
     { path: "observers", select: "name email" },
@@ -273,6 +293,90 @@ tasksRouter.get("/:taskId/attachments/:attachmentId/download-url", loadTask, asy
   }
 
   res.status(404).json({ message: "Attachment URL not found" });
+});
+
+tasksRouter.post("/:taskId/attachments", loadTask, async (req, res) => {
+  const userId = req.user._id;
+
+  if (!canUpdateTaskAttachments(req.task, req.project, userId)) {
+    return res.status(403).json({ message: "Only project admin, task creator or assignee can add attachments" });
+  }
+
+  let attachment;
+  try {
+    attachment = normalizeNewAttachment(req.body, userId, {
+      projectId: req.project._id,
+      taskId: req.task._id
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({ message: error.message });
+  }
+
+  if (req.project.organization) {
+    const organization = await Organization.findById(req.project.organization);
+    if (organization) {
+      const usage = await organizationUsage(organization);
+      const plan = planFor(organization);
+
+      if (limitExceeded({ plan, usage, key: "attachments" })) {
+        return res.status(402).json({ message: "Вложения доступны на платных тарифах" });
+      }
+    }
+  }
+
+  const now = new Date();
+  const task = await Task.findByIdAndUpdate(
+    req.task._id,
+    {
+      $push: {
+        attachments: {
+          ...attachment,
+          createdAt: now,
+          updatedAt: now
+        },
+        activities: {
+          actor: userId,
+          action: "attachment_added",
+          details: attachment.name,
+          createdAt: now,
+          updatedAt: now
+        }
+      }
+    },
+    { new: true, runValidators: true }
+  );
+
+  await respondWithTask(res, task);
+});
+
+tasksRouter.delete("/:taskId/attachments/:attachmentId", loadTask, async (req, res) => {
+  const userId = req.user._id;
+
+  if (!canUpdateTaskAttachments(req.task, req.project, userId)) {
+    return res.status(403).json({ message: "Only project admin, task creator or assignee can delete attachments" });
+  }
+
+  const attachment = req.task.attachments.id(req.params.attachmentId);
+
+  if (!attachment) {
+    return res.status(404).json({ message: "Attachment not found" });
+  }
+
+  const attachmentName = attachment.name;
+  const attachmentKey = attachment.key;
+  req.task.attachments.pull(attachment._id);
+  addActivity(req.task, userId, "attachment_removed", {
+    details: attachmentName
+  });
+  await req.task.save();
+
+  if (attachmentKey) {
+    deleteObjectForKey(attachmentKey).catch((error) => {
+      console.error("Failed to delete attachment object", error);
+    });
+  }
+
+  await respondWithTask(res, req.task);
 });
 
 tasksRouter.get("/", async (req, res) => {
@@ -438,7 +542,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   const isAssignee = asString(req.task.assignee) === asString(userId);
   const canEditDetails = isAdmin || isCreator;
   const canUpdateChecklist = canEditDetails || isAssignee;
-  const canUpdateAttachments = canEditDetails || isAssignee;
+  const canUpdateAttachments = canUpdateTaskAttachments(req.task, req.project, userId);
   const detailFields = ["description", "dueDate", "categories", "assignee", "observers", "priority", "recurrence"];
   const hasDetailChanges = detailFields.some((field) => hasOwn(req.body, field));
 

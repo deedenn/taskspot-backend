@@ -134,3 +134,14 @@ export function uploadUrlForKey(key) {
 export function downloadUrlForKey(key) {
   return presignedS3Url({ key, method: "GET", expires: DEFAULT_DOWNLOAD_TTL_SECONDS });
 }
+
+export async function deleteObjectForKey(key) {
+  const deleteUrl = presignedS3Url({ key, method: "DELETE", expires: DEFAULT_DOWNLOAD_TTL_SECONDS });
+  const response = await fetch(deleteUrl, { method: "DELETE" });
+
+  if (!response.ok && response.status !== 404) {
+    const error = new Error("Failed to delete file from storage");
+    error.statusCode = response.status;
+    throw error;
+  }
+}

@@ -12,7 +12,7 @@ export const PLANS = {
       users: 3,
       projects: 2,
       activeTasks: 50,
-      attachments: 0,
+      attachments: 20,
       templates: 3,
       recurringTasks: 0,
       historyDays: 30
@@ -111,5 +111,5 @@ export async function organizationPayload(organization) {
 
 export function limitExceeded({ plan, usage, key, increment = 1 }) {
   const limit = plan.limits[key];
-  return limit > 0 && (usage[key] || 0) + increment > limit;
+  return Number.isFinite(limit) && (usage[key] || 0) + increment > limit;
 }
