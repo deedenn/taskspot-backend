@@ -11,6 +11,7 @@ function createTransporter() {
     host: process.env.SMTP_HOST,
     port,
     secure: process.env.SMTP_SECURE === "true" || port === 465,
+    requireTLS: process.env.SMTP_REQUIRE_TLS === "true",
     auth: process.env.SMTP_USER
       ? {
           user: process.env.SMTP_USER,
