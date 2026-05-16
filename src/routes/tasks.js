@@ -94,6 +94,10 @@ function addActivity(task, actor, action, fields = {}) {
   });
 }
 
+function normalizeStatus(status) {
+  return status === "done" ? "review" : status;
+}
+
 function frontendUrl() {
   return process.env.CLIENT_URL || (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://localhost:5173");
 }
@@ -529,7 +533,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
     categories,
     assignee,
     observers,
-    status,
+    status: rawStatus,
     priority,
     comment,
     checklist,
@@ -573,6 +577,8 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   }
 
   if (hasOwn(req.body, "status")) {
+    const status = normalizeStatus(rawStatus);
+
     if (!TASK_STATUSES.includes(status)) {
       return res.status(400).json({ message: "Unknown task status" });
     }
@@ -593,7 +599,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       if (!["review", "done"].includes(req.task.status)) {
         return res.status(400).json({ message: "Only tasks on review can be closed" });
       }
-    } else if (req.task.status === "review" && status === "in_progress") {
+    } else if (["review", "done"].includes(req.task.status) && status === "in_progress") {
       if (!isCreator) {
         return res.status(403).json({ message: "Only task creator can send task back to work" });
       }
@@ -799,7 +805,9 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
 
   await req.task.save();
 
-  if (status === "review") {
+  const requestedStatus = hasOwn(req.body, "status") ? normalizeStatus(rawStatus) : undefined;
+
+  if (requestedStatus === "review") {
     await notifyUser({
       user: req.task.creator,
       project: req.project._id,
@@ -808,7 +816,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
     });
   }
 
-  if (status === "closed" && req.task.assignee) {
+  if (requestedStatus === "closed" && req.task.assignee) {
     await notifyUser({
       user: req.task.assignee,
       project: req.project._id,
@@ -817,7 +825,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
     });
   }
 
-  if (status === "in_progress" && req.task.assignee) {
+  if (requestedStatus === "in_progress" && req.task.assignee) {
     await notifyUser({
       user: req.task.assignee,
       project: req.project._id,

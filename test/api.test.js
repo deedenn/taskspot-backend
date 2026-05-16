@@ -21,6 +21,7 @@ if (!process.env.TEST_MONGODB_URI) {
   delete process.env.SMTP_FROM;
 
   const { createApp } = await import("../src/app.js");
+  const { Notification } = await import("../src/models/Notification.js");
   let server;
   let baseUrl;
 
@@ -292,6 +293,9 @@ if (!process.env.TEST_MONGODB_URI) {
       });
       assert.equal(review.response.status, 200, review.data.message);
       assert.equal(review.data.task.status, "review");
+      assert.ok(
+        await Notification.exists({ user: creator.user._id, task: taskId, message: /ready for review/ })
+      );
 
       const missingComment = await request(`/api/tasks/${taskId}`, {
         method: "PATCH",
@@ -312,11 +316,17 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(returned.data.task.status, "in_progress");
       assert.ok(returned.data.task.comments.some((comment) => comment.text === "Please update the report"));
 
-      await request(`/api/tasks/${taskId}`, {
+      const legacyDone = await request(`/api/tasks/${taskId}`, {
         method: "PATCH",
         token: assignee.token,
-        body: { status: "review" }
+        body: { status: "done" }
       });
+      assert.equal(legacyDone.response.status, 200, legacyDone.data.message);
+      assert.equal(legacyDone.data.task.status, "review");
+      assert.ok(
+        await Notification.exists({ user: creator.user._id, task: taskId, message: /ready for review/ })
+      );
+
       const closed = await request(`/api/tasks/${taskId}`, {
         method: "PATCH",
         token: creator.token,
