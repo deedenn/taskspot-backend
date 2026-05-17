@@ -447,13 +447,35 @@ projectsRouter.post("/:projectId/categories", loadProject, requireAdmin, async (
 });
 
 projectsRouter.delete("/:projectId/categories/:categoryId", loadProject, requireAdmin, async (req, res) => {
-  req.project.categories = req.project.categories.filter(
-    (category) => category._id.toString() !== req.params.categoryId
-  );
+  const requestedCategory = decodeURIComponent(req.params.categoryId || "");
+  const removedCategoryIds = [];
+  const removedCategoryNames = [];
+
+  req.project.categories = req.project.categories.filter((category) => {
+    const categoryId = category._id?.toString();
+    const categoryName = category.name?.trim();
+    const shouldRemove = categoryId === requestedCategory || categoryName === requestedCategory;
+
+    if (shouldRemove) {
+      if (categoryId) removedCategoryIds.push(categoryId);
+      if (categoryName) removedCategoryNames.push(categoryName);
+    }
+
+    return !shouldRemove;
+  });
+
+  if (!removedCategoryIds.length && !removedCategoryNames.length) {
+    return res.status(404).json({ message: "Category not found" });
+  }
+
   await req.project.save();
-  await Task.updateMany(
-    { project: req.project._id },
-    { $pull: { categories: req.params.categoryId } }
-  );
+
+  if (removedCategoryIds.length) {
+    await Task.updateMany(
+      { project: req.project._id },
+      { $pull: { categories: { $in: removedCategoryIds } } }
+    );
+  }
+
   res.json({ categories: req.project.categories });
 });
