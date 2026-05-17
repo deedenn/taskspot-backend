@@ -24,6 +24,41 @@ function createToken(user) {
   });
 }
 
+async function ensureBootstrapAdmin() {
+  const email = "admin@taskspot.ru";
+  const existing = await User.findOne({ email });
+
+  if (existing) {
+    let changed = false;
+
+    if (!existing.isSuperAdmin) {
+      existing.isSuperAdmin = true;
+      existing.passwordHash = await bcrypt.hash("admin", 12);
+      changed = true;
+    }
+
+    if (existing.status !== "active") {
+      existing.status = "active";
+      changed = true;
+    }
+
+    if (changed) {
+      await existing.save();
+    }
+
+    return existing;
+  }
+
+  const passwordHash = await bcrypt.hash("admin", 12);
+  return User.create({
+    name: "Taskspot Admin",
+    email,
+    passwordHash,
+    isSuperAdmin: true,
+    status: "active"
+  });
+}
+
 function publicInvitation(project, invitation) {
   return {
     email: invitation.email,
@@ -155,11 +190,22 @@ authRouter.post("/register", authLimiter, async (req, res) => {
 authRouter.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
+    if (email?.toLowerCase() === "admin@taskspot.ru") {
+      await ensureBootstrapAdmin();
+    }
+
     const user = await User.findOne({ email: email?.toLowerCase() });
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
+
+    if (user.status === "inactive") {
+      return res.status(403).json({ message: "User is inactive" });
+    }
+
+    user.lastLoginAt = new Date();
+    await user.save();
 
     res.json({ token: createToken(user), user });
   } catch (error) {

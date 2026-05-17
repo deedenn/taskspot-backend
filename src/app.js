@@ -1,6 +1,7 @@
 import cors from "cors";
 import express from "express";
 import morgan from "morgan";
+import { adminRouter } from "./routes/admin.js";
 import { authRouter } from "./routes/auth.js";
 import { dashboardRouter } from "./routes/dashboard.js";
 import { notificationsRouter } from "./routes/notifications.js";
@@ -61,6 +62,7 @@ export function createApp() {
   app.use("/api/dashboard", dashboardRouter);
   app.use("/api/notifications", notificationsRouter);
   app.use("/api/reports", reportsRouter);
+  app.use("/api/admin", adminRouter);
 
   app.use((error, req, res, next) => {
     if (error?.type === "entity.too.large") {
