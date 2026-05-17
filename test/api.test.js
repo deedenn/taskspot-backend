@@ -297,6 +297,20 @@ if (!process.env.TEST_MONGODB_URI) {
         await Notification.exists({ user: creator.user._id, task: taskId, message: /ready for review/ })
       );
 
+      const assigneeCannotClose = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: assignee.token,
+        body: { status: "closed" }
+      });
+      assert.equal(assigneeCannotClose.response.status, 403);
+
+      const cannotReopenFromReview = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: assignee.token,
+        body: { status: "open" }
+      });
+      assert.equal(cannotReopenFromReview.response.status, 400);
+
       const missingComment = await request(`/api/tasks/${taskId}`, {
         method: "PATCH",
         token: creator.token,
@@ -334,6 +348,13 @@ if (!process.env.TEST_MONGODB_URI) {
       });
       assert.equal(closed.response.status, 200, closed.data.message);
       assert.equal(closed.data.task.status, "closed");
+
+      const cannotChangeClosed = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: creator.token,
+        body: { status: "in_progress" }
+      });
+      assert.equal(cannotChangeClosed.response.status, 400);
 
       const actions = closed.data.task.activities.map((activity) => activity.action);
       assert.ok(actions.includes("created"));

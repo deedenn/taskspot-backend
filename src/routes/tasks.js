@@ -583,6 +583,10 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       return res.status(400).json({ message: "Unknown task status" });
     }
 
+    if (status !== req.task.status && req.task.status === "closed") {
+      return res.status(400).json({ message: "Closed task status cannot be changed" });
+    }
+
     if (status === "review") {
       if (!isAssignee) {
         return res.status(403).json({ message: "Only assignee can send task to review" });
@@ -607,6 +611,8 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       if (!comment?.trim()) {
         return res.status(400).json({ message: "Comment is required when sending task back to work" });
       }
+    } else if (["review", "done"].includes(req.task.status) && status !== req.task.status) {
+      return res.status(400).json({ message: "Task on review can only be closed or sent back to work" });
     } else if (!isAdmin && !isCreator && !isAssignee) {
       return res.status(403).json({ message: "You cannot change this task status" });
     }
