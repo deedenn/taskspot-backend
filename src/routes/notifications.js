@@ -1,10 +1,10 @@
 import express from "express";
-import { requireAuth } from "../middleware/auth.js";
+import { requireRegularUser } from "../middleware/auth.js";
 import { Notification } from "../models/Notification.js";
 
 export const notificationsRouter = express.Router();
 
-notificationsRouter.use(requireAuth);
+notificationsRouter.use(requireRegularUser);
 
 notificationsRouter.get("/", async (req, res) => {
   const notifications = await Notification.find({ user: req.user._id })

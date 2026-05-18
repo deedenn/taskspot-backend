@@ -1,11 +1,11 @@
 import express from "express";
-import { requireAuth } from "../middleware/auth.js";
+import { requireRegularUser } from "../middleware/auth.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 
 export const reportsRouter = express.Router();
 
-reportsRouter.use(requireAuth);
+reportsRouter.use(requireRegularUser);
 
 function idOf(value) {
   return value?._id?.toString() || value?.toString();

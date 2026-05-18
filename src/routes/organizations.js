@@ -1,11 +1,11 @@
 import express from "express";
-import { requireAuth } from "../middleware/auth.js";
+import { requireRegularUser } from "../middleware/auth.js";
 import { Organization } from "../models/Organization.js";
 import { ensureDefaultOrganization, organizationPayload, PLANS, planFor } from "../services/plans.js";
 
 export const organizationsRouter = express.Router();
 
-organizationsRouter.use(requireAuth);
+organizationsRouter.use(requireRegularUser);
 
 function memberEntry(organization, userId) {
   return organization.members.find((member) => member.user.toString() === userId.toString());

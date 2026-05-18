@@ -210,8 +210,8 @@ authRouter.post("/login", authLimiter, async (req, res) => {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
-    if (user.status === "inactive") {
-      return res.status(403).json({ message: "User is inactive" });
+    if (user.status && user.status !== "active") {
+      return res.status(403).json({ message: user.status === "blocked" ? "User is blocked" : "User is inactive" });
     }
 
     user.lastLoginAt = new Date();

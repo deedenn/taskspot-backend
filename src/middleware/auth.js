@@ -18,9 +18,23 @@ export async function requireAuth(req, res, next) {
       return res.status(401).json({ message: "User not found" });
     }
 
+    if (user.status && user.status !== "active") {
+      return res.status(403).json({ message: user.status === "blocked" ? "User is blocked" : "User is inactive" });
+    }
+
     req.user = user;
     next();
   } catch (error) {
     res.status(401).json({ message: "Invalid token" });
   }
+}
+
+export function requireRegularUser(req, res, next) {
+  return requireAuth(req, res, () => {
+    if (req.user?.isSuperAdmin) {
+      return res.status(403).json({ message: "Super admin cannot use workspace features" });
+    }
+
+    next();
+  });
 }

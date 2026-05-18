@@ -1,12 +1,12 @@
 import express from "express";
-import { requireAuth } from "../middleware/auth.js";
+import { requireRegularUser } from "../middleware/auth.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { attachmentKey, isStorageConfigured, maxUploadSize, safeFileName, uploadUrlForKey } from "../services/storage.js";
 
 export const uploadsRouter = express.Router();
 
-uploadsRouter.use(requireAuth);
+uploadsRouter.use(requireRegularUser);
 
 function asString(value) {
   return value?.toString();

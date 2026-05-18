@@ -129,6 +129,58 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(login.response.status, 200, login.data.message);
       assert.ok(login.data.token);
     });
+
+    test("super admin is limited to service routes and can block users", async () => {
+      const user = await register({ name: "Blocked User", email: `blocked_${Date.now()}@example.com` });
+
+      const adminLogin = await request("/api/auth/login", {
+        method: "POST",
+        body: {
+          email: "admin@taskspot.ru",
+          password: "qwerty"
+        }
+      });
+      assert.equal(adminLogin.response.status, 200, adminLogin.data.message);
+      assert.equal(adminLogin.data.user.isSuperAdmin, true);
+
+      const overview = await request("/api/admin/overview", { token: adminLogin.data.token });
+      assert.equal(overview.response.status, 200, overview.data.message);
+
+      const cannotCreateProject = await request("/api/projects", {
+        method: "POST",
+        token: adminLogin.data.token,
+        body: { name: "Admin workspace project", description: "Should be forbidden" }
+      });
+      assert.equal(cannotCreateProject.response.status, 403);
+
+      const blocked = await request(`/api/admin/users/${user.user._id}/status`, {
+        method: "PATCH",
+        token: adminLogin.data.token,
+        body: { blocked: true }
+      });
+      assert.equal(blocked.response.status, 200, blocked.data.message);
+      assert.equal(blocked.data.user.status, "blocked");
+
+      const blockedMe = await request("/api/auth/me", { token: user.token });
+      assert.equal(blockedMe.response.status, 403);
+
+      const blockedLogin = await request("/api/auth/login", {
+        method: "POST",
+        body: {
+          email: user.user.email,
+          password: "password123"
+        }
+      });
+      assert.equal(blockedLogin.response.status, 403);
+
+      const unblocked = await request(`/api/admin/users/${user.user._id}/status`, {
+        method: "PATCH",
+        token: adminLogin.data.token,
+        body: { status: "active" }
+      });
+      assert.equal(unblocked.response.status, 200, unblocked.data.message);
+      assert.equal(unblocked.data.user.status, "active");
+    });
   });
 
   describe("project invitations", () => {

@@ -1,6 +1,6 @@
 import express from "express";
 import crypto from "node:crypto";
-import { requireAuth } from "../middleware/auth.js";
+import { requireRegularUser } from "../middleware/auth.js";
 import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
@@ -13,7 +13,7 @@ export const projectsRouter = express.Router();
 const TEMPLATE_PRIORITIES = ["low", "medium", "high", "urgent"];
 const TEMPLATE_RECURRENCE_FREQUENCIES = ["none", "daily", "weekly", "monthly"];
 
-projectsRouter.use(requireAuth);
+projectsRouter.use(requireRegularUser);
 
 function memberEntry(project, userId) {
   return project.members.find((member) => member.user.toString() === userId.toString());

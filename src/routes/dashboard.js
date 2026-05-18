@@ -1,11 +1,11 @@
 import express from "express";
-import { requireAuth } from "../middleware/auth.js";
+import { requireRegularUser } from "../middleware/auth.js";
 import { Notification } from "../models/Notification.js";
 import { Task } from "../models/Task.js";
 
 export const dashboardRouter = express.Router();
 
-dashboardRouter.use(requireAuth);
+dashboardRouter.use(requireRegularUser);
 
 dashboardRouter.get("/", async (req, res) => {
   const [initiated, assigned, observing, notifications] = await Promise.all([

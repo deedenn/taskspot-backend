@@ -1,6 +1,6 @@
 import express from "express";
 import mongoose from "mongoose";
-import { requireAuth } from "../middleware/auth.js";
+import { requireRegularUser } from "../middleware/auth.js";
 import { Notification } from "../models/Notification.js";
 import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
@@ -12,7 +12,7 @@ import { deleteObjectForKey, downloadUrlForKey } from "../services/storage.js";
 
 export const tasksRouter = express.Router();
 
-tasksRouter.use(requireAuth);
+tasksRouter.use(requireRegularUser);
 
 const RECURRENCE_FREQUENCIES = ["none", "daily", "weekly", "monthly"];
 
