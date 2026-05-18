@@ -11,6 +11,10 @@ import { User } from "../models/User.js";
 
 export const authRouter = express.Router();
 
+const BOOTSTRAP_ADMIN_EMAIL = "admin@taskspot.ru";
+const BOOTSTRAP_ADMIN_PASSWORD = "qwerty";
+const LEGACY_BOOTSTRAP_ADMIN_PASSWORD = "admin";
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -25,20 +29,24 @@ function createToken(user) {
 }
 
 async function ensureBootstrapAdmin() {
-  const email = "admin@taskspot.ru";
-  const existing = await User.findOne({ email });
+  const existing = await User.findOne({ email: BOOTSTRAP_ADMIN_EMAIL });
 
   if (existing) {
     let changed = false;
 
     if (!existing.isSuperAdmin) {
       existing.isSuperAdmin = true;
-      existing.passwordHash = await bcrypt.hash("admin", 12);
+      existing.passwordHash = await bcrypt.hash(BOOTSTRAP_ADMIN_PASSWORD, 12);
       changed = true;
     }
 
     if (existing.status !== "active") {
       existing.status = "active";
+      changed = true;
+    }
+
+    if (await bcrypt.compare(LEGACY_BOOTSTRAP_ADMIN_PASSWORD, existing.passwordHash)) {
+      existing.passwordHash = await bcrypt.hash(BOOTSTRAP_ADMIN_PASSWORD, 12);
       changed = true;
     }
 
@@ -49,10 +57,10 @@ async function ensureBootstrapAdmin() {
     return existing;
   }
 
-  const passwordHash = await bcrypt.hash("admin", 12);
+  const passwordHash = await bcrypt.hash(BOOTSTRAP_ADMIN_PASSWORD, 12);
   return User.create({
     name: "Taskspot Admin",
-    email,
+    email: BOOTSTRAP_ADMIN_EMAIL,
     passwordHash,
     isSuperAdmin: true,
     status: "active"
@@ -190,11 +198,13 @@ authRouter.post("/register", authLimiter, async (req, res) => {
 authRouter.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (email?.toLowerCase() === "admin@taskspot.ru") {
+    const normalizedEmail = email?.toLowerCase();
+
+    if (normalizedEmail === BOOTSTRAP_ADMIN_EMAIL) {
       await ensureBootstrapAdmin();
     }
 
-    const user = await User.findOne({ email: email?.toLowerCase() });
+    const user = await User.findOne({ email: normalizedEmail });
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ message: "Invalid email or password" });
