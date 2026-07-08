@@ -142,10 +142,7 @@ projectsRouter.post("/", async (req, res) => {
     name,
     description,
     members: [{ user: req.user._id, role: "admin" }],
-    categories: [
-      { name: "Backend", color: "#1677ff" },
-      { name: "Frontend", color: "#52c41a" }
-    ]
+    categories: []
   });
 
   await project.populate([
@@ -169,11 +166,7 @@ projectsRouter.post("/demo", async (req, res) => {
     name: "Контроль поручений",
     description: "Демо-проект с задачами для руководителя малого бизнеса.",
     members: [{ user: req.user._id, role: "admin" }],
-    categories: [
-      { name: "Продажи", color: "#1677ff" },
-      { name: "Операционка", color: "#52c41a" },
-      { name: "Финансы", color: "#faad14" }
-    ],
+    categories: [],
     templates: [
       {
         title: "Еженедельный отчёт",
@@ -193,7 +186,7 @@ projectsRouter.post("/demo", async (req, res) => {
       assignee: req.user._id,
       description: "Позвонить клиентам, которые ждут счёт",
       dueDate: new Date(Date.now() + 86400000),
-      categories: [project.categories[0]._id],
+      categories: [],
       priority: "urgent",
       checklist: [{ text: "Проверить список клиентов" }, { text: "Отметить результат звонка" }],
       status: "open",
@@ -205,7 +198,7 @@ projectsRouter.post("/demo", async (req, res) => {
       assignee: req.user._id,
       description: "Проверить выполнение поручений за неделю",
       dueDate: new Date(Date.now() + 2 * 86400000),
-      categories: [project.categories[1]._id],
+      categories: [],
       priority: "high",
       recurrence: { enabled: true, frequency: "weekly", nextRunAt: new Date(Date.now() + 7 * 86400000) },
       status: "in_progress",

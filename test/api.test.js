@@ -278,6 +278,49 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(template.data.templates[0].title, "Weekly report");
       assert.equal(template.data.templates[0].checklist.length, 2);
     });
+
+    test("creates projects without preset categories and allows category deletion", async () => {
+      const owner = await register({ name: "Category Owner", email: `categories_${Date.now()}@example.com` });
+      const project = await createProject(owner.token, "Empty categories");
+
+      assert.deepEqual(project.categories, []);
+
+      const category = await request(`/api/projects/${project._id}/categories`, {
+        method: "POST",
+        token: owner.token,
+        body: { name: "Срочно", color: "#dc2626" }
+      });
+      assert.equal(category.response.status, 201, category.data.message);
+      assert.equal(category.data.categories.length, 1);
+
+      const categoryId = category.data.categories[0]._id;
+      const task = await request("/api/tasks", {
+        method: "POST",
+        token: owner.token,
+        body: {
+          projectId: project._id,
+          description: "Task with removable category",
+          dueDate: new Date(Date.now() + 86400000).toISOString(),
+          assignee: owner.user._id,
+          observers: [],
+          categories: [categoryId],
+          priority: "medium"
+        }
+      });
+      assert.equal(task.response.status, 201, task.data.message);
+      assert.equal(task.data.task.categories.length, 1);
+
+      const removed = await request(`/api/projects/${project._id}/categories/${categoryId}`, {
+        method: "DELETE",
+        token: owner.token
+      });
+      assert.equal(removed.response.status, 200, removed.data.message);
+      assert.deepEqual(removed.data.categories, []);
+
+      const updatedTask = await request(`/api/tasks/${task.data.task._id}`, { token: owner.token });
+      assert.equal(updatedTask.response.status, 200, updatedTask.data.message);
+      assert.deepEqual(updatedTask.data.task.categories, []);
+    });
   });
 
   describe("tasks", () => {
