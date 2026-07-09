@@ -11,16 +11,16 @@ dashboardRouter.get("/", async (req, res) => {
   const [initiated, assigned, observing, notifications] = await Promise.all([
     Task.find({ creator: req.user._id })
       .populate("project", "name isArchived archivedAt")
-      .populate("assignee", "name email")
+      .populate("assignee", "name lastName email")
       .sort({ updatedAt: -1 }),
     Task.find({ assignee: req.user._id })
       .populate("project", "name isArchived archivedAt")
-      .populate("creator", "name email")
+      .populate("creator", "name lastName email")
       .sort({ updatedAt: -1 }),
     Task.find({ observers: req.user._id })
       .populate("project", "name isArchived archivedAt")
-      .populate("creator", "name email")
-      .populate("assignee", "name email")
+      .populate("creator", "name lastName email")
+      .populate("assignee", "name lastName email")
       .sort({ updatedAt: -1 }),
     Notification.find({ user: req.user._id })
       .populate("project", "name")

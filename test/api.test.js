@@ -39,15 +39,16 @@ if (!process.env.TEST_MONGODB_URI) {
     return { response, data };
   }
 
-  async function register({ name, email, password = "password123", invitationToken }) {
+  async function register({ name, lastName = "Тестов", email, password = "password123", invitationToken }) {
     const { response, data } = await request("/api/auth/register", {
       method: "POST",
-      body: { name, email, password, invitationToken }
+      body: { name, lastName, email, password, invitationToken }
     });
 
     assert.equal(response.status, 201, data.message);
     assert.ok(data.token);
     assert.equal(data.user.email, email.toLowerCase());
+    assert.equal(data.user.lastName, lastName);
 
     return data;
   }
@@ -101,12 +102,14 @@ if (!process.env.TEST_MONGODB_URI) {
         token: registered.token,
         body: {
           name: "Owner Updated",
+          lastName: "Updated",
           phone: "+79990000000",
           avatarUrl: "https://example.com/avatar.png"
         }
       });
       assert.equal(updated.response.status, 200, updated.data.message);
       assert.equal(updated.data.user.name, "Owner Updated");
+      assert.equal(updated.data.user.lastName, "Updated");
       assert.equal(updated.data.user.phone, "+79990000000");
 
       const password = await request("/api/auth/password", {
@@ -202,7 +205,7 @@ if (!process.env.TEST_MONGODB_URI) {
       const invitation = invited.data.project.invitations.find((item) => item.email === invitedEmail);
       assert.ok(invitation);
       assert.equal(invitation.status, "pending");
-      assert.equal(invitation.emailStatus, "skipped");
+      assert.ok(["pending", "skipped", "sent", "failed"].includes(invitation.emailStatus));
       assert.ok(invitation.token);
 
       const invitationInfo = await request(`/api/auth/invitations/${invitation.token}`);
@@ -229,6 +232,7 @@ if (!process.env.TEST_MONGODB_URI) {
 
       const invitee = await register({
         name: "Invitee",
+        lastName: "Invited",
         email: invitedEmail,
         invitationToken: invitation.token
       });

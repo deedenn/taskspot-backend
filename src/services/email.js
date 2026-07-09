@@ -12,6 +12,9 @@ function createTransporter() {
     port,
     secure: process.env.SMTP_SECURE === "true" || port === 465,
     requireTLS: process.env.SMTP_REQUIRE_TLS === "true",
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 15000),
     auth: process.env.SMTP_USER
       ? {
           user: process.env.SMTP_USER,

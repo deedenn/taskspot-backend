@@ -40,9 +40,9 @@ function createInvitationExpiresAt() {
 async function populateProject(project) {
   await project.populate([
     { path: "organization", select: "name plan" },
-    { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" },
-    { path: "archivedBy", select: "name email" }
+    { path: "members.user", select: "name lastName email" },
+    { path: "invitations.invitedBy", select: "name lastName email" },
+    { path: "archivedBy", select: "name lastName email" }
   ]);
   return project;
 }
@@ -53,6 +53,10 @@ function frontendUrl() {
 
 function invitationUrl(token) {
   return `${frontendUrl().replace(/\/$/, "")}/register?invite=${token}`;
+}
+
+function fullName(user) {
+  return [user?.name, user?.lastName].filter(Boolean).join(" ").trim() || user?.name || user?.email || "";
 }
 
 async function sendInvitation(project, invitation, inviter) {
@@ -68,7 +72,7 @@ async function sendInvitation(project, invitation, inviter) {
     const result = await sendProjectInvitationEmail({
       email: invitation.email,
       projectName: project.name,
-      inviterName: inviter.name,
+      inviterName: fullName(inviter),
       role: invitation.role,
       invitationUrl: invitationUrl(invitation.token)
     });
@@ -82,12 +86,28 @@ async function sendInvitation(project, invitation, inviter) {
   }
 }
 
+async function sendInvitationAndSave(projectId, invitationId, inviter) {
+  try {
+    const project = await Project.findById(projectId);
+    const invitation = project?.invitations.id(invitationId);
+
+    if (!project || !invitation || invitation.status !== "pending") {
+      return;
+    }
+
+    await sendInvitation(project, invitation, inviter);
+    await project.save();
+  } catch (error) {
+    console.error("Failed to send project invitation email", error);
+  }
+}
+
 async function sendMemberAdded(user, project, inviter) {
   try {
     await sendProjectMemberAddedEmail({
       email: user.email,
       projectName: project.name,
-      inviterName: inviter.name,
+      inviterName: fullName(inviter),
       appUrl: `${frontendUrl().replace(/\/$/, "")}/app/projects/${project._id}/tasks`
     });
   } catch (error) {
@@ -121,9 +141,9 @@ async function requireAdmin(req, res, next) {
 projectsRouter.get("/", async (req, res) => {
   const projects = await Project.find({ "members.user": req.user._id })
     .populate("organization", "name plan")
-    .populate("members.user", "name email")
-    .populate("invitations.invitedBy", "name email")
-    .populate("archivedBy", "name email")
+    .populate("members.user", "name lastName email")
+    .populate("invitations.invitedBy", "name lastName email")
+    .populate("archivedBy", "name lastName email")
     .sort({ updatedAt: -1 });
 
   res.json({ projects });
@@ -160,7 +180,7 @@ projectsRouter.post("/", async (req, res) => {
 
   await project.populate([
     { path: "organization", select: "name plan" },
-    { path: "members.user", select: "name email" }
+    { path: "members.user", select: "name lastName email" }
   ]);
   res.status(201).json({ project });
 });
@@ -221,7 +241,7 @@ projectsRouter.post("/demo", async (req, res) => {
 
   await project.populate([
     { path: "organization", select: "name plan" },
-    { path: "members.user", select: "name email" }
+    { path: "members.user", select: "name lastName email" }
   ]);
   res.status(201).json({ project, tasks });
 });
@@ -229,9 +249,9 @@ projectsRouter.post("/demo", async (req, res) => {
 projectsRouter.get("/:projectId", loadProject, async (req, res) => {
   await req.project.populate([
     { path: "organization", select: "name plan" },
-    { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" },
-    { path: "archivedBy", select: "name email" }
+    { path: "members.user", select: "name lastName email" },
+    { path: "invitations.invitedBy", select: "name lastName email" },
+    { path: "archivedBy", select: "name lastName email" }
   ]);
   res.json({ project: req.project });
 });
@@ -353,7 +373,7 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
         organization.members.push({ user: user._id, role: role === "admin" ? "admin" : "member" });
         await organization.save();
       }
-      await sendMemberAdded(user, req.project, req.user);
+      void sendMemberAdded(user, req.project, req.user);
     }
   } else {
     const existingInvitation = req.project.invitations.find(
@@ -364,7 +384,6 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
       existingInvitation.role = role;
       existingInvitation.token = existingInvitation.token || createInvitationToken();
       existingInvitation.expiresAt = createInvitationExpiresAt();
-      await sendInvitation(req.project, existingInvitation, req.user);
     } else {
       const invitation = {
         email: normalizedEmail,
@@ -375,14 +394,21 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
         status: "pending"
       };
       req.project.invitations.push(invitation);
-      await sendInvitation(req.project, req.project.invitations[req.project.invitations.length - 1], req.user);
     }
   }
 
   await req.project.save();
+  const pendingInvitation = !user
+    ? req.project.invitations.find((invitation) => invitation.email === normalizedEmail && invitation.status === "pending")
+    : null;
+
+  if (pendingInvitation) {
+    void sendInvitationAndSave(req.project._id, pendingInvitation._id, req.user);
+  }
+
   await req.project.populate([
-    { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" }
+    { path: "members.user", select: "name lastName email" },
+    { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
   res.json({ project: req.project });
 });
@@ -463,8 +489,8 @@ projectsRouter.post("/:projectId/invitations/:invitationId/resend", loadProject,
   await sendInvitation(req.project, invitation, req.user);
   await req.project.save();
   await req.project.populate([
-    { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" }
+    { path: "members.user", select: "name lastName email" },
+    { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
 
   res.json({ project: req.project });
@@ -476,8 +502,8 @@ projectsRouter.delete("/:projectId/invitations/:invitationId", loadProject, requ
   );
   await req.project.save();
   await req.project.populate([
-    { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" }
+    { path: "members.user", select: "name lastName email" },
+    { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
   res.json({ project: req.project });
 });
@@ -498,8 +524,8 @@ projectsRouter.delete("/:projectId/members/:userId", loadProject, requireAdmin, 
     Task.updateMany({ project: req.project._id, assignee: userId }, { $unset: { assignee: "" } })
   ]);
   await req.project.populate([
-    { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" }
+    { path: "members.user", select: "name lastName email" },
+    { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
   res.json({ project: req.project });
 });

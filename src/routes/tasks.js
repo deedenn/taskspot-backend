@@ -267,12 +267,12 @@ async function loadTask(req, res, next) {
 async function respondWithTask(res, task) {
   await task.populate([
     { path: "project", select: "name categories members isArchived archivedAt archivedBy" },
-    { path: "creator", select: "name email" },
-    { path: "assignee", select: "name email" },
-    { path: "observers", select: "name email" },
-    { path: "attachments.addedBy", select: "name email" },
-    { path: "comments.author", select: "name email" },
-    { path: "activities.actor", select: "name email" }
+    { path: "creator", select: "name lastName email" },
+    { path: "assignee", select: "name lastName email" },
+    { path: "observers", select: "name lastName email" },
+    { path: "attachments.addedBy", select: "name lastName email" },
+    { path: "comments.author", select: "name lastName email" },
+    { path: "activities.actor", select: "name lastName email" }
   ]);
   res.json({ task });
 }
@@ -418,9 +418,9 @@ tasksRouter.get("/", async (req, res) => {
 
   const [tasks, total] = await Promise.all([
     Task.find(filter)
-      .populate("creator", "name email")
-      .populate("assignee", "name email")
-      .populate("observers", "name email")
+      .populate("creator", "name lastName email")
+      .populate("assignee", "name lastName email")
+      .populate("observers", "name lastName email")
       .sort({ updatedAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit),

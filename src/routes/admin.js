@@ -122,7 +122,7 @@ adminRouter.get("/overview", async (req, res) => {
     User.find()
       .sort({ createdAt: -1 })
       .limit(8)
-      .select("name email status isSuperAdmin lastLoginAt createdAt")
+      .select("name lastName email status isSuperAdmin lastLoginAt createdAt")
       .lean()
   ]);
 
@@ -210,7 +210,7 @@ adminRouter.get("/users", async (req, res) => {
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
-      .select("name email status isSuperAdmin lastLoginAt createdAt")
+      .select("name lastName email status isSuperAdmin lastLoginAt createdAt")
       .lean()
   ]);
 

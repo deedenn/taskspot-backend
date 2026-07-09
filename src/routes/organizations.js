@@ -14,7 +14,7 @@ function memberEntry(organization, userId) {
 organizationsRouter.get("/", async (req, res) => {
   await ensureDefaultOrganization(req.user);
   const organizations = await Organization.find({ "members.user": req.user._id })
-    .populate("members.user", "name email")
+    .populate("members.user", "name lastName email")
     .sort({ updatedAt: -1 });
   const payloads = await Promise.all(organizations.map(organizationPayload));
 
@@ -42,7 +42,7 @@ organizationsRouter.post("/", async (req, res) => {
     plan: "free",
     members: [{ user: req.user._id, role: "owner" }]
   });
-  await organization.populate("members.user", "name email");
+  await organization.populate("members.user", "name lastName email");
 
   res.status(201).json(await organizationPayload(organization));
 });
@@ -70,7 +70,7 @@ organizationsRouter.patch("/:organizationId", async (req, res) => {
   }
 
   await organization.save();
-  await organization.populate("members.user", "name email");
+  await organization.populate("members.user", "name lastName email");
 
   res.json(await organizationPayload(organization));
 });

@@ -86,13 +86,22 @@ function publicInvitation(project, invitation) {
   };
 }
 
+function isStrongPassword(password) {
+  return (
+    typeof password === "string" &&
+    password.length >= 8 &&
+    /[A-Za-zА-Яа-яЁё]/.test(password) &&
+    /\d/.test(password)
+  );
+}
+
 async function findInvitationByToken(token) {
   if (!token) return null;
 
   const project = await Project.findOne({
     "invitations.token": token,
     "invitations.status": "pending"
-  }).populate("invitations.invitedBy", "name email");
+  }).populate("invitations.invitedBy", "name lastName email");
 
   if (!project) return null;
 
@@ -119,14 +128,14 @@ authRouter.get("/invitations/:token", async (req, res) => {
 
 authRouter.post("/register", authLimiter, async (req, res) => {
   try {
-    const { name, email, password, invitationToken } = req.body;
+    const { name, lastName, email, password, invitationToken } = req.body;
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: "Name, email and password are required" });
+    if (!name?.trim() || !lastName?.trim() || !email || !password) {
+      return res.status(400).json({ message: "Name, last name, email and password are required" });
     }
 
-    if (password.length < 8) {
-      return res.status(400).json({ message: "Password must contain at least 8 characters" });
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({ message: "Password must contain at least 8 characters, letters and digits" });
     }
 
     const invited = await findInvitationByToken(invitationToken);
@@ -144,7 +153,12 @@ authRouter.post("/register", authLimiter, async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = await User.create({ name, email, passwordHash });
+    const user = await User.create({
+      name: name.trim(),
+      lastName: lastName.trim(),
+      email,
+      passwordHash
+    });
     const invitedProjects = await Project.find({
       "invitations.email": user.email,
       "invitations.status": "pending"
@@ -229,13 +243,14 @@ authRouter.get("/me", requireAuth, (req, res) => {
 
 authRouter.patch("/me", requireAuth, async (req, res) => {
   try {
-    const { name, phone = "", avatarUrl = "" } = req.body;
+    const { name, lastName = "", phone = "", avatarUrl = "" } = req.body;
 
-    if (!name?.trim()) {
-      return res.status(400).json({ message: "Name is required" });
+    if (!name?.trim() || !lastName?.trim()) {
+      return res.status(400).json({ message: "Name and last name are required" });
     }
 
     req.user.name = name.trim();
+    req.user.lastName = lastName.trim();
     req.user.phone = String(phone || "").trim();
     req.user.avatarUrl = String(avatarUrl || "").trim();
     await req.user.save();
@@ -250,8 +265,8 @@ authRouter.patch("/password", requireAuth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
 
-    if (!currentPassword || !newPassword || newPassword.length < 6) {
-      return res.status(400).json({ message: "Current password and new password with 6+ chars are required" });
+    if (!currentPassword || !isStrongPassword(newPassword)) {
+      return res.status(400).json({ message: "Current password and strong new password are required" });
     }
 
     const isValid = await bcrypt.compare(currentPassword, req.user.passwordHash);
