@@ -187,6 +187,29 @@ if (!process.env.TEST_MONGODB_URI) {
   });
 
   describe("project invitations", () => {
+    test("adds an existing user to project and reports member email status", async () => {
+      const owner = await register({ name: "Project Owner", email: `owner_existing_${Date.now()}@example.com` });
+      const member = await register({ name: "Existing", email: `existing_member_${Date.now()}@example.com` });
+      const project = await createProject(owner.token, "Existing member project");
+
+      const added = await request(`/api/projects/${project._id}/members`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          email: member.user.email,
+          role: "member"
+        }
+      });
+
+      assert.equal(added.response.status, 200, added.data.message);
+      assert.ok(added.data.project.members.some((item) => item.user.email === member.user.email));
+      assert.equal(added.data.email.status, "skipped");
+
+      const projects = await request("/api/projects", { token: member.token });
+      assert.equal(projects.response.status, 200, projects.data.message);
+      assert.ok(projects.data.projects.some((item) => item._id === project._id));
+    });
+
     test("creates email invitation, exposes invitation info and accepts it on registration", async () => {
       const owner = await register({ name: "Project Owner", email: `owner_project_${Date.now()}@example.com` });
       const project = await createProject(owner.token, "Email invites");

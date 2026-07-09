@@ -4,14 +4,16 @@ function smtpConfigured() {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 
-function createTransporter() {
-  const port = Number(process.env.SMTP_PORT || 587);
+function createTransportOptions(overrides = {}) {
+  const port = Number(overrides.port || process.env.SMTP_PORT || 587);
+  const secure = overrides.secure ?? (process.env.SMTP_SECURE === "true" || port === 465);
+  const requireTLS = overrides.requireTLS ?? process.env.SMTP_REQUIRE_TLS === "true";
 
-  return nodemailer.createTransport({
+  return {
     host: process.env.SMTP_HOST,
     port,
-    secure: process.env.SMTP_SECURE === "true" || port === 465,
-    requireTLS: process.env.SMTP_REQUIRE_TLS === "true",
+    secure,
+    requireTLS,
     connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
     greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
     socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 15000),
@@ -21,7 +23,25 @@ function createTransporter() {
           pass: process.env.SMTP_PASS
         }
       : undefined
-  });
+  };
+}
+
+function createTransportProfiles() {
+  const primaryPort = Number(process.env.SMTP_PORT || 587);
+  const profiles = [createTransportOptions()];
+  const fallbackPort = Number(process.env.SMTP_FALLBACK_PORT || 2525);
+  const isTimewebSmtp = process.env.SMTP_HOST === "smtp.timeweb.ru";
+
+  if (isTimewebSmtp && primaryPort !== fallbackPort) {
+    profiles.push(createTransportOptions({ port: fallbackPort, secure: false, requireTLS: true }));
+  }
+
+  return profiles;
+}
+
+function isRetryableSmtpError(error) {
+  return ["ETIMEDOUT", "ECONNECTION", "ESOCKET", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN"].includes(error?.code) ||
+    ["CONN", "GREETING"].includes(error?.command);
 }
 
 function escapeHtml(value) {
@@ -37,16 +57,30 @@ async function sendMail({ to, subject, text, html }) {
     return { skipped: true, reason: "SMTP is not configured" };
   }
 
-  const transporter = createTransporter();
-  const info = await transporter.sendMail({
-    from: process.env.SMTP_FROM,
-    to,
-    subject,
-    text,
-    html
-  });
+  let lastError;
 
-  return { skipped: false, messageId: info.messageId };
+  for (const options of createTransportProfiles()) {
+    try {
+      const transporter = nodemailer.createTransport(options);
+      const info = await transporter.sendMail({
+        from: process.env.SMTP_FROM,
+        to,
+        subject,
+        text,
+        html
+      });
+
+      return { skipped: false, messageId: info.messageId, port: options.port };
+    } catch (error) {
+      lastError = error;
+
+      if (!isRetryableSmtpError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 export async function sendProjectInvitationEmail({ email, projectName, inviterName, role, invitationUrl }) {

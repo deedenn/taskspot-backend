@@ -68,6 +68,9 @@ async function sendInvitation(project, invitation, inviter) {
     invitation.expiresAt = createInvitationExpiresAt();
   }
 
+  invitation.emailStatus = "pending";
+  invitation.emailError = "";
+
   try {
     const result = await sendProjectInvitationEmail({
       email: invitation.email,
@@ -86,25 +89,9 @@ async function sendInvitation(project, invitation, inviter) {
   }
 }
 
-async function sendInvitationAndSave(projectId, invitationId, inviter) {
-  try {
-    const project = await Project.findById(projectId);
-    const invitation = project?.invitations.id(invitationId);
-
-    if (!project || !invitation || invitation.status !== "pending") {
-      return;
-    }
-
-    await sendInvitation(project, invitation, inviter);
-    await project.save();
-  } catch (error) {
-    console.error("Failed to send project invitation email", error);
-  }
-}
-
 async function sendMemberAdded(user, project, inviter) {
   try {
-    await sendProjectMemberAddedEmail({
+    return await sendProjectMemberAddedEmail({
       email: user.email,
       projectName: project.name,
       inviterName: fullName(inviter),
@@ -112,7 +99,33 @@ async function sendMemberAdded(user, project, inviter) {
     });
   } catch (error) {
     console.error("Failed to send member email", error);
+    return { failed: true, error: error.message };
   }
+}
+
+async function attachPendingTasksToUser(project, user) {
+  const assignedTasks = await Task.find({
+    project: project._id,
+    assigneeEmail: user.email,
+    $or: [{ assignee: { $exists: false } }, { assignee: null }]
+  });
+
+  await Promise.all(
+    assignedTasks.map(async (task) => {
+      task.assignee = user._id;
+      task.assigneeEmail = undefined;
+      await task.save();
+
+      await Notification.create({
+        user: user._id,
+        project: project._id,
+        task: task._id,
+        message: `You were assigned a task in "${project.name}"`
+      });
+    })
+  );
+
+  return assignedTasks.length;
 }
 
 async function loadProject(req, res, next) {
@@ -350,6 +363,10 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
 
   const user = await User.findOne({ email: normalizedEmail });
   const organization = req.project.organization ? await Organization.findById(req.project.organization) : null;
+  let addedExistingUser = null;
+  let memberEmail = null;
+  let assignedPendingTasks = 0;
+
   if (organization) {
     const usage = await organizationUsage(organization);
     const plan = planFor(organization);
@@ -369,11 +386,21 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
       existing.role = role;
     } else {
       req.project.members.push({ user: user._id, role });
+      addedExistingUser = user;
       if (organization && !organizationMember(organization, user._id)) {
         organization.members.push({ user: user._id, role: role === "admin" ? "admin" : "member" });
         await organization.save();
       }
-      void sendMemberAdded(user, req.project, req.user);
+    }
+
+    const matchingInvitation = req.project.invitations.find(
+      (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
+    );
+
+    if (matchingInvitation) {
+      matchingInvitation.status = "accepted";
+      matchingInvitation.acceptedAt = new Date();
+      matchingInvitation.emailError = "";
     }
   } else {
     const existingInvitation = req.project.invitations.find(
@@ -397,20 +424,30 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
     }
   }
 
-  await req.project.save();
   const pendingInvitation = !user
     ? req.project.invitations.find((invitation) => invitation.email === normalizedEmail && invitation.status === "pending")
     : null;
 
   if (pendingInvitation) {
-    void sendInvitationAndSave(req.project._id, pendingInvitation._id, req.user);
+    await sendInvitation(req.project, pendingInvitation, req.user);
+  }
+
+  await req.project.save();
+
+  if (addedExistingUser) {
+    assignedPendingTasks = await attachPendingTasksToUser(req.project, addedExistingUser);
+    const result = await sendMemberAdded(addedExistingUser, req.project, req.user);
+    memberEmail = {
+      status: result.skipped ? "skipped" : result.failed ? "failed" : "sent",
+      error: result.reason || result.error || ""
+    };
   }
 
   await req.project.populate([
     { path: "members.user", select: "name lastName email" },
     { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
-  res.json({ project: req.project });
+  res.json({ project: req.project, email: memberEmail, assignedPendingTasks });
 });
 
 projectsRouter.post("/:projectId/templates", loadProject, requireAdmin, async (req, res) => {
