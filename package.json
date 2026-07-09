@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
+    "smtp:check": "node scripts/check-smtp.js",
     "test": "NODE_ENV=test node --test test"
   },
   "dependencies": {
