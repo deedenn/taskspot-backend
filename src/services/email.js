@@ -54,15 +54,45 @@ function logEmail(event, payload = {}, level = "info") {
   console[level](`${EMAIL_LOG_PREFIX} ${JSON.stringify(line)}`);
 }
 
+function uniqNumbers(values) {
+  return [...new Set(values.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0))];
+}
+
+function configuredPorts() {
+  if (process.env.SMTP_PORTS) {
+    return uniqNumbers(process.env.SMTP_PORTS.split(",").map((value) => value.trim()));
+  }
+
+  const primaryPort = Number(process.env.SMTP_PORT || 587);
+  const fallbackPort = Number(process.env.SMTP_FALLBACK_PORT || 2525);
+
+  if (isTimewebSmtp()) {
+    return uniqNumbers([primaryPort, fallbackPort, 587, 465]);
+  }
+
+  return uniqNumbers([primaryPort, fallbackPort]);
+}
+
+function defaultSecurityForPort(port) {
+  if (port === 465) {
+    return { secure: true, requireTLS: false };
+  }
+
+  if (port === 587 || port === 2525) {
+    return { secure: false, requireTLS: true };
+  }
+
+  return {
+    secure: process.env.SMTP_SECURE === "true",
+    requireTLS: process.env.SMTP_REQUIRE_TLS === "true"
+  };
+}
+
 function createTransportOptions(overrides = {}) {
   const port = Number(overrides.port || process.env.SMTP_PORT || 587);
-  const useTimewebStartTlsPort = isTimewebSmtp() && port === Number(process.env.SMTP_FALLBACK_PORT || 2525);
-  const secure = useTimewebStartTlsPort
-    ? false
-    : overrides.secure ?? (process.env.SMTP_SECURE === "true" || port === 465);
-  const requireTLS = useTimewebStartTlsPort
-    ? true
-    : overrides.requireTLS ?? process.env.SMTP_REQUIRE_TLS === "true";
+  const security = defaultSecurityForPort(port);
+  const secure = overrides.secure ?? security.secure;
+  const requireTLS = overrides.requireTLS ?? security.requireTLS;
 
   return {
     host: smtpHost() || process.env.SMTP_HOST,
@@ -82,15 +112,7 @@ function createTransportOptions(overrides = {}) {
 }
 
 function createTransportProfiles() {
-  const primaryPort = Number(process.env.SMTP_PORT || 587);
-  const profiles = [createTransportOptions()];
-  const fallbackPort = Number(process.env.SMTP_FALLBACK_PORT || 2525);
-
-  if (isTimewebSmtp() && primaryPort !== fallbackPort) {
-    profiles.push(createTransportOptions({ port: fallbackPort, secure: false, requireTLS: true }));
-  }
-
-  return profiles;
+  return configuredPorts().map((port) => createTransportOptions({ port }));
 }
 
 function isRetryableSmtpError(error) {
