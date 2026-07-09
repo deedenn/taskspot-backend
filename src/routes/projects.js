@@ -14,6 +14,7 @@ export const projectsRouter = express.Router();
 
 const TEMPLATE_PRIORITIES = ["low", "medium", "high", "urgent"];
 const TEMPLATE_RECURRENCE_FREQUENCIES = ["none", "daily", "weekly", "monthly"];
+const PROJECT_EMAIL_LOG_PREFIX = "[taskspot:project-email]";
 
 projectsRouter.use(requireRegularUser);
 
@@ -59,6 +60,18 @@ function fullName(user) {
   return [user?.name, user?.lastName].filter(Boolean).join(" ").trim() || user?.name || user?.email || "";
 }
 
+function emailDomain(email) {
+  return String(email || "").split("@")[1] || "";
+}
+
+function logProjectEmail(event, payload = {}, level = "info") {
+  console[level](`${PROJECT_EMAIL_LOG_PREFIX} ${JSON.stringify({
+    event,
+    at: new Date().toISOString(),
+    ...payload
+  })}`);
+}
+
 async function sendInvitation(project, invitation, inviter) {
   if (!invitation.token) {
     invitation.token = createInvitationToken();
@@ -72,6 +85,13 @@ async function sendInvitation(project, invitation, inviter) {
   invitation.emailError = "";
 
   try {
+    logProjectEmail("invitation_email_send_start", {
+      projectId: project._id?.toString(),
+      invitationId: invitation._id?.toString(),
+      recipientDomain: emailDomain(invitation.email),
+      role: invitation.role
+    });
+
     const result = await sendProjectInvitationEmail({
       email: invitation.email,
       projectName: project.name,
@@ -83,9 +103,62 @@ async function sendInvitation(project, invitation, inviter) {
     invitation.emailStatus = result.skipped ? "skipped" : "sent";
     invitation.emailSentAt = result.skipped ? invitation.emailSentAt : new Date();
     invitation.emailError = result.skipped ? result.reason : "";
+
+    logProjectEmail("invitation_email_send_finish", {
+      projectId: project._id?.toString(),
+      invitationId: invitation._id?.toString(),
+      recipientDomain: emailDomain(invitation.email),
+      status: invitation.emailStatus,
+      port: result.port,
+      skippedReason: result.reason || ""
+    }, result.skipped ? "warn" : "info");
   } catch (error) {
     invitation.emailStatus = "failed";
     invitation.emailError = error.message;
+
+    logProjectEmail("invitation_email_send_failed", {
+      projectId: project._id?.toString(),
+      invitationId: invitation._id?.toString(),
+      recipientDomain: emailDomain(invitation.email),
+      error: error.message,
+      code: error.code,
+      command: error.command,
+      responseCode: error.responseCode
+    }, "error");
+  }
+}
+
+async function sendInvitationAndSave(projectId, invitationId, inviter) {
+  try {
+    const project = await Project.findById(projectId);
+    const invitation = project?.invitations.id(invitationId);
+
+    if (!project || !invitation || invitation.status !== "pending") {
+      logProjectEmail("invitation_email_background_skipped", {
+        projectId: projectId?.toString(),
+        invitationId: invitationId?.toString(),
+        reason: !project ? "project_not_found" : "invitation_not_pending"
+      }, "warn");
+      return;
+    }
+
+    await sendInvitation(project, invitation, inviter);
+    await project.save();
+
+    logProjectEmail("invitation_email_status_saved", {
+      projectId: project._id?.toString(),
+      invitationId: invitation._id?.toString(),
+      status: invitation.emailStatus
+    }, invitation.emailStatus === "failed" ? "error" : "info");
+  } catch (error) {
+    logProjectEmail("invitation_email_background_failed", {
+      projectId: projectId?.toString(),
+      invitationId: invitationId?.toString(),
+      error: error.message,
+      code: error.code,
+      command: error.command,
+      responseCode: error.responseCode
+    }, "error");
   }
 }
 
@@ -365,6 +438,7 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
   const organization = req.project.organization ? await Organization.findById(req.project.organization) : null;
   let addedExistingUser = null;
   let memberEmail = null;
+  let invitationEmail = null;
   let assignedPendingTasks = 0;
 
   if (organization) {
@@ -429,10 +503,19 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
     : null;
 
   if (pendingInvitation) {
-    await sendInvitation(req.project, pendingInvitation, req.user);
+    pendingInvitation.emailStatus = "pending";
+    pendingInvitation.emailError = "";
+    invitationEmail = {
+      status: "pending",
+      invitationId: pendingInvitation._id?.toString()
+    };
   }
 
   await req.project.save();
+
+  if (pendingInvitation) {
+    void sendInvitationAndSave(req.project._id, pendingInvitation._id, req.user);
+  }
 
   if (addedExistingUser) {
     assignedPendingTasks = await attachPendingTasksToUser(req.project, addedExistingUser);
@@ -447,7 +530,7 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
     { path: "members.user", select: "name lastName email" },
     { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
-  res.json({ project: req.project, email: memberEmail, assignedPendingTasks });
+  res.json({ project: req.project, email: memberEmail || invitationEmail, assignedPendingTasks });
 });
 
 projectsRouter.post("/:projectId/templates", loadProject, requireAdmin, async (req, res) => {

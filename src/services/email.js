@@ -1,16 +1,71 @@
 import nodemailer from "nodemailer";
 
-function smtpConfigured() {
-  return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
+const EMAIL_LOG_PREFIX = "[taskspot:email]";
+
+function smtpReadiness() {
+  const requiredKeys = ["SMTP_HOST", "SMTP_FROM", "SMTP_USER", "SMTP_PASS"];
+  const missing = requiredKeys.filter((key) => !process.env[key]);
+
+  return { missing };
+}
+
+function smtpHost() {
+  return String(process.env.SMTP_HOST || "").trim().toLowerCase();
+}
+
+function isTimewebSmtp() {
+  return smtpHost() === "smtp.timeweb.ru";
+}
+
+function maskEmail(email) {
+  const [local = "", domain = ""] = String(email || "").split("@");
+
+  if (!domain) {
+    return "***";
+  }
+
+  const visible = local.slice(0, 2);
+  return `${visible}${local.length > 2 ? "***" : "*"}@${domain}`;
+}
+
+function smtpPublicConfig(options) {
+  return {
+    host: options.host,
+    port: options.port,
+    secure: options.secure,
+    requireTLS: options.requireTLS,
+    hasAuthUser: Boolean(options.auth?.user),
+    hasAuthPass: Boolean(options.auth?.pass),
+    from: process.env.SMTP_FROM || "",
+    user: process.env.SMTP_USER || "",
+    connectionTimeout: options.connectionTimeout,
+    greetingTimeout: options.greetingTimeout,
+    socketTimeout: options.socketTimeout
+  };
+}
+
+function logEmail(event, payload = {}, level = "info") {
+  const line = {
+    event,
+    at: new Date().toISOString(),
+    ...payload
+  };
+
+  console[level](`${EMAIL_LOG_PREFIX} ${JSON.stringify(line)}`);
 }
 
 function createTransportOptions(overrides = {}) {
   const port = Number(overrides.port || process.env.SMTP_PORT || 587);
-  const secure = overrides.secure ?? (process.env.SMTP_SECURE === "true" || port === 465);
-  const requireTLS = overrides.requireTLS ?? process.env.SMTP_REQUIRE_TLS === "true";
+  const useTimewebStartTlsPort = isTimewebSmtp() && port === Number(process.env.SMTP_FALLBACK_PORT || 2525);
+  const secure = useTimewebStartTlsPort
+    ? false
+    : overrides.secure ?? (process.env.SMTP_SECURE === "true" || port === 465);
+  const requireTLS = useTimewebStartTlsPort
+    ? true
+    : overrides.requireTLS ?? process.env.SMTP_REQUIRE_TLS === "true";
 
   return {
-    host: process.env.SMTP_HOST,
+    host: smtpHost() || process.env.SMTP_HOST,
     port,
     secure,
     requireTLS,
@@ -30,9 +85,8 @@ function createTransportProfiles() {
   const primaryPort = Number(process.env.SMTP_PORT || 587);
   const profiles = [createTransportOptions()];
   const fallbackPort = Number(process.env.SMTP_FALLBACK_PORT || 2525);
-  const isTimewebSmtp = process.env.SMTP_HOST === "smtp.timeweb.ru";
 
-  if (isTimewebSmtp && primaryPort !== fallbackPort) {
+  if (isTimewebSmtp() && primaryPort !== fallbackPort) {
     profiles.push(createTransportOptions({ port: fallbackPort, secure: false, requireTLS: true }));
   }
 
@@ -53,14 +107,34 @@ function escapeHtml(value) {
 }
 
 async function sendMail({ to, subject, text, html }) {
-  if (!smtpConfigured()) {
-    return { skipped: true, reason: "SMTP is not configured" };
+  const readiness = smtpReadiness();
+
+  if (readiness.missing.length) {
+    logEmail("smtp_skipped", {
+      reason: "SMTP is not configured",
+      missingKeys: readiness.missing,
+      to: maskEmail(to),
+      subject
+    }, "warn");
+    return { skipped: true, reason: `SMTP is not configured: ${readiness.missing.join(", ")}` };
   }
 
   let lastError;
+  const profiles = createTransportProfiles();
 
-  for (const options of createTransportProfiles()) {
+  logEmail("smtp_send_start", {
+    to: maskEmail(to),
+    subject,
+    profiles: profiles.map(smtpPublicConfig)
+  });
+
+  for (const options of profiles) {
     try {
+      logEmail("smtp_attempt", {
+        to: maskEmail(to),
+        subject,
+        profile: smtpPublicConfig(options)
+      });
       const transporter = nodemailer.createTransport(options);
       const info = await transporter.sendMail({
         from: process.env.SMTP_FROM,
@@ -70,15 +144,40 @@ async function sendMail({ to, subject, text, html }) {
         html
       });
 
+      logEmail("smtp_sent", {
+        to: maskEmail(to),
+        subject,
+        messageId: info.messageId,
+        port: options.port
+      });
+
       return { skipped: false, messageId: info.messageId, port: options.port };
     } catch (error) {
       lastError = error;
+
+      logEmail("smtp_attempt_failed", {
+        to: maskEmail(to),
+        subject,
+        profile: smtpPublicConfig(options),
+        error: error.message,
+        code: error.code,
+        command: error.command,
+        retryable: isRetryableSmtpError(error)
+      }, "error");
 
       if (!isRetryableSmtpError(error)) {
         throw error;
       }
     }
   }
+
+  logEmail("smtp_send_failed", {
+    to: maskEmail(to),
+    subject,
+    error: lastError?.message,
+    code: lastError?.code,
+    command: lastError?.command
+  }, "error");
 
   throw lastError;
 }
