@@ -66,8 +66,11 @@ export async function ensureDefaultOrganization(user) {
 }
 
 export async function organizationUsage(organization) {
-  const projects = await Project.find({ organization: organization._id }).select("_id members templates");
+  const projects = await Project.find({ organization: organization._id }).select("_id members templates isArchived archivedAt");
   const projectIds = projects.map((project) => project._id);
+  const activeProjectIds = projects
+    .filter((project) => !project.isArchived && !project.archivedAt)
+    .map((project) => project._id);
   const users = new Set();
   let templates = 0;
 
@@ -78,13 +81,13 @@ export async function organizationUsage(organization) {
   });
 
   const [activeTasks, attachments, recurringTasks] = await Promise.all([
-    Task.countDocuments({ project: { $in: projectIds }, status: { $ne: "closed" } }),
+    Task.countDocuments({ project: { $in: activeProjectIds }, status: { $ne: "closed" } }),
     Task.aggregate([
       { $match: { project: { $in: projectIds } } },
       { $project: { count: { $size: "$attachments" } } },
       { $group: { _id: null, total: { $sum: "$count" } } }
     ]),
-    Task.countDocuments({ project: { $in: projectIds }, "recurrence.enabled": true, status: { $ne: "closed" } })
+    Task.countDocuments({ project: { $in: activeProjectIds }, "recurrence.enabled": true, status: { $ne: "closed" } })
   ]);
 
   return {

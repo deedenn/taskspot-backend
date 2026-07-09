@@ -321,6 +321,115 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(updatedTask.response.status, 200, updatedTask.data.message);
       assert.deepEqual(updatedTask.data.task.categories, []);
     });
+
+    test("archives, restores and permanently deletes projects with tasks", async () => {
+      const owner = await register({ name: "Archive Owner", email: `archive_${Date.now()}@example.com` });
+      const assignee = await register({ name: "Archive Assignee", email: `archive_assignee_${Date.now()}@example.com` });
+      const project = await createProject(owner.token, "Archive lifecycle");
+
+      const member = await request(`/api/projects/${project._id}/members`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          email: assignee.user.email,
+          role: "member"
+        }
+      });
+      assert.equal(member.response.status, 200, member.data.message);
+
+      const task = await request("/api/tasks", {
+        method: "POST",
+        token: owner.token,
+        body: {
+          projectId: project._id,
+          description: "Task in archived project",
+          dueDate: new Date(Date.now() + 86400000).toISOString(),
+          assignee: assignee.user._id,
+          observers: [],
+          categories: [],
+          priority: "medium"
+        }
+      });
+      assert.equal(task.response.status, 201, task.data.message);
+
+      const archived = await request(`/api/projects/${project._id}/archive`, {
+        method: "PATCH",
+        token: owner.token
+      });
+      assert.equal(archived.response.status, 200, archived.data.message);
+      assert.equal(archived.data.project.isArchived, true);
+      assert.ok(archived.data.project.archivedAt);
+
+      const archivedTasks = await request(`/api/tasks?projectId=${project._id}`, { token: owner.token });
+      assert.equal(archivedTasks.response.status, 200, archivedTasks.data.message);
+      assert.equal(archivedTasks.data.tasks.length, 1);
+
+      const cannotCreateTask = await request("/api/tasks", {
+        method: "POST",
+        token: owner.token,
+        body: {
+          projectId: project._id,
+          description: "Should not be created",
+          dueDate: new Date(Date.now() + 86400000).toISOString(),
+          assignee: assignee.user._id,
+          observers: [],
+          categories: [],
+          priority: "medium"
+        }
+      });
+      assert.equal(cannotCreateTask.response.status, 409);
+
+      const cannotChangeArchivedTask = await request(`/api/tasks/${task.data.task._id}`, {
+        method: "PATCH",
+        token: assignee.token,
+        body: { status: "review" }
+      });
+      assert.equal(cannotChangeArchivedTask.response.status, 409);
+
+      const cannotCommentArchivedTask = await request(`/api/tasks/${task.data.task._id}/comments`, {
+        method: "POST",
+        token: owner.token,
+        body: { text: "Archived task is read-only" }
+      });
+      assert.equal(cannotCommentArchivedTask.response.status, 409);
+
+      const restored = await request(`/api/projects/${project._id}/restore`, {
+        method: "PATCH",
+        token: owner.token
+      });
+      assert.equal(restored.response.status, 200, restored.data.message);
+      assert.equal(restored.data.project.isArchived, false);
+
+      const reviewAfterRestore = await request(`/api/tasks/${task.data.task._id}`, {
+        method: "PATCH",
+        token: assignee.token,
+        body: { status: "review" }
+      });
+      assert.equal(reviewAfterRestore.response.status, 200, reviewAfterRestore.data.message);
+      assert.equal(reviewAfterRestore.data.task.status, "review");
+
+      const missingConfirmation = await request(`/api/projects/${project._id}`, {
+        method: "DELETE",
+        token: owner.token,
+        body: { confirm: "DELETE" }
+      });
+      assert.equal(missingConfirmation.response.status, 400);
+
+      const deleted = await request(`/api/projects/${project._id}`, {
+        method: "DELETE",
+        token: owner.token,
+        body: { confirm: "DELETE_PROJECT_WITH_TASKS" }
+      });
+      assert.equal(deleted.response.status, 200, deleted.data.message);
+      assert.equal(deleted.data.deleted, true);
+      assert.equal(deleted.data.tasksDeleted, 1);
+
+      const deletedProject = await request(`/api/projects/${project._id}`, { token: owner.token });
+      assert.equal(deletedProject.response.status, 404);
+
+      const deletedTask = await request(`/api/tasks/${task.data.task._id}`, { token: owner.token });
+      assert.equal(deletedTask.response.status, 404);
+    });
   });
 
   describe("tasks", () => {

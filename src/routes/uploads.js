@@ -60,6 +60,10 @@ uploadsRouter.post("/presign", async (req, res) => {
     return res.status(403).json({ message: "Task access denied" });
   }
 
+  if (project.isArchived || project.archivedAt) {
+    return res.status(409).json({ message: "Archived project tasks are available for viewing only" });
+  }
+
   if (!canAttachFile(task, project, req.user._id)) {
     return res.status(403).json({ message: "Only project admin, task creator or assignee can add attachments" });
   }

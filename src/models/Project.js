@@ -158,7 +158,18 @@ const projectSchema = new mongoose.Schema(
     members: [projectMemberSchema],
     categories: [categorySchema],
     invitations: [invitationSchema],
-    templates: [taskTemplateSchema]
+    templates: [taskTemplateSchema],
+    isArchived: {
+      type: Boolean,
+      default: false
+    },
+    archivedAt: {
+      type: Date
+    },
+    archivedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    }
   },
   { timestamps: true }
 );

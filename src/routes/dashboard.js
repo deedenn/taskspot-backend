@@ -10,15 +10,15 @@ dashboardRouter.use(requireRegularUser);
 dashboardRouter.get("/", async (req, res) => {
   const [initiated, assigned, observing, notifications] = await Promise.all([
     Task.find({ creator: req.user._id })
-      .populate("project", "name")
+      .populate("project", "name isArchived archivedAt")
       .populate("assignee", "name email")
       .sort({ updatedAt: -1 }),
     Task.find({ assignee: req.user._id })
-      .populate("project", "name")
+      .populate("project", "name isArchived archivedAt")
       .populate("creator", "name email")
       .sort({ updatedAt: -1 }),
     Task.find({ observers: req.user._id })
-      .populate("project", "name")
+      .populate("project", "name isArchived archivedAt")
       .populate("creator", "name email")
       .populate("assignee", "name email")
       .sort({ updatedAt: -1 }),

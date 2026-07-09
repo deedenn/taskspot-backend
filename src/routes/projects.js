@@ -1,12 +1,14 @@
 import express from "express";
 import crypto from "node:crypto";
 import { requireRegularUser } from "../middleware/auth.js";
+import { Notification } from "../models/Notification.js";
 import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendProjectInvitationEmail, sendProjectMemberAddedEmail } from "../services/email.js";
 import { ensureDefaultOrganization, limitExceeded, organizationUsage, planFor } from "../services/plans.js";
+import { deleteObjectForKey } from "../services/storage.js";
 
 export const projectsRouter = express.Router();
 
@@ -33,6 +35,16 @@ function createInvitationToken() {
 
 function createInvitationExpiresAt() {
   return new Date(Date.now() + 1000 * 60 * 60 * 24 * 14);
+}
+
+async function populateProject(project) {
+  await project.populate([
+    { path: "organization", select: "name plan" },
+    { path: "members.user", select: "name email" },
+    { path: "invitations.invitedBy", select: "name email" },
+    { path: "archivedBy", select: "name email" }
+  ]);
+  return project;
 }
 
 function frontendUrl() {
@@ -111,6 +123,7 @@ projectsRouter.get("/", async (req, res) => {
     .populate("organization", "name plan")
     .populate("members.user", "name email")
     .populate("invitations.invitedBy", "name email")
+    .populate("archivedBy", "name email")
     .sort({ updatedAt: -1 });
 
   res.json({ projects });
@@ -217,7 +230,8 @@ projectsRouter.get("/:projectId", loadProject, async (req, res) => {
   await req.project.populate([
     { path: "organization", select: "name plan" },
     { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" }
+    { path: "invitations.invitedBy", select: "name email" },
+    { path: "archivedBy", select: "name email" }
   ]);
   res.json({ project: req.project });
 });
@@ -232,11 +246,74 @@ projectsRouter.patch("/:projectId", loadProject, requireAdmin, async (req, res) 
   req.project.name = name.trim();
   req.project.description = description.trim();
   await req.project.save();
-  await req.project.populate([
-    { path: "members.user", select: "name email" },
-    { path: "invitations.invitedBy", select: "name email" }
-  ]);
+  await populateProject(req.project);
   res.json({ project: req.project });
+});
+
+projectsRouter.patch("/:projectId/archive", loadProject, requireAdmin, async (req, res) => {
+  if (!req.project.isArchived) {
+    req.project.isArchived = true;
+    req.project.archivedAt = new Date();
+    req.project.archivedBy = req.user._id;
+    await req.project.save();
+  }
+
+  await populateProject(req.project);
+  res.json({ project: req.project });
+});
+
+projectsRouter.patch("/:projectId/restore", loadProject, requireAdmin, async (req, res) => {
+  if (req.project.isArchived) {
+    req.project.isArchived = false;
+    req.project.archivedAt = undefined;
+    req.project.archivedBy = undefined;
+    await req.project.save();
+  }
+
+  await populateProject(req.project);
+  res.json({ project: req.project });
+});
+
+projectsRouter.delete("/:projectId", loadProject, requireAdmin, async (req, res) => {
+  if (req.body?.confirm !== "DELETE_PROJECT_WITH_TASKS") {
+    return res.status(400).json({
+      message: "Project deletion requires confirmation of permanent task deletion"
+    });
+  }
+
+  const tasks = await Task.find({ project: req.project._id }).select("attachments.key");
+  const taskIds = tasks.map((task) => task._id);
+  const attachmentKeys = tasks.flatMap((task) =>
+    (task.attachments || [])
+      .map((attachment) => attachment.key)
+      .filter(Boolean)
+  );
+
+  await Promise.all([
+    Task.deleteMany({ project: req.project._id }),
+    Notification.deleteMany({
+      $or: [
+        { project: req.project._id },
+        { task: { $in: taskIds } }
+      ]
+    }),
+    Project.deleteOne({ _id: req.project._id })
+  ]);
+
+  const storageResults = await Promise.allSettled(
+    attachmentKeys.map((key) => deleteObjectForKey(key))
+  );
+  storageResults
+    .filter((result) => result.status === "rejected")
+    .forEach((result) => {
+      console.error("Failed to delete project attachment object", result.reason);
+    });
+
+  res.json({
+    deleted: true,
+    tasksDeleted: taskIds.length,
+    attachmentsDeleted: attachmentKeys.length
+  });
 });
 
 projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req, res) => {

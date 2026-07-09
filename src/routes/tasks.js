@@ -32,6 +32,10 @@ function isProjectAdmin(project, userId) {
   return projectMember(project, userId)?.role === "admin";
 }
 
+function isArchivedProject(project) {
+  return Boolean(project?.isArchived || project?.archivedAt);
+}
+
 function isVisibleTask(task, project, userId) {
   return (
     isProjectAdmin(project, userId) ||
@@ -262,7 +266,7 @@ async function loadTask(req, res, next) {
 
 async function respondWithTask(res, task) {
   await task.populate([
-    { path: "project", select: "name categories members" },
+    { path: "project", select: "name categories members isArchived archivedAt archivedBy" },
     { path: "creator", select: "name email" },
     { path: "assignee", select: "name email" },
     { path: "observers", select: "name email" },
@@ -301,6 +305,10 @@ tasksRouter.get("/:taskId/attachments/:attachmentId/download-url", loadTask, asy
 
 tasksRouter.post("/:taskId/attachments", loadTask, async (req, res) => {
   const userId = req.user._id;
+
+  if (isArchivedProject(req.project)) {
+    return res.status(409).json({ message: "Archived project tasks are available for viewing only" });
+  }
 
   if (!canUpdateTaskAttachments(req.task, req.project, userId)) {
     return res.status(403).json({ message: "Only project admin, task creator or assignee can add attachments" });
@@ -355,6 +363,10 @@ tasksRouter.post("/:taskId/attachments", loadTask, async (req, res) => {
 
 tasksRouter.delete("/:taskId/attachments/:attachmentId", loadTask, async (req, res) => {
   const userId = req.user._id;
+
+  if (isArchivedProject(req.project)) {
+    return res.status(409).json({ message: "Archived project tasks are available for viewing only" });
+  }
 
   if (!canUpdateTaskAttachments(req.task, req.project, userId)) {
     return res.status(403).json({ message: "Only project admin, task creator or assignee can delete attachments" });
@@ -436,6 +448,10 @@ tasksRouter.post("/", async (req, res) => {
 
   if (!project || !projectMember(project, req.user._id)) {
     return res.status(403).json({ message: "Project access denied" });
+  }
+
+  if (isArchivedProject(project)) {
+    return res.status(409).json({ message: "Archived project does not accept new tasks" });
   }
 
   if (!description || !dueDate) {
@@ -549,6 +565,10 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   const canUpdateAttachments = canUpdateTaskAttachments(req.task, req.project, userId);
   const detailFields = ["description", "dueDate", "categories", "assignee", "observers", "priority", "recurrence"];
   const hasDetailChanges = detailFields.some((field) => hasOwn(req.body, field));
+
+  if (isArchivedProject(req.project)) {
+    return res.status(409).json({ message: "Archived project tasks are available for viewing only" });
+  }
 
   if (hasDetailChanges && !canEditDetails) {
     return res.status(403).json({ message: "Only project admin or task creator can edit task details" });
@@ -845,6 +865,10 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
 
 tasksRouter.post("/:taskId/comments", loadTask, async (req, res) => {
   const { text } = req.body;
+
+  if (isArchivedProject(req.project)) {
+    return res.status(409).json({ message: "Archived project tasks are available for viewing only" });
+  }
 
   if (!text) {
     return res.status(400).json({ message: "Comment text is required" });
