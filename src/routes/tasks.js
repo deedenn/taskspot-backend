@@ -535,7 +535,7 @@ tasksRouter.post("/", async (req, res) => {
       user: resolvedAssignee.assignee,
       project: project._id,
       task: task._id,
-      message: `You were assigned a task in "${project.name}"`
+      message: `Вам назначена задача в проекте «${project.name}»`
     });
   }
 
@@ -734,7 +734,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
         user: resolvedAssignee.assignee,
         project: req.project._id,
         task: req.task._id,
-        message: `You were assigned a task in "${req.project.name}"`
+        message: `Вам назначена задача в проекте «${req.project.name}»`
       });
     }
   }
@@ -838,7 +838,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       user: req.task.creator,
       project: req.project._id,
       task: req.task._id,
-      message: `Task "${req.task.description}" is ready for review`
+      message: `Задача «${req.task.description}» ожидает проверки`
     });
   }
 
@@ -847,7 +847,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       user: req.task.assignee,
       project: req.project._id,
       task: req.task._id,
-      message: `Task "${req.task.description}" was closed`
+      message: `Задача «${req.task.description}» закрыта`
     });
   }
 
@@ -856,7 +856,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       user: req.task.assignee,
       project: req.project._id,
       task: req.task._id,
-      message: `Task "${req.task.description}" was sent back to work`
+      message: `Задача «${req.task.description}» возвращена на доработку`
     });
   }
 
@@ -890,7 +890,7 @@ tasksRouter.post("/:taskId/comments", loadTask, async (req, res) => {
         user: recipientId,
         project: req.project._id,
         task: req.task._id,
-        message: `New comment in task "${req.task.description}"`
+        message: `Новый комментарий в задаче «${req.task.description}»`
       })
     )
   );

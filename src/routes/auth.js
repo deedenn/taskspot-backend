@@ -195,7 +195,7 @@ authRouter.post("/register", authLimiter, async (req, res) => {
                 user: user._id,
                 project: project._id,
                 task: task._id,
-                message: `You were assigned a task in "${project.name}"`
+                message: `Вам назначена задача в проекте «${project.name}»`
               });
             })
           );
