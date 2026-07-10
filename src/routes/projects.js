@@ -663,35 +663,32 @@ projectsRouter.post("/:projectId/categories", loadProject, requireAdmin, async (
 });
 
 projectsRouter.delete("/:projectId/categories/:categoryId", loadProject, requireAdmin, async (req, res) => {
-  const requestedCategory = decodeURIComponent(req.params.categoryId || "");
-  const removedCategoryIds = [];
-  const removedCategoryNames = [];
+  const requestedCategoryId = req.params.categoryId || "";
+  const existingCategory = req.project.categories.find(
+    (category) => category._id?.toString() === requestedCategoryId
+  );
 
-  req.project.categories = req.project.categories.filter((category) => {
-    const categoryId = category._id?.toString();
-    const categoryName = category.name?.trim();
-    const shouldRemove = categoryId === requestedCategory || categoryName === requestedCategory;
-
-    if (shouldRemove) {
-      if (categoryId) removedCategoryIds.push(categoryId);
-      if (categoryName) removedCategoryNames.push(categoryName);
-    }
-
-    return !shouldRemove;
-  });
-
-  if (!removedCategoryIds.length && !removedCategoryNames.length) {
+  if (!existingCategory) {
     return res.status(404).json({ message: "Category not found" });
   }
 
-  await req.project.save();
-
-  if (removedCategoryIds.length) {
-    await Task.updateMany(
-      { project: req.project._id },
-      { $pull: { categories: { $in: removedCategoryIds } } }
+  req.project.categories = req.project.categories.filter(
+    (category) => category._id?.toString() !== requestedCategoryId
+  );
+  req.project.templates.forEach((template) => {
+    template.categories = template.categories.filter(
+      (categoryId) => categoryId?.toString() !== requestedCategoryId
     );
-  }
+  });
 
-  res.json({ categories: req.project.categories });
+  await Promise.all([
+    req.project.save(),
+    Task.updateMany(
+      { project: req.project._id },
+      { $pull: { categories: requestedCategoryId } }
+    )
+  ]);
+
+  await populateProject(req.project);
+  res.json({ project: req.project, categories: req.project.categories });
 });
