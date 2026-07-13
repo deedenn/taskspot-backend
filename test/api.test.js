@@ -39,14 +39,37 @@ if (!process.env.TEST_MONGODB_URI) {
     return { response, data };
   }
 
-  async function register({ name, lastName = "Тестов", email, password = "password123", invitationToken }) {
+  async function registerRaw({ name, lastName = "Тестов", email, password = "password123", invitationToken }) {
     const { response, data } = await request("/api/auth/register", {
       method: "POST",
       body: { name, lastName, email, password, invitationToken }
     });
 
     assert.equal(response.status, 201, data.message);
+    assert.equal(data.requiresEmailVerification, true);
+    assert.ok(data.verificationToken);
+    assert.equal(data.email, email.toLowerCase());
+
+    return data;
+  }
+
+  async function verifyEmail(token) {
+    const { response, data } = await request("/api/auth/email/verify", {
+      method: "POST",
+      body: { token }
+    });
+
+    assert.equal(response.status, 200, data.message);
     assert.ok(data.token);
+    assert.ok(data.user.emailVerifiedAt);
+
+    return data;
+  }
+
+  async function register({ name, lastName = "Тестов", email, password = "password123", invitationToken }) {
+    const created = await registerRaw({ name, lastName, email, password, invitationToken });
+    const data = await verifyEmail(created.verificationToken);
+
     assert.equal(data.user.email, email.toLowerCase());
     assert.equal(data.user.lastName, lastName);
 
@@ -89,6 +112,31 @@ if (!process.env.TEST_MONGODB_URI) {
   });
 
   describe("auth and profile", () => {
+    test("requires email confirmation before login", async () => {
+      const email = `pending_${Date.now()}@example.com`;
+      const created = await registerRaw({ name: "Pending", email });
+
+      const rejectedLogin = await request("/api/auth/login", {
+        method: "POST",
+        body: {
+          email,
+          password: "password123"
+        }
+      });
+      assert.equal(rejectedLogin.response.status, 403);
+      assert.equal(rejectedLogin.data.requiresEmailVerification, true);
+
+      const resend = await request("/api/auth/email/resend", {
+        method: "POST",
+        body: { email }
+      });
+      assert.equal(resend.response.status, 200, resend.data.message);
+      assert.ok(resend.data.verificationToken);
+
+      const verified = await verifyEmail(resend.data.verificationToken || created.verificationToken);
+      assert.equal(verified.user.email, email);
+    });
+
     test("registers, logs in, reads and updates profile", async () => {
       const email = `owner_${Date.now()}@example.com`;
       const registered = await register({ name: "Owner", email });

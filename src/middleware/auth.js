@@ -31,6 +31,13 @@ export async function requireAuth(req, res, next) {
 
 export function requireRegularUser(req, res, next) {
   return requireAuth(req, res, () => {
+    if (!req.user?.emailVerifiedAt && ["pending", "sent", "failed", "skipped"].includes(req.user?.emailVerificationStatus)) {
+      return res.status(403).json({
+        message: "Подтвердите email, чтобы продолжить работу",
+        requiresEmailVerification: true
+      });
+    }
+
     if (req.user?.isSuperAdmin) {
       return res.status(403).json({ message: "Super admin cannot use workspace features" });
     }

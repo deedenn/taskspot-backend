@@ -260,6 +260,36 @@ export async function sendProjectMemberAddedEmail({ email, projectName, inviterN
   });
 }
 
+export async function sendEmailVerificationEmail({ email, name, verificationUrl }) {
+  const safeName = escapeHtml(name || "пользователь");
+  const safeUrl = escapeHtml(verificationUrl);
+
+  return sendMail({
+    to: email,
+    subject: "Подтвердите регистрацию в Taskspot",
+    text: [
+      `Здравствуйте, ${name || "пользователь"}!`,
+      "Подтвердите email, чтобы начать работу в Taskspot.",
+      `Подтвердить регистрацию: ${verificationUrl}`,
+      "Если вы не регистрировались в Taskspot, просто проигнорируйте это письмо."
+    ].join("\n\n"),
+    html: `
+      <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #17202a;">
+        <h2 style="margin: 0 0 12px;">Подтверждение регистрации</h2>
+        <p>Здравствуйте, ${safeName}!</p>
+        <p>Подтвердите email, чтобы начать работу в <strong>Taskspot</strong>.</p>
+        <p>
+          <a href="${safeUrl}" style="display:inline-block;padding:10px 16px;border-radius:6px;background:#2563eb;color:#ffffff;text-decoration:none;">
+            Подтвердить email
+          </a>
+        </p>
+        <p style="color:#6b7a86;">Если кнопка не открывается, скопируйте ссылку: ${safeUrl}</p>
+        <p style="color:#6b7a86;">Если вы не регистрировались в Taskspot, просто проигнорируйте это письмо.</p>
+      </div>
+    `
+  });
+}
+
 export async function sendTaskNotificationEmail({ email, projectName, taskDescription, message, taskUrl }) {
   const safeProject = escapeHtml(projectName);
   const safeTask = escapeHtml(taskDescription);

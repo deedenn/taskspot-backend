@@ -44,14 +44,39 @@ const userSchema = new mongoose.Schema(
     },
     lastLoginAt: {
       type: Date
+    },
+    emailVerifiedAt: {
+      type: Date
+    },
+    emailVerificationTokenHash: {
+      type: String,
+      default: ""
+    },
+    emailVerificationExpiresAt: {
+      type: Date
+    },
+    emailVerificationSentAt: {
+      type: Date
+    },
+    emailVerificationStatus: {
+      type: String,
+      enum: ["verified", "pending", "sent", "failed", "skipped"],
+      default: "verified"
+    },
+    emailVerificationError: {
+      type: String,
+      default: ""
     }
   },
   { timestamps: true }
 );
 
+userSchema.index({ emailVerificationTokenHash: 1 });
+
 userSchema.methods.toJSON = function toJSON() {
   const user = this.toObject();
   delete user.passwordHash;
+  delete user.emailVerificationTokenHash;
   return user;
 };
 
