@@ -236,11 +236,32 @@ function normalizeRecurrence(recurrence, fallbackDueDate) {
     throw error;
   }
 
+  if (enabled && !recurrence.nextRunAt && !fallbackDueDate) {
+    const error = new Error("Due date is required for recurring tasks");
+    error.statusCode = 400;
+    throw error;
+  }
+
   return {
     enabled,
     frequency,
     nextRunAt: enabled ? recurrence.nextRunAt || fallbackDueDate : undefined
   };
+}
+
+function parseOptionalDueDate(dueDate) {
+  if (dueDate === undefined || dueDate === null || dueDate === "") {
+    return undefined;
+  }
+
+  const parsedDueDate = new Date(dueDate);
+  if (Number.isNaN(parsedDueDate.getTime())) {
+    const error = new Error("Due date is invalid");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return parsedDueDate;
 }
 
 async function loadTask(req, res, next) {
@@ -274,6 +295,7 @@ async function respondWithTask(res, task) {
     { path: "comments.author", select: "name lastName email" },
     { path: "activities.actor", select: "name lastName email" }
   ]);
+  await task.project?.populate?.("members.user", "name lastName email");
   res.json({ task });
 }
 
@@ -454,13 +476,8 @@ tasksRouter.post("/", async (req, res) => {
     return res.status(409).json({ message: "Archived project does not accept new tasks" });
   }
 
-  if (!description || !dueDate) {
-    return res.status(400).json({ message: "Description and due date are required" });
-  }
-
-  const parsedDueDate = new Date(dueDate);
-  if (Number.isNaN(parsedDueDate.getTime())) {
-    return res.status(400).json({ message: "Due date is invalid" });
+  if (!description?.trim()) {
+    return res.status(400).json({ message: "Description is required" });
   }
 
   if (!TASK_PRIORITIES.includes(priority)) {
@@ -471,8 +488,10 @@ tasksRouter.post("/", async (req, res) => {
   let normalizedChecklist;
   let normalizedAttachments;
   let normalizedRecurrence;
+  let parsedDueDate;
 
   try {
+    parsedDueDate = parseOptionalDueDate(dueDate);
     validCategories = normalizeCategories(project, categories);
     normalizedChecklist = normalizeChecklist(checklist);
     normalizedAttachments = normalizeAttachments(attachments, [], req.user._id);
@@ -667,17 +686,15 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   }
 
   if (hasOwn(req.body, "dueDate")) {
-    if (!dueDate) {
-      return res.status(400).json({ message: "Due date is required" });
-    }
-
-    const parsedDueDate = new Date(dueDate);
-    if (Number.isNaN(parsedDueDate.getTime())) {
-      return res.status(400).json({ message: "Due date is invalid" });
+    let parsedDueDate;
+    try {
+      parsedDueDate = parseOptionalDueDate(dueDate);
+    } catch (error) {
+      return res.status(error.statusCode || 400).json({ message: error.message });
     }
 
     const previousDueDate = req.task.dueDate?.toISOString();
-    const nextDueDate = parsedDueDate.toISOString();
+    const nextDueDate = parsedDueDate?.toISOString();
 
     if (previousDueDate !== nextDueDate) {
       addActivity(req.task, userId, "due_date_changed", {

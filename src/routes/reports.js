@@ -21,6 +21,10 @@ function isActive(task) {
   return !["review", "done", "closed"].includes(task.status);
 }
 
+function isOverdue(task, today) {
+  return Boolean(task.dueDate) && task.dueDate < today && isActive(task);
+}
+
 function fullName(user) {
   return [user?.name, user?.lastName].filter(Boolean).join(" ").trim() || user?.email || "";
 }
@@ -49,7 +53,7 @@ reportsRouter.get("/control", async (req, res) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const overdue = tasks.filter((task) => task.dueDate < today && isActive(task));
+  const overdue = tasks.filter((task) => isOverdue(task, today));
   const waitingReview = tasks.filter((task) => ["review", "done"].includes(task.status));
   const unassigned = tasks.filter((task) => !task.assignee && !task.assigneeEmail && task.status !== "closed");
   const closedThisMonth = tasks.filter((task) => {
@@ -74,7 +78,7 @@ reportsRouter.get("/control", async (req, res) => {
 
     if (task.status === "closed") current.closed += 1;
     else current.active += 1;
-    if (task.dueDate < today && isActive(task)) current.overdue += 1;
+    if (isOverdue(task, today)) current.overdue += 1;
     if (["review", "done"].includes(task.status)) current.review += 1;
 
     assigneeMap.set(key, current);
@@ -96,7 +100,7 @@ reportsRouter.get("/control", async (req, res) => {
 
     if (task.status === "closed") workload.closed += 1;
     else workload.active += 1;
-    if (task.dueDate < today && isActive(task)) workload.overdue += 1;
+    if (isOverdue(task, today)) workload.overdue += 1;
     if (["review", "done"].includes(task.status)) workload.review += 1;
 
     workloadByAssigneeProjectMap.set(workloadKey, workload);
@@ -116,7 +120,7 @@ reportsRouter.get("/control", async (req, res) => {
 
     if (task.status === "closed") current.closed += 1;
     else current.active += 1;
-    if (task.dueDate < today && isActive(task)) current.overdue += 1;
+    if (isOverdue(task, today)) current.overdue += 1;
     if (["review", "done"].includes(task.status)) current.review += 1;
 
     projectMap.set(key, current);

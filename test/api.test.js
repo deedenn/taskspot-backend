@@ -397,6 +397,32 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.deepEqual(updatedTask.data.task.categories, []);
     });
 
+    test("creates quick task without due date and allows adding date later", async () => {
+      const owner = await register({ name: "Quick Owner", email: `quick_${Date.now()}@example.com` });
+      const project = await createProject(owner.token, "Quick tasks");
+
+      const created = await request("/api/tasks", {
+        method: "POST",
+        token: owner.token,
+        body: {
+          projectId: project._id,
+          description: "Quick task from dashboard"
+        }
+      });
+      assert.equal(created.response.status, 201, created.data.message);
+      assert.equal(created.data.task.description, "Quick task from dashboard");
+      assert.equal(created.data.task.dueDate, undefined);
+
+      const dueDate = new Date(Date.now() + 86400000).toISOString();
+      const updated = await request(`/api/tasks/${created.data.task._id}`, {
+        method: "PATCH",
+        token: owner.token,
+        body: { dueDate }
+      });
+      assert.equal(updated.response.status, 200, updated.data.message);
+      assert.equal(new Date(updated.data.task.dueDate).toISOString(), dueDate);
+    });
+
     test("archives, restores and permanently deletes projects with tasks", async () => {
       const owner = await register({ name: "Archive Owner", email: `archive_${Date.now()}@example.com` });
       const assignee = await register({ name: "Archive Assignee", email: `archive_assignee_${Date.now()}@example.com` });
