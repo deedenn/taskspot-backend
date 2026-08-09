@@ -8,6 +8,7 @@ notificationsRouter.use(requireRegularUser);
 
 notificationsRouter.get("/", async (req, res) => {
   const notifications = await Notification.find({ user: req.user._id })
+    .populate("organization", "name plan")
     .populate("project", "name")
     .populate("task", "description status")
     .sort({ createdAt: -1 })

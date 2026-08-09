@@ -6,6 +6,7 @@ import { requireJwtSecret } from "../config/env.js";
 import { requireAuth } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import { Notification } from "../models/Notification.js";
+import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
@@ -112,6 +113,19 @@ async function acceptPendingInvitations(user) {
         invitation.status = "accepted";
         invitation.acceptedAt = new Date();
         await project.save();
+
+        if (project.organization) {
+          const organization = await Organization.findById(project.organization);
+          const organizationRole = invitation.role === "admin" ? "admin" : "member";
+
+          if (
+            organization &&
+            !organization.members.some((member) => member.user.toString() === user._id.toString())
+          ) {
+            organization.members.push({ user: user._id, role: organizationRole });
+            await organization.save();
+          }
+        }
 
         const assignedTasks = await Task.find({
           project: project._id,

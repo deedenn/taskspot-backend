@@ -9,8 +9,11 @@ const notificationSchema = new mongoose.Schema(
     },
     project: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "Project",
-      required: true
+      ref: "Project"
+    },
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization"
     },
     task: {
       type: mongoose.Schema.Types.ObjectId,
@@ -29,6 +32,7 @@ const notificationSchema = new mongoose.Schema(
 );
 
 notificationSchema.index({ user: 1, read: 1, createdAt: -1 });
+notificationSchema.index({ organization: 1, createdAt: -1 });
 notificationSchema.index({ project: 1, createdAt: -1 });
 notificationSchema.index({ task: 1, createdAt: -1 });
 

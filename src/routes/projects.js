@@ -7,7 +7,7 @@ import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendProjectInvitationEmail, sendProjectMemberAddedEmail } from "../services/email.js";
-import { ensureDefaultOrganization, limitExceeded, organizationUsage, planFor } from "../services/plans.js";
+import { ensureDefaultOrganization, limitExceeded, limitPayload, notifyOrganizationLimit, organizationUsage, planFor } from "../services/plans.js";
 import { deleteObjectForKey } from "../services/storage.js";
 
 export const projectsRouter = express.Router();
@@ -46,6 +46,11 @@ async function populateProject(project) {
     { path: "archivedBy", select: "name lastName email" }
   ]);
   return project;
+}
+
+async function sendLimitResponse(res, { organization, plan, usage, key, increment = 1, message }) {
+  await notifyOrganizationLimit({ organization, plan, usage, key });
+  return res.status(402).json(limitPayload({ organization, plan, usage, key, increment, message }));
 }
 
 function frontendUrl() {
@@ -253,7 +258,13 @@ projectsRouter.post("/", async (req, res) => {
   const usage = await organizationUsage(organization);
   const plan = planFor(organization);
   if (limitExceeded({ plan, usage, key: "projects" })) {
-    return res.status(402).json({ message: "Лимит проектов на текущем тарифе исчерпан" });
+    return sendLimitResponse(res, {
+      organization,
+      plan,
+      usage,
+      key: "projects",
+      message: "Лимит активных проектов на текущем тарифе исчерпан"
+    });
   }
 
   const project = await Project.create({
@@ -277,7 +288,24 @@ projectsRouter.post("/demo", async (req, res) => {
   const plan = planFor(organization);
 
   if (limitExceeded({ plan, usage, key: "projects" })) {
-    return res.status(402).json({ message: "Лимит проектов на текущем тарифе исчерпан" });
+    return sendLimitResponse(res, {
+      organization,
+      plan,
+      usage,
+      key: "projects",
+      message: "Лимит активных проектов на текущем тарифе исчерпан"
+    });
+  }
+
+  if (limitExceeded({ plan, usage, key: "activeTasks", increment: 2 })) {
+    return sendLimitResponse(res, {
+      organization,
+      plan,
+      usage,
+      key: "activeTasks",
+      increment: 2,
+      message: "Лимит активных задач на текущем тарифе исчерпан"
+    });
   }
 
   const project = await Project.create({
@@ -370,6 +398,23 @@ projectsRouter.patch("/:projectId/archive", loadProject, requireAdmin, async (re
 
 projectsRouter.patch("/:projectId/restore", loadProject, requireAdmin, async (req, res) => {
   if (req.project.isArchived) {
+    const organization = req.project.organization ? await Organization.findById(req.project.organization) : null;
+
+    if (organization) {
+      const usage = await organizationUsage(organization);
+      const plan = planFor(organization);
+
+      if (limitExceeded({ plan, usage, key: "projects" })) {
+        return sendLimitResponse(res, {
+          organization,
+          plan,
+          usage,
+          key: "projects",
+          message: "Лимит активных проектов на текущем тарифе исчерпан"
+        });
+      }
+    }
+
     req.project.isArchived = false;
     req.project.archivedAt = undefined;
     req.project.archivedBy = undefined;
@@ -449,8 +494,18 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
       (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
     );
 
-    if (!existingInProject && !existingInvitation && limitExceeded({ plan, usage, key: "users" })) {
-      return res.status(402).json({ message: "Лимит пользователей на текущем тарифе исчерпан" });
+    const alreadyInOrganization = user && usage.memberUserIds.includes(user._id.toString());
+    const alreadyInvitedInOrganization = usage.pendingInviteEmails.includes(normalizedEmail);
+    const consumesSeat = !existingInProject && !existingInvitation && !alreadyInOrganization && !alreadyInvitedInOrganization;
+
+    if (consumesSeat && limitExceeded({ plan, usage, key: "users" })) {
+      return sendLimitResponse(res, {
+        organization,
+        plan,
+        usage,
+        key: "users",
+        message: "Лимит участников на текущем тарифе исчерпан"
+      });
     }
   }
 
@@ -565,7 +620,13 @@ projectsRouter.post("/:projectId/templates", loadProject, requireAdmin, async (r
     const plan = planFor(organization);
 
     if (limitExceeded({ plan, usage, key: "templates" })) {
-      return res.status(402).json({ message: "Лимит шаблонов на текущем тарифе исчерпан" });
+      return sendLimitResponse(res, {
+        organization,
+        plan,
+        usage,
+        key: "templates",
+        message: "Лимит шаблонов на текущем тарифе исчерпан"
+      });
     }
   }
 
@@ -639,6 +700,22 @@ projectsRouter.delete("/:projectId/members/:userId", loadProject, requireAdmin, 
 
   req.project.members = req.project.members.filter((member) => member.user.toString() !== userId);
   await req.project.save();
+
+  const organization = req.project.organization ? await Organization.findById(req.project.organization) : null;
+  if (organization) {
+    const stillMemberInOrganizationProjects = await Project.exists({
+      organization: organization._id,
+      _id: { $ne: req.project._id },
+      "members.user": userId
+    });
+    const organizationEntry = organization.members.find((member) => member.user.toString() === userId);
+
+    if (organizationEntry && organizationEntry.role !== "owner" && !stillMemberInOrganizationProjects) {
+      organization.members = organization.members.filter((member) => member.user.toString() !== userId);
+      await organization.save();
+    }
+  }
+
   await Promise.all([
     Task.updateMany({ project: req.project._id }, { $pull: { observers: userId } }),
     Task.updateMany({ project: req.project._id, assignee: userId }, { $unset: { assignee: "" } })

@@ -23,6 +23,10 @@ const organizationSchema = new mongoose.Schema(
       trim: true,
       required: true
     },
+    personalOwner: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
     plan: {
       type: String,
       enum: ["free", "team", "business"],
@@ -59,5 +63,6 @@ const organizationSchema = new mongoose.Schema(
 );
 
 organizationSchema.index({ "members.user": 1, updatedAt: -1 });
+organizationSchema.index({ personalOwner: 1 }, { unique: true, sparse: true });
 
 export const Organization = mongoose.model("Organization", organizationSchema);

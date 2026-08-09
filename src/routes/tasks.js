@@ -7,7 +7,7 @@ import { Project } from "../models/Project.js";
 import { Task, TASK_PRIORITIES, TASK_STATUSES } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendTaskNotificationEmail } from "../services/email.js";
-import { limitExceeded, organizationUsage, planFor } from "../services/plans.js";
+import { limitExceeded, limitPayload, notifyOrganizationLimit, organizationUsage, planFor } from "../services/plans.js";
 import { deleteObjectForKey, downloadUrlForKey } from "../services/storage.js";
 
 export const tasksRouter = express.Router();
@@ -117,6 +117,11 @@ async function notifyUser({ user, project, task, message }) {
   });
 
   void sendTaskEmail({ user, project, task, message });
+}
+
+async function sendLimitResponse(res, { organization, plan, usage, key, increment = 1, message }) {
+  await notifyOrganizationLimit({ organization, plan, usage, key });
+  return res.status(402).json(limitPayload({ organization, plan, usage, key, increment, message }));
 }
 
 async function sendTaskEmail({ user, project, task, message }) {
@@ -506,18 +511,37 @@ tasksRouter.post("/", async (req, res) => {
     const plan = planFor(organization);
 
     if (limitExceeded({ plan, usage, key: "activeTasks" })) {
-      return res.status(402).json({ message: "Лимит активных задач на текущем тарифе исчерпан" });
+      return sendLimitResponse(res, {
+        organization,
+        plan,
+        usage,
+        key: "activeTasks",
+        message: "Лимит активных задач на текущем тарифе исчерпан"
+      });
     }
 
     if (
       normalizedAttachments.length &&
       limitExceeded({ plan, usage, key: "attachments", increment: normalizedAttachments.length })
     ) {
-      return res.status(402).json({ message: "Вложения доступны на платных тарифах" });
+      return sendLimitResponse(res, {
+        organization,
+        plan,
+        usage,
+        key: "attachments",
+        increment: normalizedAttachments.length,
+        message: "Лимит вложений на текущем тарифе исчерпан"
+      });
     }
 
     if (normalizedRecurrence.enabled && limitExceeded({ plan, usage, key: "recurringTasks" })) {
-      return res.status(402).json({ message: "Повторяющиеся задачи доступны на платных тарифах" });
+      return sendLimitResponse(res, {
+        organization,
+        plan,
+        usage,
+        key: "recurringTasks",
+        message: "Повторяющиеся задачи недоступны на текущем тарифе"
+      });
     }
   }
 
@@ -806,7 +830,14 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
         const addedCount = nextAttachments.length - previousCount;
 
         if (limitExceeded({ plan, usage, key: "attachments", increment: addedCount })) {
-          return res.status(402).json({ message: "Вложения доступны на платных тарифах" });
+          return sendLimitResponse(res, {
+            organization,
+            plan,
+            usage,
+            key: "attachments",
+            increment: addedCount,
+            message: "Лимит вложений на текущем тарифе исчерпан"
+          });
         }
       }
     }
@@ -835,7 +866,13 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
         const plan = planFor(organization);
 
         if (limitExceeded({ plan, usage, key: "recurringTasks" })) {
-          return res.status(402).json({ message: "Повторяющиеся задачи доступны на платных тарифах" });
+          return sendLimitResponse(res, {
+            organization,
+            plan,
+            usage,
+            key: "recurringTasks",
+            message: "Повторяющиеся задачи недоступны на текущем тарифе"
+          });
         }
       }
     }
