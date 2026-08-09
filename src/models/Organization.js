@@ -28,6 +28,26 @@ const organizationSchema = new mongoose.Schema(
       enum: ["free", "team", "business"],
       default: "free"
     },
+    planExpiresAt: {
+      type: Date
+    },
+    planAssignedAt: {
+      type: Date
+    },
+    planAssignedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+    planSource: {
+      type: String,
+      enum: ["system", "manual", "billing"],
+      default: "system"
+    },
+    planChangeReason: {
+      type: String,
+      trim: true,
+      default: ""
+    },
     billingNote: {
       type: String,
       trim: true,

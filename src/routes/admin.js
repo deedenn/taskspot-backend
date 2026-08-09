@@ -4,6 +4,7 @@ import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
+import { PLANS } from "../services/plans.js";
 
 export const adminRouter = express.Router();
 
@@ -19,6 +20,12 @@ function daysAgo(days) {
   return date;
 }
 
+function daysFromNow(days) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date;
+}
+
 function percent(part, total) {
   return total ? Math.round((part / total) * 100) : 0;
 }
@@ -29,8 +36,9 @@ function escapeRegex(value) {
 
 async function attachUserPlans(users) {
   const userIds = users.map((user) => user._id);
+  const userIdSet = new Set(userIds.map((id) => id.toString()));
   const organizations = await Organization.find({ "members.user": { $in: userIds } })
-    .select("name plan members.user")
+    .select("name plan planExpiresAt planAssignedAt planSource planChangeReason billingNote members")
     .lean();
 
   const plansByUser = new Map();
@@ -38,12 +46,20 @@ async function attachUserPlans(users) {
   for (const organization of organizations) {
     for (const member of organization.members || []) {
       const userId = member.user?.toString();
-      if (!userIds.some((id) => id.toString() === userId)) continue;
+      if (!userIdSet.has(userId)) continue;
 
       const plans = plansByUser.get(userId) || [];
       plans.push({
+        organizationId: organization._id,
         organization: organization.name,
-        plan: organization.plan || "free"
+        role: member.role,
+        membersCount: organization.members?.length || 0,
+        plan: organization.plan || "free",
+        planExpiresAt: organization.planExpiresAt,
+        planAssignedAt: organization.planAssignedAt,
+        planSource: organization.planSource || "system",
+        planChangeReason: organization.planChangeReason || "",
+        billingNote: organization.billingNote || ""
       });
       plansByUser.set(userId, plans);
     }
@@ -62,6 +78,8 @@ adminRouter.get("/overview", async (req, res) => {
   const periodDays = Number(req.query.periodDays) || 30;
   const since = daysAgo(periodDays);
   const activeSince = daysAgo(30);
+  const now = new Date();
+  const expiresSoon = daysFromNow(14);
 
   const [
     totalUsers,
@@ -71,6 +89,9 @@ adminRouter.get("/overview", async (req, res) => {
     newUsers,
     totalOrganizations,
     organizationsByPlan,
+    expiringPaidOrganizations,
+    expiredPaidOrganizations,
+    manualPlanOrganizations,
     totalProjects,
     newProjects,
     totalTasks,
@@ -110,6 +131,15 @@ adminRouter.get("/overview", async (req, res) => {
       { $group: { _id: "$plan", count: { $sum: 1 } } },
       { $sort: { count: -1 } }
     ]),
+    Organization.countDocuments({
+      plan: { $ne: "free" },
+      planExpiresAt: { $gte: now, $lte: expiresSoon }
+    }),
+    Organization.countDocuments({
+      plan: { $ne: "free" },
+      planExpiresAt: { $lt: now }
+    }),
+    Organization.countDocuments({ planSource: "manual" }),
     Project.countDocuments(),
     Project.countDocuments({ createdAt: { $gte: since } }),
     Task.countDocuments(),
@@ -149,6 +179,9 @@ adminRouter.get("/overview", async (req, res) => {
     organizations: {
       total: totalOrganizations,
       paid: paidOrganizations,
+      manualPlans: manualPlanOrganizations,
+      expiringPaid: expiringPaidOrganizations,
+      expiredPaid: expiredPaidOrganizations,
       byPlan: planBreakdown
     },
     revenue: {
@@ -261,4 +294,81 @@ adminRouter.patch("/users/:userId/status", async (req, res) => {
   ]);
 
   res.json({ user: payload });
+});
+
+adminRouter.patch("/users/:userId/plan", async (req, res) => {
+  const { organizationId, plan, expiresAt, note } = req.body;
+
+  if (!Object.prototype.hasOwnProperty.call(PLANS, plan)) {
+    return res.status(400).json({ message: "Неизвестный тариф" });
+  }
+
+  const user = await User.findById(req.params.userId).select(
+    "name lastName email status isSuperAdmin lastLoginAt createdAt"
+  );
+
+  if (!user) {
+    return res.status(404).json({ message: "Пользователь не найден" });
+  }
+
+  if (user.isSuperAdmin) {
+    return res.status(400).json({ message: "Тариф суперadmin нельзя менять здесь" });
+  }
+
+  let planExpiresAt;
+  if (expiresAt === null || expiresAt === "") {
+    planExpiresAt = undefined;
+  } else if (expiresAt) {
+    const parsedDate = new Date(expiresAt);
+    if (Number.isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ message: "Некорректная дата окончания тарифа" });
+    }
+    planExpiresAt = parsedDate;
+  }
+
+  let organization;
+
+  if (organizationId) {
+    organization = await Organization.findOne({
+      _id: organizationId,
+      "members.user": user._id
+    });
+  } else {
+    const organizations = await Organization.find({ "members.user": user._id }).sort({ createdAt: 1 });
+    organization =
+      organizations.find((item) =>
+        item.members.some((member) => member.user.toString() === user._id.toString() && member.role === "owner")
+      ) || organizations[0];
+  }
+
+  if (!organization) {
+    return res.status(404).json({ message: "У пользователя нет организации для назначения тарифа" });
+  }
+
+  organization.plan = plan;
+  organization.planExpiresAt = planExpiresAt;
+  organization.planAssignedAt = new Date();
+  organization.planAssignedBy = req.user._id;
+  organization.planSource = "manual";
+  organization.planChangeReason = typeof note === "string" ? note.trim() : "";
+  await organization.save();
+
+  const [payload] = await attachUserPlans([
+    user.toObject({
+      versionKey: false
+    })
+  ]);
+
+  res.json({
+    user: payload,
+    organization: {
+      _id: organization._id,
+      name: organization.name,
+      plan: organization.plan,
+      planExpiresAt: organization.planExpiresAt,
+      planAssignedAt: organization.planAssignedAt,
+      planSource: organization.planSource,
+      planChangeReason: organization.planChangeReason
+    }
+  });
 });
