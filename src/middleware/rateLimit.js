@@ -2,6 +2,10 @@ const buckets = new Map();
 
 export function rateLimit({ windowMs, max, keyPrefix }) {
   return (req, res, next) => {
+    if (process.env.NODE_ENV === "test") {
+      return next();
+    }
+
     const ip = req.ip || req.socket?.remoteAddress || "unknown";
     const key = `${keyPrefix}:${ip}`;
     const now = Date.now();

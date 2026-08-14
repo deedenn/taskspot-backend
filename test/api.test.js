@@ -90,6 +90,63 @@ if (!process.env.TEST_MONGODB_URI) {
     return data.project;
   }
 
+  async function loginSuperAdmin() {
+    const { response, data } = await request("/api/auth/login", {
+      method: "POST",
+      body: {
+        email: "admin@taskspot.ru",
+        password: "qwerty"
+      }
+    });
+
+    assert.equal(response.status, 200, data.message);
+    assert.equal(data.user.isSuperAdmin, true);
+
+    return data;
+  }
+
+  async function defaultOrganization(token) {
+    const { response, data } = await request("/api/organizations", { token });
+
+    assert.equal(response.status, 200, data.message);
+    assert.ok(data.organizations.length >= 1);
+
+    return data.organizations[0].organization;
+  }
+
+  async function createTask({
+    token,
+    projectId,
+    description = "Task",
+    dueDate,
+    assignee,
+    observers = [],
+    categories = [],
+    priority = "medium",
+    checklist = [],
+    attachments = [],
+    recurrence = {}
+  }) {
+    const { response, data } = await request("/api/tasks", {
+      method: "POST",
+      token,
+      body: {
+        projectId,
+        description,
+        dueDate,
+        assignee,
+        observers,
+        categories,
+        priority,
+        checklist,
+        attachments,
+        recurrence
+      }
+    });
+
+    return { response, data };
+  }
+
   before(async () => {
     await mongoose.connect(testDatabaseUri(), { serverSelectionTimeoutMS: 10000 });
     server = createApp().listen(0);
@@ -185,34 +242,26 @@ if (!process.env.TEST_MONGODB_URI) {
     test("super admin is limited to service routes and can block users", async () => {
       const user = await register({ name: "Blocked User", email: `blocked_${Date.now()}@example.com` });
 
-      const adminLogin = await request("/api/auth/login", {
-        method: "POST",
-        body: {
-          email: "admin@taskspot.ru",
-          password: "qwerty"
-        }
-      });
-      assert.equal(adminLogin.response.status, 200, adminLogin.data.message);
-      assert.equal(adminLogin.data.user.isSuperAdmin, true);
+      const adminLogin = await loginSuperAdmin();
 
-      const overview = await request("/api/admin/overview", { token: adminLogin.data.token });
+      const overview = await request("/api/admin/overview", { token: adminLogin.token });
       assert.equal(overview.response.status, 200, overview.data.message);
 
-      const emailDiagnostics = await request("/api/admin/email/diagnostics", { token: adminLogin.data.token });
+      const emailDiagnostics = await request("/api/admin/email/diagnostics", { token: adminLogin.token });
       assert.equal(emailDiagnostics.response.status, 200, emailDiagnostics.data.message);
       assert.equal(emailDiagnostics.data.diagnostics.configured, false);
       assert.ok(emailDiagnostics.data.diagnostics.missingKeys.includes("SMTP_HOST"));
 
       const cannotCreateProject = await request("/api/projects", {
         method: "POST",
-        token: adminLogin.data.token,
+        token: adminLogin.token,
         body: { name: "Admin workspace project", description: "Should be forbidden" }
       });
       assert.equal(cannotCreateProject.response.status, 403);
 
       const blocked = await request(`/api/admin/users/${user.user._id}/status`, {
         method: "PATCH",
-        token: adminLogin.data.token,
+        token: adminLogin.token,
         body: { blocked: true }
       });
       assert.equal(blocked.response.status, 200, blocked.data.message);
@@ -232,7 +281,7 @@ if (!process.env.TEST_MONGODB_URI) {
 
       const unblocked = await request(`/api/admin/users/${user.user._id}/status`, {
         method: "PATCH",
-        token: adminLogin.data.token,
+        token: adminLogin.token,
         body: { status: "active" }
       });
       assert.equal(unblocked.response.status, 200, unblocked.data.message);
@@ -322,6 +371,61 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(dashboard.response.status, 200, dashboard.data.message);
       assert.ok(dashboard.data.assigned.some((item) => item.description === "Prepare account"));
     });
+
+    test("rejects wrong invite email, updates duplicate invitation and deletes pending invitation", async () => {
+      const owner = await register({ name: "Invite Owner", email: `owner_invite_rules_${Date.now()}@example.com` });
+      const project = await createProject(owner.token, "Invitation rules");
+      const invitedEmail = `rules_${Date.now()}@example.com`;
+
+      const created = await request(`/api/projects/${project._id}/members`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          email: invitedEmail,
+          role: "member"
+        }
+      });
+      assert.equal(created.response.status, 200, created.data.message);
+      const firstInvitation = created.data.project.invitations.find((item) => item.email === invitedEmail);
+      assert.ok(firstInvitation?.token);
+
+      const wrongEmail = await request("/api/auth/register", {
+        method: "POST",
+        body: {
+          name: "Wrong",
+          lastName: "Invite",
+          email: `wrong_${Date.now()}@example.com`,
+          password: "password123",
+          invitationToken: firstInvitation.token
+        }
+      });
+      assert.equal(wrongEmail.response.status, 400);
+
+      const updated = await request(`/api/projects/${project._id}/members`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          email: invitedEmail,
+          role: "admin"
+        }
+      });
+      assert.equal(updated.response.status, 200, updated.data.message);
+      const matchingInvitations = updated.data.project.invitations.filter(
+        (item) => item.email === invitedEmail && item.status === "pending"
+      );
+      assert.equal(matchingInvitations.length, 1);
+      assert.equal(matchingInvitations[0].role, "admin");
+
+      const removed = await request(`/api/projects/${project._id}/invitations/${matchingInvitations[0]._id}`, {
+        method: "DELETE",
+        token: owner.token
+      });
+      assert.equal(removed.response.status, 200, removed.data.message);
+      assert.ok(!removed.data.project.invitations.some((item) => item.email === invitedEmail && item.status === "pending"));
+
+      const removedInvitationInfo = await request(`/api/auth/invitations/${matchingInvitations[0].token}`);
+      assert.equal(removedInvitationInfo.response.status, 404);
+    });
   });
 
   describe("organizations, plans and templates", () => {
@@ -358,6 +462,170 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(template.data.templates.length, 1);
       assert.equal(template.data.templates[0].title, "Weekly report");
       assert.equal(template.data.templates[0].checklist.length, 2);
+    });
+
+    test("enforces free participant limit across existing members and pending invitations", async () => {
+      const owner = await register({ name: "Seat Owner", email: `seat_owner_${Date.now()}@example.com` });
+      const project = await createProject(owner.token, "Seat limits");
+      const organization = await defaultOrganization(owner.token);
+      const members = await Promise.all(
+        [1, 2, 3].map((index) =>
+          register({ name: `Seat ${index}`, email: `seat_${index}_${Date.now()}@example.com` })
+        )
+      );
+
+      for (const member of members) {
+        const added = await request(`/api/projects/${project._id}/members`, {
+          method: "POST",
+          token: owner.token,
+          body: {
+            email: member.user.email,
+            role: "member"
+          }
+        });
+        assert.equal(added.response.status, 200, added.data.message);
+      }
+
+      const blockedInvite = await request(`/api/projects/${project._id}/members`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          email: `seat_pending_${Date.now()}@example.com`,
+          role: "member"
+        }
+      });
+      assert.equal(blockedInvite.response.status, 402);
+      assert.equal(blockedInvite.data.code, "limit_exceeded");
+      assert.equal(blockedInvite.data.key, "users");
+      assert.equal(blockedInvite.data.usage.limit, 3);
+      assert.ok(
+        await Notification.exists({
+          user: owner.user._id,
+          organization: organization._id,
+          message: /Лимит тарифа/
+        })
+      );
+    });
+
+    test("free active task limit blocks all project members from creating more tasks", async () => {
+      const owner = await register({ name: "Task Limit Owner", email: `task_limit_owner_${Date.now()}@example.com` });
+      const member = await register({ name: "Task Limit Member", email: `task_limit_member_${Date.now()}@example.com` });
+      const project = await createProject(owner.token, "Task limits");
+      const organization = await defaultOrganization(owner.token);
+
+      const added = await request(`/api/projects/${project._id}/members`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          email: member.user.email,
+          role: "member"
+        }
+      });
+      assert.equal(added.response.status, 200, added.data.message);
+
+      for (let index = 1; index <= 50; index += 1) {
+        const created = await createTask({
+          token: owner.token,
+          projectId: project._id,
+          description: `Active task ${index}`,
+          assignee: owner.user._id
+        });
+        assert.equal(created.response.status, 201, created.data.message);
+      }
+
+      const blockedForMember = await createTask({
+        token: member.token,
+        projectId: project._id,
+        description: "Member cannot exceed owner company task limit",
+        assignee: member.user._id
+      });
+      assert.equal(blockedForMember.response.status, 402);
+      assert.equal(blockedForMember.data.code, "limit_exceeded");
+      assert.equal(blockedForMember.data.key, "activeTasks");
+      assert.equal(blockedForMember.data.usage.limit, 50);
+      assert.ok(
+        await Notification.exists({
+          user: owner.user._id,
+          organization: organization._id,
+          message: /активных задач/
+        })
+      );
+    });
+
+    test("manual paid plan lifts project and recurrence limits until it expires", async () => {
+      const owner = await register({ name: "Paid Owner", email: `paid_owner_${Date.now()}@example.com` });
+      const organization = await defaultOrganization(owner.token);
+      const first = await createProject(owner.token, "Paid first");
+      await createProject(owner.token, "Paid second");
+
+      const recurringOnFree = await createTask({
+        token: owner.token,
+        projectId: first._id,
+        description: "Free recurring task should be blocked",
+        dueDate: new Date(Date.now() + 86400000).toISOString(),
+        assignee: owner.user._id,
+        recurrence: { enabled: true, frequency: "weekly" }
+      });
+      assert.equal(recurringOnFree.response.status, 402);
+      assert.equal(recurringOnFree.data.key, "recurringTasks");
+
+      const freeThird = await request("/api/projects", {
+        method: "POST",
+        token: owner.token,
+        body: { name: "Paid third before upgrade", description: "Should hit free project limit" }
+      });
+      assert.equal(freeThird.response.status, 402);
+
+      const admin = await loginSuperAdmin();
+      const future = new Date(Date.now() + 30 * 86400000).toISOString();
+      const upgraded = await request(`/api/admin/users/${owner.user._id}/plan`, {
+        method: "PATCH",
+        token: admin.token,
+        body: {
+          organizationId: organization._id,
+          plan: "team",
+          expiresAt: future,
+          note: "Integration test upgrade"
+        }
+      });
+      assert.equal(upgraded.response.status, 200, upgraded.data.message);
+      assert.equal(upgraded.data.organization.plan, "team");
+
+      const paidThird = await createProject(owner.token, "Paid third after upgrade");
+      assert.equal(paidThird.name, "Paid third after upgrade");
+
+      const recurringOnTeam = await createTask({
+        token: owner.token,
+        projectId: first._id,
+        description: "Team recurring task",
+        dueDate: new Date(Date.now() + 86400000).toISOString(),
+        assignee: owner.user._id,
+        recurrence: { enabled: true, frequency: "weekly" }
+      });
+      assert.equal(recurringOnTeam.response.status, 201, recurringOnTeam.data.message);
+      assert.equal(recurringOnTeam.data.task.recurrence.enabled, true);
+
+      const past = new Date(Date.now() - 86400000).toISOString();
+      const expired = await request(`/api/admin/users/${owner.user._id}/plan`, {
+        method: "PATCH",
+        token: admin.token,
+        body: {
+          organizationId: organization._id,
+          plan: "team",
+          expiresAt: past,
+          note: "Integration test expiration"
+        }
+      });
+      assert.equal(expired.response.status, 200, expired.data.message);
+
+      const afterExpiration = await request("/api/projects", {
+        method: "POST",
+        token: owner.token,
+        body: { name: "Project after paid plan expired", description: "Should fall back to free limits" }
+      });
+      assert.equal(afterExpiration.response.status, 402);
+      assert.equal(afterExpiration.data.key, "projects");
+      assert.equal(afterExpiration.data.plan.key, "free");
     });
 
     test("creates projects without preset categories and allows category deletion", async () => {
@@ -677,6 +945,92 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(control.response.status, 200, control.data.message);
       assert.ok(Number.isInteger(control.data.summary.active));
       assert.ok(Array.isArray(control.data.byAssignee));
+    });
+
+    test("enforces task status permissions for creator, assignee and observers", async () => {
+      const creator = await register({ name: "Status Creator", email: `status_creator_${Date.now()}@example.com` });
+      const assignee = await register({ name: "Status Assignee", email: `status_assignee_${Date.now()}@example.com` });
+      const observer = await register({ name: "Status Observer", email: `status_observer_${Date.now()}@example.com` });
+      const project = await createProject(creator.token, "Status permissions");
+
+      for (const user of [assignee, observer]) {
+        const added = await request(`/api/projects/${project._id}/members`, {
+          method: "POST",
+          token: creator.token,
+          body: {
+            email: user.user.email,
+            role: "member"
+          }
+        });
+        assert.equal(added.response.status, 200, added.data.message);
+      }
+
+      const created = await createTask({
+        token: creator.token,
+        projectId: project._id,
+        description: "Permission workflow",
+        assignee: assignee.user._id,
+        observers: [observer.user._id]
+      });
+      assert.equal(created.response.status, 201, created.data.message);
+      const taskId = created.data.task._id;
+
+      const creatorCannotSendToReview = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: creator.token,
+        body: { status: "review" }
+      });
+      assert.equal(creatorCannotSendToReview.response.status, 403);
+
+      const observerCannotSendToReview = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: observer.token,
+        body: { status: "review" }
+      });
+      assert.equal(observerCannotSendToReview.response.status, 403);
+
+      const inProgress = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: assignee.token,
+        body: { status: "in_progress" }
+      });
+      assert.equal(inProgress.response.status, 200, inProgress.data.message);
+      assert.equal(inProgress.data.task.status, "in_progress");
+
+      const creatorCannotCloseBeforeReview = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: creator.token,
+        body: { status: "closed" }
+      });
+      assert.equal(creatorCannotCloseBeforeReview.response.status, 400);
+
+      const review = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: assignee.token,
+        body: { status: "review" }
+      });
+      assert.equal(review.response.status, 200, review.data.message);
+      assert.equal(review.data.task.status, "review");
+
+      const observerCannotReturnToWork = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: observer.token,
+        body: {
+          status: "in_progress",
+          comment: "Observer cannot return this task"
+        }
+      });
+      assert.equal(observerCannotReturnToWork.response.status, 403);
+
+      const assigneeCannotReturnToWork = await request(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        token: assignee.token,
+        body: {
+          status: "in_progress",
+          comment: "Assignee cannot return this task"
+        }
+      });
+      assert.equal(assigneeCannotReturnToWork.response.status, 403);
     });
   });
 }
