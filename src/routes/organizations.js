@@ -9,6 +9,12 @@ export const organizationsRouter = express.Router();
 
 organizationsRouter.use(requireRegularUser);
 
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
 function memberEntry(organization, userId) {
   return organization.members.find((member) => member.user.toString() === userId.toString());
 }
@@ -64,7 +70,7 @@ async function organizationPayloadWithBilling(organization) {
   };
 }
 
-organizationsRouter.get("/", async (req, res) => {
+organizationsRouter.get("/", asyncRoute(async (req, res) => {
   await ensureDefaultOrganization(req.user);
   const organizations = await Organization.find({ "members.user": req.user._id })
     .populate("members.user", "name lastName email")
@@ -76,9 +82,9 @@ organizationsRouter.get("/", async (req, res) => {
     plans: Object.values(PLANS),
     billing: billingIntegrationPayload()
   });
-});
+}));
 
-organizationsRouter.post("/", async (req, res) => {
+organizationsRouter.post("/", asyncRoute(async (req, res) => {
   const { name } = req.body;
   const existingOrganizations = await Organization.find({ "members.user": req.user._id }).select("plan");
   const organizationLimit = existingOrganizations.reduce(
@@ -102,9 +108,9 @@ organizationsRouter.post("/", async (req, res) => {
   await organization.populate("members.user", "name lastName email");
 
   res.status(201).json(await organizationPayload(organization));
-});
+}));
 
-organizationsRouter.patch("/:organizationId", async (req, res) => {
+organizationsRouter.patch("/:organizationId", asyncRoute(async (req, res) => {
   const organization = await Organization.findById(req.params.organizationId);
 
   if (!organization || !memberEntry(organization, req.user._id)) {
@@ -130,9 +136,9 @@ organizationsRouter.patch("/:organizationId", async (req, res) => {
   await organization.populate("members.user", "name lastName email");
 
   res.json(await organizationPayload(organization));
-});
+}));
 
-organizationsRouter.post("/:organizationId/billing-requests", async (req, res) => {
+organizationsRouter.post("/:organizationId/billing-requests", asyncRoute(async (req, res) => {
   const organization = await Organization.findById(req.params.organizationId);
 
   if (!organization || !memberEntry(organization, req.user._id)) {
@@ -189,4 +195,4 @@ organizationsRouter.post("/:organizationId/billing-requests", async (req, res) =
     billingRequest: sanitizeBillingRequest(request),
     billing: billingIntegrationPayload()
   });
-});
+}));

@@ -37,6 +37,12 @@ function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
 function addMonths(date, months) {
   const result = new Date(date);
   result.setMonth(result.getMonth() + months);
@@ -121,7 +127,7 @@ adminRouter.get("/email/diagnostics", async (req, res) => {
   });
 });
 
-adminRouter.get("/overview", async (req, res) => {
+adminRouter.get("/overview", asyncRoute(async (req, res) => {
   const periodDays = Number(req.query.periodDays) || 30;
   const since = daysAgo(periodDays);
   const activeSince = daysAgo(30);
@@ -273,9 +279,9 @@ adminRouter.get("/overview", async (req, res) => {
     },
     recentUsers
   });
-});
+}));
 
-adminRouter.get("/billing-requests", async (req, res) => {
+adminRouter.get("/billing-requests", asyncRoute(async (req, res) => {
   const status = String(req.query.status || "pending").trim();
   const filter = {};
 
@@ -299,9 +305,9 @@ adminRouter.get("/billing-requests", async (req, res) => {
     plans: Object.values(PLANS),
     billing: billingIntegrationPayload()
   });
-});
+}));
 
-adminRouter.patch("/billing-requests/:requestId", async (req, res) => {
+adminRouter.patch("/billing-requests/:requestId", asyncRoute(async (req, res) => {
   const { status, expiresAt, adminNote, paymentStatus = "paid" } = req.body;
 
   if (!["approved", "rejected", "cancelled"].includes(status)) {
@@ -377,7 +383,7 @@ adminRouter.patch("/billing-requests/:requestId", async (req, res) => {
       planChangeReason: organization.planChangeReason
     }
   });
-});
+}));
 
 adminRouter.get("/users", async (req, res) => {
   const page = Math.max(Number(req.query.page) || 1, 1);
