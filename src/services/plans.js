@@ -68,6 +68,11 @@ export function planFor(organization) {
   return PLANS[organization?.plan] || PLANS.free;
 }
 
+function idString(value) {
+  if (!value) return "";
+  return (value._id || value).toString();
+}
+
 export async function ensureDefaultOrganization(user) {
   const existing = await Organization.findOne({
     $or: [
@@ -108,16 +113,27 @@ export async function organizationUsage(organization) {
   const ownerIds = new Set(
     organization.members
       .filter((member) => member.role === "owner")
-      .map((member) => member.user.toString())
+      .map((member) => idString(member.user))
+      .filter(Boolean)
   );
   const memberUserIds = new Set();
   const extraMemberUserIds = new Set();
   const pendingInviteEmails = new Set();
   let templates = 0;
 
-  organization.members.forEach((member) => memberUserIds.add(member.user.toString()));
+  organization.members.forEach((member) => {
+    const userId = idString(member.user);
+    if (userId) {
+      memberUserIds.add(userId);
+    }
+  });
   projects.forEach((project) => {
-    project.members.forEach((member) => memberUserIds.add(member.user.toString()));
+    project.members.forEach((member) => {
+      const userId = idString(member.user);
+      if (userId) {
+        memberUserIds.add(userId);
+      }
+    });
     project.invitations
       .filter((invitation) => invitation.status === "pending")
       .forEach((invitation) => pendingInviteEmails.add(invitation.email));
@@ -220,7 +236,8 @@ export async function notifyOrganizationLimit({ organization, plan, usage, key }
     ...new Set(
       organization.members
         .filter((member) => ["owner", "admin"].includes(member.role))
-        .map((member) => member.user.toString())
+        .map((member) => idString(member.user))
+        .filter(Boolean)
     )
   ];
 
