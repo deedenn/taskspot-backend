@@ -49,6 +49,7 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.equal(data.requiresEmailVerification, true);
     assert.ok(data.verificationToken);
     assert.equal(data.email, email.toLowerCase());
+    assert.ok(["sent", "skipped", "failed"].includes(data.emailDeliveryStatus));
 
     return data;
   }
@@ -196,6 +197,11 @@ if (!process.env.TEST_MONGODB_URI) {
 
       const overview = await request("/api/admin/overview", { token: adminLogin.data.token });
       assert.equal(overview.response.status, 200, overview.data.message);
+
+      const emailDiagnostics = await request("/api/admin/email/diagnostics", { token: adminLogin.data.token });
+      assert.equal(emailDiagnostics.response.status, 200, emailDiagnostics.data.message);
+      assert.equal(emailDiagnostics.data.diagnostics.configured, false);
+      assert.ok(emailDiagnostics.data.diagnostics.missingKeys.includes("SMTP_HOST"));
 
       const cannotCreateProject = await request("/api/projects", {
         method: "POST",

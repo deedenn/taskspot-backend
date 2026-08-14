@@ -4,6 +4,7 @@ import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
+import { checkEmailTransport, emailRuntimeConfig } from "../services/email.js";
 import { PLANS } from "../services/plans.js";
 
 export const adminRouter = express.Router();
@@ -73,6 +74,18 @@ async function attachUserPlans(users) {
 }
 
 adminRouter.use(requireSuperAdmin);
+
+adminRouter.get("/email/diagnostics", async (req, res) => {
+  const shouldProbe = req.query.probe === "1" || req.query.probe === "true";
+  const diagnostics = shouldProbe ? await checkEmailTransport() : emailRuntimeConfig();
+
+  res.status(diagnostics.ok === false && shouldProbe ? 503 : 200).json({
+    diagnostics,
+    hint: shouldProbe
+      ? "Если tcp.ok=false с timeout/ETIMEDOUT на всех портах, исходящие SMTP-порты заблокированы на стороне хостинга или сети."
+      : "Добавьте ?probe=1, чтобы выполнить TCP/SMTP-проверку всех настроенных портов."
+  });
+});
 
 adminRouter.get("/overview", async (req, res) => {
   const periodDays = Number(req.query.periodDays) || 30;

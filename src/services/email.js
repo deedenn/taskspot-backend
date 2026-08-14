@@ -1,3 +1,4 @@
+import net from "node:net";
 import nodemailer from "nodemailer";
 
 const EMAIL_LOG_PREFIX = "[taskspot:email]";
@@ -42,6 +43,23 @@ function smtpPublicConfig(options) {
     greetingTimeout: options.greetingTimeout,
     socketTimeout: options.socketTimeout
   };
+}
+
+function smtpWarnings() {
+  const warnings = [];
+  const from = String(process.env.SMTP_FROM || "");
+  const fromEmail = from.match(/<([^>]+)>/)?.[1] || from;
+  const smtpUser = String(process.env.SMTP_USER || "");
+
+  if (fromEmail && smtpUser && fromEmail.toLowerCase() !== smtpUser.toLowerCase()) {
+    warnings.push("SMTP_FROM email differs from SMTP_USER. Some SMTP providers reject this.");
+  }
+
+  if (isTimewebSmtp() && !configuredPorts().includes(2525)) {
+    warnings.push("Timeweb SMTP often requires port 2525 when 465/587 are blocked.");
+  }
+
+  return warnings;
 }
 
 function logEmail(event, payload = {}, level = "info") {
@@ -120,6 +138,16 @@ function isRetryableSmtpError(error) {
     ["CONN", "GREETING"].includes(error?.command);
 }
 
+function smtpErrorDetails(error) {
+  return {
+    error: error?.message || "Unknown SMTP error",
+    code: error?.code,
+    command: error?.command,
+    responseCode: error?.responseCode,
+    response: error?.response
+  };
+}
+
 function escapeHtml(value) {
   return String(value || "")
     .replaceAll("&", "&amp;")
@@ -181,9 +209,7 @@ async function sendMail({ to, subject, text, html }) {
         to: maskEmail(to),
         subject,
         profile: smtpPublicConfig(options),
-        error: error.message,
-        code: error.code,
-        command: error.command,
+        ...smtpErrorDetails(error),
         retryable: isRetryableSmtpError(error)
       }, "error");
 
@@ -196,12 +222,89 @@ async function sendMail({ to, subject, text, html }) {
   logEmail("smtp_send_failed", {
     to: maskEmail(to),
     subject,
-    error: lastError?.message,
-    code: lastError?.code,
-    command: lastError?.command
+    ...smtpErrorDetails(lastError)
   }, "error");
 
   throw lastError;
+}
+
+function probeTcp({ host, port, timeout = 10000 }) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const socket = net.createConnection({ host, port, timeout }, () => {
+      socket.destroy();
+      resolve({ ok: true, ms: Date.now() - startedAt });
+    });
+
+    socket.on("timeout", () => {
+      socket.destroy();
+      resolve({ ok: false, ms: Date.now() - startedAt, error: "timeout" });
+    });
+
+    socket.on("error", (error) => {
+      resolve({ ok: false, ms: Date.now() - startedAt, ...smtpErrorDetails(error) });
+    });
+  });
+}
+
+async function probeSmtp(options) {
+  const startedAt = Date.now();
+
+  try {
+    const transporter = nodemailer.createTransport(options);
+    await transporter.verify();
+    return { ok: true, ms: Date.now() - startedAt };
+  } catch (error) {
+    return {
+      ok: false,
+      ms: Date.now() - startedAt,
+      ...smtpErrorDetails(error)
+    };
+  }
+}
+
+export function emailRuntimeConfig() {
+  const readiness = smtpReadiness();
+  const profiles = createTransportProfiles();
+
+  return {
+    configured: readiness.missing.length === 0,
+    missingKeys: readiness.missing,
+    warnings: smtpWarnings(),
+    profiles: profiles.map(smtpPublicConfig)
+  };
+}
+
+export async function checkEmailTransport() {
+  const config = emailRuntimeConfig();
+
+  if (!config.configured) {
+    return {
+      ok: false,
+      ...config,
+      checks: []
+    };
+  }
+
+  const checks = [];
+
+  for (const options of createTransportProfiles()) {
+    const profile = smtpPublicConfig(options);
+    const tcp = await probeTcp({
+      host: options.host,
+      port: options.port,
+      timeout: options.connectionTimeout
+    });
+    const smtp = tcp.ok ? await probeSmtp(options) : { ok: false, skipped: true, reason: "tcp_failed" };
+
+    checks.push({ profile, tcp, smtp });
+  }
+
+  return {
+    ok: checks.some((check) => check.smtp.ok),
+    ...config,
+    checks
+  };
 }
 
 export async function sendProjectInvitationEmail({ email, projectName, inviterName, role, invitationUrl }) {
