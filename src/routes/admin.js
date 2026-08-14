@@ -1,9 +1,11 @@
 import express from "express";
 import { requireSuperAdmin } from "../middleware/superAdmin.js";
+import { BillingRequest } from "../models/BillingRequest.js";
 import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
+import { billingIntegrationPayload } from "../services/billingProviders.js";
 import { checkEmailTransport, emailRuntimeConfig } from "../services/email.js";
 import { PLANS } from "../services/plans.js";
 
@@ -33,6 +35,38 @@ function percent(part, total) {
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function addMonths(date, months) {
+  const result = new Date(date);
+  result.setMonth(result.getMonth() + months);
+  return result;
+}
+
+function billingRequestPayload(request) {
+  if (!request) return null;
+
+  return {
+    _id: request._id,
+    organization: request.organization,
+    requestedBy: request.requestedBy,
+    plan: request.plan,
+    periodMonths: request.periodMonths,
+    amount: request.amount,
+    currency: request.currency,
+    status: request.status,
+    contactName: request.contactName,
+    contactEmail: request.contactEmail,
+    contactPhone: request.contactPhone,
+    comment: request.comment,
+    adminNote: request.adminNote,
+    planExpiresAt: request.planExpiresAt,
+    payment: request.payment,
+    processedAt: request.processedAt,
+    processedBy: request.processedBy,
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt
+  };
 }
 
 async function attachUserPlans(users) {
@@ -105,6 +139,9 @@ adminRouter.get("/overview", async (req, res) => {
     expiringPaidOrganizations,
     expiredPaidOrganizations,
     manualPlanOrganizations,
+    pendingBillingRequests,
+    approvedBillingRequests,
+    receivedRevenue,
     totalProjects,
     newProjects,
     totalTasks,
@@ -153,6 +190,12 @@ adminRouter.get("/overview", async (req, res) => {
       planExpiresAt: { $lt: now }
     }),
     Organization.countDocuments({ planSource: "manual" }),
+    BillingRequest.countDocuments({ status: "pending" }),
+    BillingRequest.countDocuments({ status: "approved", createdAt: { $gte: since } }),
+    BillingRequest.aggregate([
+      { $match: { status: "approved" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } }
+    ]),
     Project.countDocuments(),
     Project.countDocuments({ createdAt: { $gte: since } }),
     Task.countDocuments(),
@@ -198,10 +241,15 @@ adminRouter.get("/overview", async (req, res) => {
       byPlan: planBreakdown
     },
     revenue: {
-      received: 0,
+      received: receivedRevenue[0]?.total || 0,
       estimatedMonthly: estimatedMonthlyRevenue,
       estimatedAnnual: estimatedMonthlyRevenue * 12,
       paidConversionRate: percent(paidOrganizations, totalOrganizations)
+    },
+    billing: {
+      pendingRequests: pendingBillingRequests,
+      approvedInPeriod: approvedBillingRequests,
+      integration: billingIntegrationPayload()
     },
     projects: {
       total: totalProjects,
@@ -224,6 +272,110 @@ adminRouter.get("/overview", async (req, res) => {
       completedTasks
     },
     recentUsers
+  });
+});
+
+adminRouter.get("/billing-requests", async (req, res) => {
+  const status = String(req.query.status || "pending").trim();
+  const filter = {};
+
+  if (status !== "all") {
+    if (!["pending", "approved", "rejected", "cancelled"].includes(status)) {
+      return res.status(400).json({ message: "Некорректный статус заявки" });
+    }
+    filter.status = status;
+  }
+
+  const requests = await BillingRequest.find(filter)
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .populate("organization", "name plan planExpiresAt members")
+    .populate("requestedBy", "name lastName email phone")
+    .populate("processedBy", "name lastName email")
+    .lean();
+
+  res.json({
+    billingRequests: requests.map(billingRequestPayload),
+    plans: Object.values(PLANS),
+    billing: billingIntegrationPayload()
+  });
+});
+
+adminRouter.patch("/billing-requests/:requestId", async (req, res) => {
+  const { status, expiresAt, adminNote, paymentStatus = "paid" } = req.body;
+
+  if (!["approved", "rejected", "cancelled"].includes(status)) {
+    return res.status(400).json({ message: "Выберите итоговый статус заявки" });
+  }
+
+  const request = await BillingRequest.findById(req.params.requestId);
+
+  if (!request) {
+    return res.status(404).json({ message: "Заявка не найдена" });
+  }
+
+  if (request.status !== "pending") {
+    return res.status(400).json({ message: "Можно обработать только новую заявку" });
+  }
+
+  const organization = await Organization.findById(request.organization);
+
+  if (!organization) {
+    return res.status(404).json({ message: "Компания заявки не найдена" });
+  }
+
+  let planExpiresAt;
+  if (status === "approved") {
+    if (expiresAt) {
+      const parsedDate = new Date(expiresAt);
+      if (Number.isNaN(parsedDate.getTime())) {
+        return res.status(400).json({ message: "Некорректная дата окончания тарифа" });
+      }
+      planExpiresAt = parsedDate;
+    } else {
+      planExpiresAt = addMonths(new Date(), request.periodMonths || 1);
+    }
+
+    organization.plan = request.plan;
+    organization.planExpiresAt = planExpiresAt;
+    organization.planAssignedAt = new Date();
+    organization.planAssignedBy = req.user._id;
+    organization.planSource = "manual";
+    organization.planChangeReason =
+      typeof adminNote === "string" && adminNote.trim()
+        ? adminNote.trim()
+        : `Заявка на тариф ${PLANS[request.plan]?.name || request.plan} на ${request.periodMonths} мес.`;
+    await organization.save();
+  }
+
+  request.status = status;
+  request.adminNote = typeof adminNote === "string" ? adminNote.trim() : "";
+  request.processedAt = new Date();
+  request.processedBy = req.user._id;
+  request.planExpiresAt = planExpiresAt;
+  request.payment = {
+    ...(request.payment?.toObject ? request.payment.toObject() : request.payment || {}),
+    provider: request.payment?.provider || "manual",
+    status: status === "approved" ? paymentStatus : "not_required",
+    paidAt: status === "approved" && paymentStatus === "paid" ? new Date() : request.payment?.paidAt
+  };
+  await request.save();
+
+  await request.populate("organization", "name plan planExpiresAt members");
+  await request.populate("requestedBy", "name lastName email phone");
+  await request.populate("processedBy", "name lastName email");
+
+  res.json({
+    billingRequest: billingRequestPayload(request),
+    organization: {
+      _id: organization._id,
+      name: organization.name,
+      plan: organization.plan,
+      planExpiresAt: organization.planExpiresAt,
+      planAssignedAt: organization.planAssignedAt,
+      planSource: organization.planSource,
+      planChangeReason: organization.planChangeReason
+    }
   });
 });
 

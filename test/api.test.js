@@ -21,6 +21,7 @@ if (!process.env.TEST_MONGODB_URI) {
   delete process.env.SMTP_FROM;
 
   const { createApp } = await import("../src/app.js");
+  const { BillingRequest } = await import("../src/models/BillingRequest.js");
   const { Notification } = await import("../src/models/Notification.js");
   let server;
   let baseUrl;
@@ -626,6 +627,67 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(afterExpiration.response.status, 402);
       assert.equal(afterExpiration.data.key, "projects");
       assert.equal(afterExpiration.data.plan.key, "free");
+    });
+
+    test("creates billing request and lets super admin manually enable plan", async () => {
+      const owner = await register({ name: "Billing Request Owner", email: `billing_request_${Date.now()}@example.com` });
+      const organization = await defaultOrganization(owner.token);
+
+      const requested = await request(`/api/organizations/${organization._id}/billing-requests`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          plan: "team",
+          periodMonths: 3,
+          contactName: "Finance Lead",
+          contactEmail: "finance@example.com",
+          comment: "Need SBP payment link"
+        }
+      });
+      assert.equal(requested.response.status, 201, requested.data.message);
+      assert.equal(requested.data.billingRequest.plan, "team");
+      assert.equal(requested.data.billingRequest.periodMonths, 3);
+      assert.equal(requested.data.billingRequest.amount, 2970);
+      assert.equal(requested.data.billingRequest.status, "pending");
+
+      const duplicate = await request(`/api/organizations/${organization._id}/billing-requests`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          plan: "business",
+          periodMonths: 1
+        }
+      });
+      assert.equal(duplicate.response.status, 409);
+
+      const admin = await loginSuperAdmin();
+      const pending = await request("/api/admin/billing-requests?status=pending", { token: admin.token });
+      assert.equal(pending.response.status, 200, pending.data.message);
+      assert.ok(pending.data.billingRequests.some((item) => item._id === requested.data.billingRequest._id));
+
+      const future = new Date(Date.now() + 90 * 86400000).toISOString();
+      const approved = await request(`/api/admin/billing-requests/${requested.data.billingRequest._id}`, {
+        method: "PATCH",
+        token: admin.token,
+        body: {
+          status: "approved",
+          expiresAt: future,
+          paymentStatus: "paid",
+          adminNote: "Paid manually by SBP"
+        }
+      });
+      assert.equal(approved.response.status, 200, approved.data.message);
+      assert.equal(approved.data.billingRequest.status, "approved");
+      assert.equal(approved.data.organization.plan, "team");
+
+      const storedRequest = await BillingRequest.findById(requested.data.billingRequest._id);
+      assert.equal(storedRequest.status, "approved");
+      assert.equal(storedRequest.payment.status, "paid");
+
+      const organizations = await request("/api/organizations", { token: owner.token });
+      assert.equal(organizations.response.status, 200, organizations.data.message);
+      assert.equal(organizations.data.organizations[0].plan.key, "team");
+      assert.equal(organizations.data.organizations[0].activeBillingRequest.status, "approved");
     });
 
     test("creates projects without preset categories and allows category deletion", async () => {

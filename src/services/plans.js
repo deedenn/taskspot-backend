@@ -9,6 +9,7 @@ export const PLANS = {
     key: "free",
     name: "Бесплатный",
     price: "0 ₽",
+    monthlyPrice: 0,
     limits: {
       organizations: 1,
       users: 3,
@@ -24,6 +25,7 @@ export const PLANS = {
     key: "team",
     name: "Команда",
     price: "990 ₽/мес",
+    monthlyPrice: 990,
     limits: {
       organizations: 3,
       users: 20,
@@ -39,6 +41,7 @@ export const PLANS = {
     key: "business",
     name: "Бизнес",
     price: "2490 ₽/мес",
+    monthlyPrice: 2490,
     limits: {
       organizations: 10,
       users: 100,
