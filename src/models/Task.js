@@ -160,6 +160,10 @@ const taskSchema = new mongoose.Schema(
     recurrence: {
       timeZone: { type: String, default: "Europe/Moscow" },
       anchorDay: Number,
+      anchorTime: { hour: Number, minute: Number, second: Number },
+      revision: String,
+      lastRunAt: Date,
+      lastTask: { type: mongoose.Schema.Types.ObjectId, ref: "Task" },
       lastError: { type: String, default: "" },
       retryAt: Date,
       enabled: {

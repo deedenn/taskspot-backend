@@ -14,13 +14,12 @@ import { taskSearchFilter } from "../services/taskSearch.js";
 import { parseTaskListQuery } from "../services/taskListQuery.js";
 import { taskFilterForProjects } from "../services/taskAccess.js";
 import { asyncRoute } from "../middleware/asyncRoute.js";
-import { calendarParts, nextOccurrence, validTimeZone } from "../services/taskSchedule.js";
+import { normalizeRecurrence } from "../services/taskSchedule.js";
 
 export const tasksRouter = express.Router();
 
 tasksRouter.use(requireRegularUser);
 
-const RECURRENCE_FREQUENCIES = ["none", "daily", "weekly", "monthly"];
 
 function asString(value) {
   return value?.toString();
@@ -220,37 +219,6 @@ function normalizeNewAttachment(attachment, userId, { projectId, taskId }) {
   }
 
   return normalized;
-}
-
-function normalizeRecurrence(recurrence, fallbackDueDate) {
-  const enabled = Boolean(recurrence?.enabled);
-  const frequency = enabled ? recurrence.frequency || "weekly" : "none";
-
-  if (!RECURRENCE_FREQUENCIES.includes(frequency)) {
-    const error = new Error("Unknown recurrence frequency");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  if (enabled && !recurrence.nextRunAt && !fallbackDueDate) {
-    const error = new Error("Due date is required for recurring tasks");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const timeZone = recurrence?.timeZone || process.env.TASK_TIME_ZONE || "Europe/Moscow";
-  if (!validTimeZone(timeZone)) throw Object.assign(new Error("Некорректный часовой пояс"), { statusCode: 400 });
-  const firstDate = new Date(recurrence?.nextRunAt || fallbackDueDate || Date.now());
-  if (!Number.isFinite(firstDate.getTime())) throw Object.assign(new Error("Некорректная дата повтора"), { statusCode: 400 });
-  const anchorDay = calendarParts(firstDate, timeZone).day;
-  return {
-    timeZone,
-    anchorDay,
-    lastError: "",
-    enabled,
-    frequency,
-    nextRunAt: enabled ? (recurrence.nextRunAt ? firstDate : nextOccurrence(firstDate, frequency, timeZone, anchorDay)) : undefined
-  };
 }
 
 function parseOptionalDueDate(dueDate) {
@@ -857,10 +825,13 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
     }
   }
 
-  if (hasOwn(req.body, "recurrence")) {
+  const rescheduleForDeadline = hasOwn(req.body, "dueDate") && req.task.isModified("dueDate") && req.task.recurrence?.enabled;
+  if (hasOwn(req.body, "recurrence") || rescheduleForDeadline) {
     let nextRecurrence;
     try {
-      nextRecurrence = normalizeRecurrence(recurrence, req.task.dueDate);
+      nextRecurrence = normalizeRecurrence(hasOwn(req.body, "recurrence") ? recurrence : {
+        enabled: true, frequency: req.task.recurrence.frequency, timeZone: req.task.recurrence.timeZone
+      }, req.task.dueDate);
     } catch (error) {
       return res.status(error.statusCode || 400).json({ message: error.message });
     }
