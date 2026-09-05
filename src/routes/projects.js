@@ -8,7 +8,7 @@ import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendProjectInvitationEmail, sendProjectMemberAddedEmail } from "../services/email.js";
 import { ensureDefaultOrganization, limitExceeded, limitPayload, notifyOrganizationLimit, organizationUsage, planFor } from "../services/plans.js";
-import { deleteObjectForKey } from "../services/storage.js";
+import { deleteObjectForKey, downloadUrlForKey } from "../services/storage.js";
 
 export const projectsRouter = express.Router();
 
@@ -19,15 +19,30 @@ const PROJECT_EMAIL_LOG_PREFIX = "[taskspot:project-email]";
 projectsRouter.use(requireRegularUser);
 
 function memberEntry(project, userId) {
-  return project.members.find((member) => member.user.toString() === userId.toString());
+  return project.members.find((member) => idString(member.user) === idString(userId));
 }
 
 function isAdmin(project, userId) {
   return memberEntry(project, userId)?.role === "admin";
 }
 
+function idString(value) {
+  return value?._id ? value._id.toString() : value?.toString();
+}
+
+function projectCreatorId(project) {
+  const explicitCreator = idString(project.createdBy);
+  if (explicitCreator) return explicitCreator;
+
+  return idString(project.members.find((member) => member.role === "admin")?.user);
+}
+
+function isProjectCreator(project, userId) {
+  return projectCreatorId(project) === idString(userId);
+}
+
 function organizationMember(organization, userId) {
-  return organization.members.find((member) => member.user.toString() === userId.toString());
+  return organization.members.find((member) => idString(member.user) === idString(userId));
 }
 
 function createInvitationToken() {
@@ -41,8 +56,10 @@ function createInvitationExpiresAt() {
 async function populateProject(project) {
   await project.populate([
     { path: "organization", select: "name plan" },
+    { path: "createdBy", select: "name lastName email" },
     { path: "members.user", select: "name lastName email" },
     { path: "invitations.invitedBy", select: "name lastName email" },
+    { path: "avatar.uploadedBy", select: "name lastName email" },
     { path: "archivedBy", select: "name lastName email" }
   ]);
   return project;
@@ -232,8 +249,10 @@ async function requireAdmin(req, res, next) {
 projectsRouter.get("/", async (req, res) => {
   const projects = await Project.find({ "members.user": req.user._id })
     .populate("organization", "name plan")
+    .populate("createdBy", "name lastName email")
     .populate("members.user", "name lastName email")
     .populate("invitations.invitedBy", "name lastName email")
+    .populate("avatar.uploadedBy", "name lastName email")
     .populate("archivedBy", "name lastName email")
     .sort({ updatedAt: -1 });
 
@@ -271,12 +290,14 @@ projectsRouter.post("/", async (req, res) => {
     organization: organization._id,
     name,
     description,
+    createdBy: req.user._id,
     members: [{ user: req.user._id, role: "admin" }],
     categories: []
   });
 
   await project.populate([
     { path: "organization", select: "name plan" },
+    { path: "createdBy", select: "name lastName email" },
     { path: "members.user", select: "name lastName email" }
   ]);
   res.status(201).json({ project });
@@ -312,6 +333,7 @@ projectsRouter.post("/demo", async (req, res) => {
     organization: organization._id,
     name: "Контроль поручений",
     description: "Демо-проект с задачами для руководителя малого бизнеса.",
+    createdBy: req.user._id,
     members: [{ user: req.user._id, role: "admin" }],
     categories: [],
     templates: [
@@ -355,6 +377,7 @@ projectsRouter.post("/demo", async (req, res) => {
 
   await project.populate([
     { path: "organization", select: "name plan" },
+    { path: "createdBy", select: "name lastName email" },
     { path: "members.user", select: "name lastName email" }
   ]);
   res.status(201).json({ project, tasks });
@@ -363,10 +386,99 @@ projectsRouter.post("/demo", async (req, res) => {
 projectsRouter.get("/:projectId", loadProject, async (req, res) => {
   await req.project.populate([
     { path: "organization", select: "name plan" },
+    { path: "createdBy", select: "name lastName email" },
     { path: "members.user", select: "name lastName email" },
     { path: "invitations.invitedBy", select: "name lastName email" },
+    { path: "avatar.uploadedBy", select: "name lastName email" },
     { path: "archivedBy", select: "name lastName email" }
   ]);
+  res.json({ project: req.project });
+});
+
+projectsRouter.get("/:projectId/avatar/download-url", loadProject, async (req, res) => {
+  const avatarKey = req.project.avatar?.key;
+
+  if (!avatarKey) {
+    return res.status(404).json({ message: "Project avatar not found" });
+  }
+
+  try {
+    res.json({ url: downloadUrlForKey(avatarKey) });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message });
+  }
+});
+
+projectsRouter.post("/:projectId/avatar", loadProject, async (req, res) => {
+  if (req.project.isArchived || req.project.archivedAt) {
+    return res.status(409).json({ message: "Archived project is available for viewing only" });
+  }
+
+  if (!isProjectCreator(req.project, req.user._id)) {
+    return res.status(403).json({ message: "Project avatar can be changed only by project creator" });
+  }
+
+  const name = String(req.body.name || "").trim();
+  const key = String(req.body.key || "").trim();
+  const mimeType = String(req.body.mimeType || "").trim();
+  const size = Number(req.body.size || 0);
+  const requiredPrefix = `project-avatars/${req.project._id}/`;
+
+  if (!name || !key) {
+    return res.status(400).json({ message: "Project avatar file is required" });
+  }
+
+  if (!key.startsWith(requiredPrefix)) {
+    return res.status(400).json({ message: "Project avatar key does not belong to this project" });
+  }
+
+  if (!mimeType.startsWith("image/")) {
+    return res.status(400).json({ message: "Аватар проекта должен быть изображением" });
+  }
+
+  const previousAvatarKey = req.project.avatar?.key;
+  req.project.createdBy = req.project.createdBy || req.user._id;
+  req.project.avatar = {
+    name,
+    key,
+    mimeType,
+    size: Number.isFinite(size) ? size : 0,
+    uploadedBy: req.user._id,
+    uploadedAt: new Date()
+  };
+  await req.project.save();
+
+  if (previousAvatarKey && previousAvatarKey !== key) {
+    deleteObjectForKey(previousAvatarKey).catch((error) => {
+      console.error("Failed to delete old project avatar object", error);
+    });
+  }
+
+  await populateProject(req.project);
+  res.json({ project: req.project });
+});
+
+projectsRouter.delete("/:projectId/avatar", loadProject, async (req, res) => {
+  if (req.project.isArchived || req.project.archivedAt) {
+    return res.status(409).json({ message: "Archived project is available for viewing only" });
+  }
+
+  if (!isProjectCreator(req.project, req.user._id)) {
+    return res.status(403).json({ message: "Project avatar can be changed only by project creator" });
+  }
+
+  const avatarKey = req.project.avatar?.key;
+  req.project.createdBy = req.project.createdBy || req.user._id;
+  req.project.avatar = undefined;
+  await req.project.save();
+
+  if (avatarKey) {
+    deleteObjectForKey(avatarKey).catch((error) => {
+      console.error("Failed to delete project avatar object", error);
+    });
+  }
+
+  await populateProject(req.project);
   res.json({ project: req.project });
 });
 
@@ -434,11 +546,14 @@ projectsRouter.delete("/:projectId", loadProject, requireAdmin, async (req, res)
 
   const tasks = await Task.find({ project: req.project._id }).select("attachments.key");
   const taskIds = tasks.map((task) => task._id);
-  const attachmentKeys = tasks.flatMap((task) =>
-    (task.attachments || [])
-      .map((attachment) => attachment.key)
-      .filter(Boolean)
-  );
+  const storageKeys = [
+    req.project.avatar?.key,
+    ...tasks.flatMap((task) =>
+      (task.attachments || [])
+        .map((attachment) => attachment.key)
+        .filter(Boolean)
+    )
+  ].filter(Boolean);
 
   await Promise.all([
     Task.deleteMany({ project: req.project._id }),
@@ -452,7 +567,7 @@ projectsRouter.delete("/:projectId", loadProject, requireAdmin, async (req, res)
   ]);
 
   const storageResults = await Promise.allSettled(
-    attachmentKeys.map((key) => deleteObjectForKey(key))
+    storageKeys.map((key) => deleteObjectForKey(key))
   );
   storageResults
     .filter((result) => result.status === "rejected")
@@ -463,7 +578,7 @@ projectsRouter.delete("/:projectId", loadProject, requireAdmin, async (req, res)
   res.json({
     deleted: true,
     tasksDeleted: taskIds.length,
-    attachmentsDeleted: attachmentKeys.length
+    attachmentsDeleted: storageKeys.length
   });
 });
 

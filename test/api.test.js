@@ -733,6 +733,92 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.deepEqual(updatedTask.data.task.categories, []);
     });
 
+    test("allows only project creator to upload and remove project avatar", async () => {
+      const previousS3 = {
+        S3_ENDPOINT: process.env.S3_ENDPOINT,
+        S3_BUCKET: process.env.S3_BUCKET,
+        S3_ACCESS_KEY_ID: process.env.S3_ACCESS_KEY_ID,
+        S3_SECRET_ACCESS_KEY: process.env.S3_SECRET_ACCESS_KEY,
+        S3_REGION: process.env.S3_REGION
+      };
+      process.env.S3_ENDPOINT = baseUrl;
+      process.env.S3_BUCKET = "taskspot-test";
+      process.env.S3_ACCESS_KEY_ID = "access-key";
+      process.env.S3_SECRET_ACCESS_KEY = "secret-key";
+      process.env.S3_REGION = "ru-1";
+
+      try {
+        const owner = await register({ name: "Avatar Owner", email: `avatar_owner_${Date.now()}@example.com` });
+        const admin = await register({ name: "Avatar Admin", email: `avatar_admin_${Date.now()}@example.com` });
+        const project = await createProject(owner.token, "Avatar project");
+
+        assert.equal(project.createdBy?._id || project.createdBy, owner.user._id);
+
+        const addedAdmin = await request(`/api/projects/${project._id}/members`, {
+          method: "POST",
+          token: owner.token,
+          body: { email: admin.user.email, role: "admin" }
+        });
+        assert.equal(addedAdmin.response.status, 200, addedAdmin.data.message);
+
+        const deniedPresign = await request("/api/uploads/project-avatar/presign", {
+          method: "POST",
+          token: admin.token,
+          body: {
+            projectId: project._id,
+            fileName: "avatar.png",
+            mimeType: "image/png",
+            size: 1024
+          }
+        });
+        assert.equal(deniedPresign.response.status, 403);
+
+        const presign = await request("/api/uploads/project-avatar/presign", {
+          method: "POST",
+          token: owner.token,
+          body: {
+            projectId: project._id,
+            fileName: "avatar.png",
+            mimeType: "image/png",
+            size: 1024
+          }
+        });
+        assert.equal(presign.response.status, 200, presign.data.message);
+        assert.ok(presign.data.uploadUrl.includes("X-Amz-Signature"));
+        assert.ok(presign.data.avatar.key.startsWith(`project-avatars/${project._id}/`));
+
+        const attached = await request(`/api/projects/${project._id}/avatar`, {
+          method: "POST",
+          token: owner.token,
+          body: presign.data.avatar
+        });
+        assert.equal(attached.response.status, 200, attached.data.message);
+        assert.equal(attached.data.project.avatar.key, presign.data.avatar.key);
+        assert.equal(attached.data.project.avatar.name, "avatar.png");
+
+        const download = await request(`/api/projects/${project._id}/avatar/download-url`, {
+          token: owner.token
+        });
+        assert.equal(download.response.status, 200, download.data.message);
+        assert.ok(download.data.url.includes("X-Amz-Signature"));
+
+        const removed = await request(`/api/projects/${project._id}/avatar`, {
+          method: "DELETE",
+          token: owner.token
+        });
+        assert.equal(removed.response.status, 200, removed.data.message);
+        assert.equal(removed.data.project.avatar, undefined);
+      } finally {
+        Object.entries(previousS3).forEach(([key, value]) => {
+          if (value === undefined) {
+            delete process.env[key];
+          } else {
+            process.env[key] = value;
+          }
+        });
+      }
+    });
+
     test("creates quick task without due date and allows adding date later", async () => {
       const owner = await register({ name: "Quick Owner", email: `quick_${Date.now()}@example.com` });
       const project = await createProject(owner.token, "Quick tasks");

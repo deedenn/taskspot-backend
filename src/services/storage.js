@@ -44,6 +44,10 @@ export function attachmentKey({ projectId, taskId, userId, fileName }) {
   return `attachments/${scope}/${Date.now()}-${crypto.randomUUID()}-${safeFileName(fileName)}`;
 }
 
+export function projectAvatarKey({ projectId, userId, fileName }) {
+  return `project-avatars/${projectId}/${userId}/${Date.now()}-${crypto.randomUUID()}-${safeFileName(fileName)}`;
+}
+
 function hmac(key, value, encoding) {
   return crypto.createHmac("sha256", key).update(value).digest(encoding);
 }

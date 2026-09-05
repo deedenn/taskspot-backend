@@ -139,6 +139,38 @@ const invitationSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const projectAvatarSchema = new mongoose.Schema(
+  {
+    name: {
+      type: String,
+      trim: true,
+      default: ""
+    },
+    key: {
+      type: String,
+      trim: true,
+      default: ""
+    },
+    mimeType: {
+      type: String,
+      trim: true,
+      default: ""
+    },
+    size: {
+      type: Number,
+      default: 0
+    },
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+    uploadedAt: {
+      type: Date
+    }
+  },
+  { _id: false }
+);
+
 const projectSchema = new mongoose.Schema(
   {
     organization: {
@@ -155,6 +187,11 @@ const projectSchema = new mongoose.Schema(
       trim: true,
       default: ""
     },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+    avatar: projectAvatarSchema,
     members: [projectMemberSchema],
     categories: [categorySchema],
     invitations: [invitationSchema],
