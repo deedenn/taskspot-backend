@@ -56,6 +56,7 @@ test("email worker records acceptance, retry and permanent failure without loggi
     });
     mock.method(EmailJob, "updateOne", async () => ({}));
     mock.method(User, "exists", async () => null);
+    mock.method(User, "updateOne", async () => ({}));
     try {
       await processEmailJob({ now: new Date("2026-01-01Z"), send: async (mail) => {
         sends += 1;
@@ -64,7 +65,7 @@ test("email worker records acceptance, retry and permanent failure without loggi
         if (scenario === "permanent") throw { code: "EAUTH" };
       } });
       assert.equal(updated.status, scenario === "accepted" ? "accepted" : scenario === "temporary" ? "queued" : scenario === "expired" ? "cancelled" : "failed");
-      assert.equal(sends, scenario === "expired" ? 0 : 1);
+      assert.equal(sends, ["expired", "exhausted"].includes(scenario) ? 0 : 1);
     } finally { mock.restoreAll(); }
   }
 });

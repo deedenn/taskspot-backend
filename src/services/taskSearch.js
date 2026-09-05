@@ -28,7 +28,12 @@ export async function taskSearchFilter(project, query) {
     const expression = new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
     const userIds = await User.find({
       _id: { $in: project.members.map((member) => member.user) },
-      $or: [{ name: expression }, { lastName: expression }, { email: expression }]
+      $or: [{ name: expression }, { lastName: expression }, { email: expression },
+        { $expr: { $regexMatch: {
+          input: { $concat: [{ $ifNull: ["$name", ""] }, " ", { $ifNull: ["$lastName", ""] }] },
+          regex: expression.source,
+          options: "i"
+        } } }]
     }).distinct("_id");
     const categories = project.categories.filter((category) => expression.test(category.name)).map((category) => category._id);
     filter.$or = [

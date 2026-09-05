@@ -18,4 +18,5 @@ const emailJobSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 emailJobSchema.index({ status: 1, nextAttemptAt: 1, leaseUntil: 1 });
+emailJobSchema.index({ statusSynced: 1, status: 1 });
 export const EmailJob = mongoose.model("EmailJob", emailJobSchema);

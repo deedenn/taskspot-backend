@@ -13,7 +13,9 @@ export async function enqueueEmail(mail, context = {}) {
     if (error.code !== 11000) throw error;
     job = await EmailJob.findOne({ dedupeKey });
   }
-  return { queued: true, jobId: job._id.toString(), status: job.status };
+  if (!job) throw new Error("Email queue entry missing after duplicate insert");
+  return { queued: ["queued", "processing"].includes(job.status), failed: ["failed", "cancelled"].includes(job.status),
+    error: job.lastError || "", jobId: job._id.toString(), status: job.status };
 }
 
 export function retryDelay(attempt) {

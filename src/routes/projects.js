@@ -7,6 +7,7 @@ import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendProjectInvitationEmail, sendProjectMemberAddedEmail } from "../services/email.js";
+import { persistEmailWith } from "../services/emailOutbox.js";
 import { ensureDefaultOrganization, limitExceeded, limitPayload, notifyOrganizationLimit, organizationUsage, planFor } from "../services/plans.js";
 import { deleteObjectForKey, downloadUrlForKey } from "../services/storage.js";
 
@@ -95,110 +96,38 @@ function logProjectEmail(event, payload = {}, level = "info") {
 }
 
 async function sendInvitation(project, invitation, inviter) {
-  if (!invitation.token) {
-    invitation.token = createInvitationToken();
-  }
-
-  if (!invitation.expiresAt || invitation.expiresAt < new Date()) {
-    invitation.expiresAt = createInvitationExpiresAt();
-  }
-
+  if (!invitation.token) invitation.token = createInvitationToken();
+  if (!invitation.expiresAt || invitation.expiresAt < new Date()) invitation.expiresAt = createInvitationExpiresAt();
   invitation.emailStatus = "pending";
   invitation.emailError = "";
-  await project.save();
-
-  try {
-    logProjectEmail("invitation_email_send_start", {
-      projectId: project._id?.toString(),
-      invitationId: invitation._id?.toString(),
-      recipientDomain: emailDomain(invitation.email),
-      role: invitation.role
-    });
-
-    const result = await sendProjectInvitationEmail({
-      email: invitation.email,
-      projectName: project.name,
-      inviterName: fullName(inviter),
-      role: invitation.role,
-      invitationUrl: invitationUrl(invitation.token),
-      context: { kind: "invitation", projectId: String(project._id), invitationId: String(invitation._id), token: invitation.token,
-        dedupeKey: `invitation:${invitation._id}:${invitation.token}` }
-    });
-
-    invitation.emailStatus = result.queued ? "pending" : result.skipped ? "skipped" : "sent";
-    invitation.emailError = result.skipped ? result.reason : "";
-
-    logProjectEmail("invitation_email_send_finish", {
-      projectId: project._id?.toString(),
-      invitationId: invitation._id?.toString(),
-      recipientDomain: emailDomain(invitation.email),
-      status: invitation.emailStatus,
-      port: result.port,
-      skippedReason: result.reason || ""
-    }, result.skipped ? "warn" : "info");
-  } catch (error) {
-    invitation.emailStatus = "failed";
-    invitation.emailError = error.message;
-    await project.save();
-
-    logProjectEmail("invitation_email_send_failed", {
-      projectId: project._id?.toString(),
-      invitationId: invitation._id?.toString(),
-      recipientDomain: emailDomain(invitation.email),
-      error: error.message,
-      code: error.code,
-      command: error.command,
-      responseCode: error.responseCode
-    }, "error");
-  }
-}
-
-async function sendInvitationAndSave(projectId, invitationId, inviter) {
-  try {
-    const project = await Project.findById(projectId);
-    const invitation = project?.invitations.id(invitationId);
-
-    if (!project || !invitation || invitation.status !== "pending") {
-      logProjectEmail("invitation_email_background_skipped", {
-        projectId: projectId?.toString(),
-        invitationId: invitationId?.toString(),
-        reason: !project ? "project_not_found" : "invitation_not_pending"
-      }, "warn");
-      return;
-    }
-
-    await sendInvitation(project, invitation, inviter);
-
-    logProjectEmail("invitation_email_status_saved", {
-      projectId: project._id?.toString(),
-      invitationId: invitation._id?.toString(),
-      status: invitation.emailStatus
-    }, invitation.emailStatus === "failed" ? "error" : "info");
-  } catch (error) {
-    logProjectEmail("invitation_email_background_failed", {
-      projectId: projectId?.toString(),
-      invitationId: invitationId?.toString(),
-      error: error.message,
-      code: error.code,
-      command: error.command,
-      responseCode: error.responseCode
-    }, "error");
-  }
+  invitation.emailSentAt = undefined;
+  const index = project.invitations.indexOf(invitation);
+  const result = await sendProjectInvitationEmail({
+    email: invitation.email,
+    projectName: project.name,
+    inviterName: fullName(inviter),
+    role: invitation.role,
+    invitationUrl: invitationUrl(invitation.token),
+    dispatch: persistEmailWith(project, `invitations.${index}.emailOutbox`),
+    context: { kind: "invitation", projectId: String(project._id), invitationId: String(invitation._id),
+      token: invitation.token, dedupeKey: `invitation:${invitation._id}:${invitation.token}` }
+  });
+  logProjectEmail("invitation_email_queued", {
+    projectId: String(project._id), invitationId: String(invitation._id), recipientDomain: emailDomain(invitation.email)
+  });
+  return result;
 }
 
 async function sendMemberAdded(user, project, inviter) {
-  try {
-    return await sendProjectMemberAddedEmail({
-      email: user.email,
-      projectName: project.name,
-      inviterName: fullName(inviter),
-      appUrl: `${frontendUrl().replace(/\/$/, "")}/app/projects/${project._id}/tasks`,
-      context: { kind: "member_added", projectId: String(project._id), userId: String(user._id) }
-    });
-  } catch (error) {
-    console.error("Failed to send member email", error);
-    return { failed: true, error: error.message };
-  }
+  const index = project.members.findIndex((member) => idString(member.user) === idString(user));
+  return sendProjectMemberAddedEmail({
+    email: user.email,
+    projectName: project.name,
+    inviterName: fullName(inviter),
+    appUrl: `${frontendUrl().replace(/\/$/, "")}/app/projects/${project._id}/tasks`,
+    dispatch: persistEmailWith(project, `members.${index}.emailOutbox`),
+    context: { kind: "member_added", projectId: String(project._id), userId: String(user._id) }
+  });
 }
 
 async function attachPendingTasksToUser(project, user) {
@@ -587,7 +516,7 @@ projectsRouter.delete("/:projectId", loadProject, requireAdmin, async (req, res)
 
 projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req, res) => {
   const { email, role = "member" } = req.body;
-  const normalizedEmail = email?.toLowerCase();
+  const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
   if (!normalizedEmail) {
     return res.status(400).json({ message: "Member email is required" });
@@ -656,7 +585,7 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
 
     if (existingInvitation) {
       existingInvitation.role = role;
-      existingInvitation.token = existingInvitation.token || createInvitationToken();
+      existingInvitation.token = createInvitationToken();
       existingInvitation.expiresAt = createInvitationExpiresAt();
     } else {
       const invitation = {
@@ -684,19 +613,17 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req
     };
   }
 
-  await req.project.save();
-
   if (pendingInvitation) {
-    await sendInvitationAndSave(req.project._id, pendingInvitation._id, req.user);
-  }
-
-  if (addedExistingUser) {
-    assignedPendingTasks = await attachPendingTasksToUser(req.project, addedExistingUser);
+    await sendInvitation(req.project, pendingInvitation, req.user);
+  } else if (addedExistingUser) {
     const result = await sendMemberAdded(addedExistingUser, req.project, req.user);
+    assignedPendingTasks = await attachPendingTasksToUser(req.project, addedExistingUser);
     memberEmail = {
       status: result.queued ? "pending" : result.skipped ? "skipped" : result.failed ? "failed" : "sent",
       error: result.reason || result.error || ""
     };
+  } else {
+    await req.project.save();
   }
 
   await req.project.populate([

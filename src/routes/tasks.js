@@ -11,6 +11,7 @@ import { limitExceeded, limitPayload, notifyOrganizationLimit, organizationUsage
 import { deleteObjectForKey, downloadUrlForKey } from "../services/storage.js";
 import { canViewTask, projectMember, isProjectAdmin } from "../services/taskAccess.js";
 import { taskSearchFilter } from "../services/taskSearch.js";
+import { parseTaskListQuery } from "../services/taskListQuery.js";
 import { taskFilterForProjects } from "../services/taskAccess.js";
 import { asyncRoute } from "../middleware/asyncRoute.js";
 import { calendarParts, nextOccurrence, validTimeZone } from "../services/taskSchedule.js";
@@ -422,13 +423,18 @@ tasksRouter.delete("/:taskId/attachments/:attachmentId", loadTask, async (req, r
 
 tasksRouter.get("/", asyncRoute(async (req, res) => {
   const { projectId } = req.query;
-  const requestedLimit = Number(req.query.limit) || 100;
-  const limit = Math.trunc(Math.min(Math.max(requestedLimit, 1), 200));
-  const requestedPage = Math.trunc(Math.max(Number(req.query.page) || 1, 1));
-  if (!Number.isFinite(limit) || !Number.isFinite(requestedPage) || !mongoose.isValidObjectId(projectId)) {
+  let options;
+  try {
+    options = parseTaskListQuery(req.query);
+  } catch (error) {
+    if (error.statusCode === 400) return res.status(400).json({ message: error.message });
+    throw error;
+  }
+  const { page: requestedPage, limit, sort } = options;
+  if (!mongoose.isObjectIdOrHexString(projectId)) {
     return res.status(400).json({ message: "Некорректные параметры списка задач" });
   }
-  const project = await Project.findById(projectId);
+  const project = await Project.findById(projectId).select("members categories");
 
   if (!project || !projectMember(project, req.user._id)) {
     return res.status(403).json({ message: "Project access denied" });
@@ -444,18 +450,17 @@ tasksRouter.get("/", asyncRoute(async (req, res) => {
   const filter = { $and: [taskFilterForProjects([project], req.user._id), searchFilter] };
   const total = await Task.countDocuments(filter);
   const page = Math.min(requestedPage, Math.max(1, Math.ceil(total / limit)));
-  const sortField = ["updatedAt", "createdAt", "description", "dueDate", "status"].includes(req.query.sort)
-    ? req.query.sort : "updatedAt";
-  const direction = req.query.order === "asc" ? 1 : -1;
   const tasks = await Task.find(filter)
+      .select("-activities -attachments -checklist -recurrence")
       .populate("creator", "name lastName email")
       .populate("assignee", "name lastName email")
       .populate("observers", "name lastName email")
-      .sort({ [sortField]: direction, _id: direction })
+      .populate("comments.author", "name lastName email")
+      .sort(sort)
       .skip((page - 1) * limit)
       .limit(limit);
 
-  res.json({ tasks, pagination: { page, limit, total } });
+  res.json({ tasks, pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } });
 }));
 
 tasksRouter.post("/", async (req, res) => {

@@ -166,28 +166,30 @@ export async function deliverMail({ to, subject, text, html, messageId }) {
       reason: "SMTP is not configured",
       missingKeys: readiness.missing,
       to: maskEmail(to),
-      subject
+      messageId
     }, "warn");
     throw Object.assign(new Error("SMTP is not configured"), { code: "SMTP_NOT_CONFIGURED" });
   }
 
   let lastError;
   const profiles = createTransportProfiles();
+  if (!profiles.length) throw Object.assign(new Error("No valid SMTP ports configured"), { code: "SMTP_NOT_CONFIGURED" });
 
   logEmail("smtp_send_start", {
     to: maskEmail(to),
-    subject,
+    messageId,
     profiles: profiles.map(smtpPublicConfig)
   });
 
   for (const options of profiles) {
+    let transporter;
     try {
       logEmail("smtp_attempt", {
         to: maskEmail(to),
-        subject,
+        messageId,
         profile: smtpPublicConfig(options)
       });
-      const transporter = nodemailer.createTransport(options);
+      transporter = nodemailer.createTransport(options);
       const info = await transporter.sendMail({
         from: process.env.SMTP_FROM,
         to,
@@ -202,7 +204,6 @@ export async function deliverMail({ to, subject, text, html, messageId }) {
 
       logEmail("smtp_sent", {
         to: maskEmail(to),
-        subject,
         messageId: info.messageId,
         port: options.port
       });
@@ -213,7 +214,7 @@ export async function deliverMail({ to, subject, text, html, messageId }) {
 
       logEmail("smtp_attempt_failed", {
         to: maskEmail(to),
-        subject,
+        messageId,
         profile: smtpPublicConfig(options),
         ...smtpErrorDetails(error),
         retryable: isRetryableSmtpError(error)
@@ -222,12 +223,14 @@ export async function deliverMail({ to, subject, text, html, messageId }) {
       if (!isRetryableSmtpError(error)) {
         throw error;
       }
+    } finally {
+      transporter?.close();
     }
   }
 
   logEmail("smtp_send_failed", {
     to: maskEmail(to),
-    subject,
+    messageId,
     ...smtpErrorDetails(lastError)
   }, "error");
 
@@ -313,13 +316,13 @@ export async function checkEmailTransport() {
   };
 }
 
-export async function sendProjectInvitationEmail({ email, projectName, inviterName, role, invitationUrl, context }) {
+export async function sendProjectInvitationEmail({ email, projectName, inviterName, role, invitationUrl, context, dispatch = sendMail }) {
   const roleLabel = role === "admin" ? "администратор" : "участник";
   const safeProject = escapeHtml(projectName);
   const safeInviter = escapeHtml(inviterName);
   const safeUrl = escapeHtml(invitationUrl);
 
-  return sendMail({
+  return dispatch({
     to: email,
     subject: `Приглашение в проект ${projectName} в Taskspot`,
     text: [
@@ -343,12 +346,12 @@ export async function sendProjectInvitationEmail({ email, projectName, inviterNa
   }, context);
 }
 
-export async function sendProjectMemberAddedEmail({ email, projectName, inviterName, appUrl, context }) {
+export async function sendProjectMemberAddedEmail({ email, projectName, inviterName, appUrl, context, dispatch = sendMail }) {
   const safeProject = escapeHtml(projectName);
   const safeInviter = escapeHtml(inviterName);
   const safeUrl = escapeHtml(appUrl);
 
-  return sendMail({
+  return dispatch({
     to: email,
     subject: `Вы добавлены в проект ${projectName} в Taskspot`,
     text: [
@@ -369,11 +372,11 @@ export async function sendProjectMemberAddedEmail({ email, projectName, inviterN
   }, context);
 }
 
-export async function sendEmailVerificationEmail({ email, name, verificationUrl, context }) {
+export async function sendEmailVerificationEmail({ email, name, verificationUrl, context, dispatch = sendMail }) {
   const safeName = escapeHtml(name || "пользователь");
   const safeUrl = escapeHtml(verificationUrl);
 
-  return sendMail({
+  return dispatch({
     to: email,
     subject: "Подтвердите регистрацию в Taskspot",
     text: [

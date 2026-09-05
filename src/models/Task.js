@@ -189,6 +189,8 @@ const taskSchema = new mongoose.Schema(
 );
 
 taskSchema.index({ project: 1, status: 1, dueDate: 1 });
+taskSchema.index({ project: 1, updatedAt: -1, _id: -1 });
+taskSchema.index({ project: 1, createdAt: -1, _id: -1 });
 taskSchema.index({ creator: 1, updatedAt: -1 });
 taskSchema.index({ assignee: 1, updatedAt: -1 });
 taskSchema.index({ observers: 1, updatedAt: -1 });

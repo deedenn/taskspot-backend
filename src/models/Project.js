@@ -6,6 +6,7 @@ function defaultInvitationExpiresAt() {
 
 const projectMemberSchema = new mongoose.Schema(
   {
+    emailOutbox: { type: mongoose.Schema.Types.Mixed, select: false },
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -91,6 +92,7 @@ const taskTemplateSchema = new mongoose.Schema(
 
 const invitationSchema = new mongoose.Schema(
   {
+    emailOutbox: { type: mongoose.Schema.Types.Mixed, select: false },
     email: {
       type: String,
       trim: true,
@@ -211,9 +213,16 @@ const projectSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+projectSchema.index({ "invitations.emailOutbox.key": 1 }, { sparse: true });
+projectSchema.index({ "members.emailOutbox.key": 1 }, { sparse: true });
 projectSchema.index({ organization: 1, updatedAt: -1 });
 projectSchema.index({ "members.user": 1, updatedAt: -1 });
 projectSchema.index({ "invitations.token": 1 });
 projectSchema.index({ "invitations.email": 1, "invitations.status": 1 });
+
+projectSchema.set("toJSON", { transform: (_document, result) => {
+  for (const item of [...(result.members || []), ...(result.invitations || [])]) delete item.emailOutbox;
+  return result;
+} });
 
 export const Project = mongoose.model("Project", projectSchema);

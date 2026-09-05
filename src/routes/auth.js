@@ -11,6 +11,7 @@ import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendEmailVerificationEmail } from "../services/email.js";
+import { persistEmailWith } from "../services/emailOutbox.js";
 
 export const authRouter = express.Router();
 
@@ -33,7 +34,7 @@ function createToken(user) {
 }
 
 function frontendUrl() {
-  return process.env.CLIENT_URL || process.env.FRONTEND_URL || "http://localhost:5173";
+  return process.env.CLIENT_URL || process.env.FRONTEND_URL || (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://localhost:5173");
 }
 
 function createEmailVerificationToken() {
@@ -72,23 +73,14 @@ async function setEmailVerificationToken(user) {
 }
 
 async function sendVerificationAndSave(user, token) {
-  await user.save();
-  try {
-    const result = await sendEmailVerificationEmail({
-      email: user.email,
-      name: user.name,
-      verificationUrl: emailVerificationUrl(token),
-      context: { kind: "verification", userId: String(user._id), tokenHash: user.emailVerificationTokenHash,
-        dedupeKey: `verification:${user._id}:${user.emailVerificationTokenHash}` }
-    });
-
-    return result;
-  } catch (error) {
-    user.emailVerificationStatus = "failed";
-    user.emailVerificationError = error.message;
-    await user.save();
-    return { failed: true, error: error.message };
-  }
+  return sendEmailVerificationEmail({
+    email: user.email,
+    name: user.name,
+    verificationUrl: emailVerificationUrl(token),
+    dispatch: persistEmailWith(user, "emailOutbox"),
+    context: { kind: "verification", userId: String(user._id), tokenHash: user.emailVerificationTokenHash,
+      dedupeKey: `verification:${user._id}:${user.emailVerificationTokenHash}` }
+  });
 }
 
 async function acceptPendingInvitations(user) {
@@ -291,7 +283,7 @@ authRouter.post("/register", authLimiter, async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = await User.create({
+    const user = new User({
       name: name.trim(),
       lastName: lastName.trim(),
       email: normalizedEmail,
@@ -352,7 +344,7 @@ authRouter.post("/email/resend", authLimiter, async (req, res) => {
 
     res.json({
       ok: true,
-      emailDeliveryStatus: emailResult.failed ? "failed" : emailResult.skipped ? "skipped" : "sent",
+      emailDeliveryStatus: emailResult.failed ? "failed" : emailResult.queued ? "pending" : emailResult.skipped ? "skipped" : "sent",
       ...(emailResult.reason || emailResult.error ? { emailDeliveryError: emailResult.reason || emailResult.error } : {}),
       ...(process.env.NODE_ENV === "test" ? { verificationToken } : {})
     });

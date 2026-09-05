@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 
 const userSchema = new mongoose.Schema(
   {
+    emailOutbox: { type: mongoose.Schema.Types.Mixed, select: false },
     name: {
       type: String,
       trim: true,
@@ -72,11 +73,13 @@ const userSchema = new mongoose.Schema(
 );
 
 userSchema.index({ emailVerificationTokenHash: 1 });
+userSchema.index({ "emailOutbox.key": 1 }, { sparse: true });
 
 userSchema.methods.toJSON = function toJSON() {
   const user = this.toObject();
   delete user.passwordHash;
   delete user.emailVerificationTokenHash;
+  delete user.emailOutbox;
   return user;
 };
 

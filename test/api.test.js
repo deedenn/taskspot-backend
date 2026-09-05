@@ -216,6 +216,60 @@ if (!process.env.TEST_MONGODB_URI) {
     });
   });
 
+  describe("paginated task lists", () => {
+    test("paginates after access and search filters, without duplicates or leaked totals", async () => {
+      const { Task } = await import("../src/models/Task.js");
+      const { Project } = await import("../src/models/Project.js");
+      const suffix = `${Date.now()}_pages`;
+      const owner = await register({ name: "Руководитель", email: `owner_${suffix}@example.com` });
+      const member = await register({ name: "Анна", lastName: "Соколова", email: `member_${suffix}@example.com` });
+      const outsider = await register({ name: "Другой", email: `other_${suffix}@example.com` });
+      const project = await createProject(owner.token, "Pagination");
+      const added = await request(`/api/projects/${project._id}/members`, {
+        method: "POST", token: owner.token, body: { email: member.user.email }
+      });
+      assert.equal(added.response.status, 200);
+      const category = new mongoose.Types.ObjectId();
+      await Project.updateOne({ _id: project._id }, { $push: { categories: { _id: category, name: "Документы", color: "#123456" } } });
+      const timestamp = new Date("2026-01-01T12:00:00Z");
+      const records = await Task.insertMany(Array.from({ length: 61 }, (_, index) => ({
+        project: project._id, creator: owner.user._id, description: `Task ${index}`,
+        assignee: index < 30 ? member.user._id : owner.user._id,
+        categories: index < 5 ? [category] : [],
+        status: index === 0 ? "closed" : index === 1 ? "review" : index === 2 ? "done" : "open",
+        comments: index === 3 ? [{ author: owner.user._id, text: "Файл [invoice]" }] : [],
+        createdAt: timestamp, updatedAt: timestamp
+      })));
+      const list = async (token, query = "") => {
+        const result = await request(`/api/tasks?projectId=${project._id}&${query}`, { token });
+        assert.equal(result.response.status, 200, result.data.message);
+        return result.data;
+      };
+      const first = await list(owner.token);
+      const second = await list(owner.token, "page=2");
+      const last = await list(owner.token, "page=999");
+      assert.deepEqual(last.pagination, { page: 3, limit: 25, total: 61, totalPages: 3 });
+      assert.equal(first.tasks.length, 25);
+      assert.equal(second.tasks.length, 25);
+      assert.equal(last.tasks.length, 11);
+      assert.equal(new Set([...first.tasks, ...second.tasks, ...last.tasks].map((task) => task._id)).size, 61);
+      assert.deepEqual((await list(owner.token)).tasks.map((task) => task._id), first.tasks.map((task) => task._id));
+      assert.equal((await list(member.token, "limit=100")).pagination.total, 30);
+      assert.equal((await list(member.token, "search=Task%2060")).pagination.total, 0);
+      assert.equal((await list(owner.token, "search=%5Binvoice%5D")).tasks[0]._id, String(records[3]._id));
+      assert.equal((await list(owner.token, `search=${encodeURIComponent("Анна Соколова")}`)).pagination.total, 30);
+      assert.equal((await list(owner.token, `category=${category}`)).pagination.total, 5);
+      assert.equal((await list(owner.token, "status=review")).pagination.total, 2);
+      assert.equal((await list(owner.token, "hideClosed=true")).pagination.total, 60);
+      assert.deepEqual((await list(owner.token, "search=not-found&page=999")).pagination,
+        { page: 1, limit: 25, total: 0, totalPages: 1 });
+      assert.equal((await request(`/api/tasks?projectId=${project._id}`, { token: outsider.token })).response.status, 403);
+      for (const query of ["page=-1", "page=1.5", "limit=0", "sort=bad", "search[$ne]=x", "category[$ne]=x"]) {
+        assert.equal((await request(`/api/tasks?projectId=${project._id}&${query}`, { token: owner.token })).response.status, 400, query);
+      }
+    });
+  });
+
   describe("auth and profile", () => {
     test("requires email confirmation before login", async () => {
       const email = `pending_${Date.now()}@example.com`;

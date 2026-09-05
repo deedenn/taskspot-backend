@@ -3,6 +3,7 @@ import { Notification } from "../models/Notification.js";
 import { Task } from "../models/Task.js";
 import { processEmailJob, reconcileEmailStatuses } from "./emailWorker.js";
 import { runScheduledTasks } from "./taskScheduler.js";
+import { drainEmailOutbox } from "./emailOutbox.js";
 import { validTimeZone } from "./taskSchedule.js";
 
 export async function startWorkers() {
@@ -31,6 +32,7 @@ export async function startWorkers() {
     void tick();
   }
   loop(async function emailQueue() {
+    await drainEmailOutbox();
     await reconcileEmailStatuses();
     for (let count = 0; count < 10 && !stopped; count += 1) {
       if (!await processEmailJob()) break;
