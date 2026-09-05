@@ -158,6 +158,10 @@ const taskSchema = new mongoose.Schema(
     checklist: [checklistItemSchema],
     attachments: [attachmentSchema],
     recurrence: {
+      timeZone: { type: String, default: "Europe/Moscow" },
+      anchorDay: Number,
+      lastError: { type: String, default: "" },
+      retryAt: Date,
       enabled: {
         type: Boolean,
         default: false
@@ -171,6 +175,8 @@ const taskSchema = new mongoose.Schema(
         type: Date
       }
     },
+    recurrenceSource: { type: mongoose.Schema.Types.ObjectId, ref: "Task" },
+    recurrenceKey: { type: String },
     status: {
       type: String,
       enum: TASK_STATUSES,
@@ -188,5 +194,7 @@ taskSchema.index({ assignee: 1, updatedAt: -1 });
 taskSchema.index({ observers: 1, updatedAt: -1 });
 taskSchema.index({ assigneeEmail: 1 });
 taskSchema.index({ "recurrence.enabled": 1, status: 1 });
+taskSchema.index({ "recurrence.enabled": 1, "recurrence.nextRunAt": 1 });
+taskSchema.index({ recurrenceKey: 1 }, { unique: true, sparse: true });
 
 export const Task = mongoose.model("Task", taskSchema);

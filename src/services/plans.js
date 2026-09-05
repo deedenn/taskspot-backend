@@ -156,7 +156,7 @@ export async function organizationUsage(organization) {
       { $project: { count: { $size: "$attachments" } } },
       { $group: { _id: null, total: { $sum: "$count" } } }
     ]),
-    Task.countDocuments({ project: { $in: activeProjectIds }, "recurrence.enabled": true, status: { $ne: "closed" } })
+    Task.countDocuments({ project: { $in: activeProjectIds }, "recurrence.enabled": true })
   ]);
 
   return {

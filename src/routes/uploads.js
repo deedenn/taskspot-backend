@@ -2,6 +2,7 @@ import express from "express";
 import { requireRegularUser } from "../middleware/auth.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
+import { projectMember, isProjectAdmin } from "../services/taskAccess.js";
 import { attachmentKey, isStorageConfigured, maxUploadSize, projectAvatarKey, safeFileName, uploadUrlForKey } from "../services/storage.js";
 
 export const uploadsRouter = express.Router();
@@ -10,14 +11,6 @@ uploadsRouter.use(requireRegularUser);
 
 function asString(value) {
   return value?._id ? value._id.toString() : value?.toString();
-}
-
-function projectMember(project, userId) {
-  return project.members.find((member) => asString(member.user) === asString(userId));
-}
-
-function isProjectAdmin(project, userId) {
-  return projectMember(project, userId)?.role === "admin";
 }
 
 function projectCreatorId(project) {

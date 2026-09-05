@@ -8,6 +8,7 @@ import { User } from "../models/User.js";
 import { billingIntegrationPayload } from "../services/billingProviders.js";
 import { checkEmailTransport, emailRuntimeConfig } from "../services/email.js";
 import { PLANS } from "../services/plans.js";
+import { EmailJob } from "../models/EmailJob.js";
 
 export const adminRouter = express.Router();
 
@@ -114,6 +115,23 @@ async function attachUserPlans(users) {
 }
 
 adminRouter.use(requireSuperAdmin);
+
+adminRouter.get("/email/queue", asyncRoute(async (req, res) => {
+  const [counts, jobs] = await Promise.all([
+    EmailJob.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+    EmailJob.find().select("status attempts lastAttemptAt nextAttemptAt acceptedAt messageId lastError lastErrorCode")
+      .sort({ updatedAt: -1 }).limit(50).lean()
+  ]);
+  res.json({ counts: Object.fromEntries(counts.map((row) => [row._id, row.count])), jobs });
+}));
+
+adminRouter.post("/email/queue/:jobId/retry", asyncRoute(async (req, res) => {
+  const job = await EmailJob.findOneAndUpdate({ _id: req.params.jobId, status: "failed" }, {
+    $set: { status: "queued", attempts: 0, nextAttemptAt: new Date(), lastError: "", statusSynced: false }
+  }, { new: true }).select("status attempts nextAttemptAt messageId");
+  if (!job) return res.status(404).json({ message: "Неудачная отправка не найдена" });
+  res.json({ job });
+}));
 
 adminRouter.get("/email/diagnostics", async (req, res) => {
   const shouldProbe = req.query.probe === "1" || req.query.probe === "true";

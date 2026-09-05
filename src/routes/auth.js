@@ -56,7 +56,7 @@ function publicRegistrationResponse({ user, emailResult, verificationToken }) {
   return {
     requiresEmailVerification: true,
     email: user.email,
-    emailDeliveryStatus: emailResult.failed ? "failed" : emailResult.skipped ? "skipped" : "sent",
+    emailDeliveryStatus: emailResult.failed ? "failed" : emailResult.queued ? "pending" : emailResult.skipped ? "skipped" : "sent",
     ...(emailResult.reason || emailResult.error ? { emailDeliveryError: emailResult.reason || emailResult.error } : {}),
     ...(process.env.NODE_ENV === "test" ? { verificationToken } : {})
   };
@@ -72,17 +72,15 @@ async function setEmailVerificationToken(user) {
 }
 
 async function sendVerificationAndSave(user, token) {
+  await user.save();
   try {
     const result = await sendEmailVerificationEmail({
       email: user.email,
       name: user.name,
-      verificationUrl: emailVerificationUrl(token)
+      verificationUrl: emailVerificationUrl(token),
+      context: { kind: "verification", userId: String(user._id), tokenHash: user.emailVerificationTokenHash,
+        dedupeKey: `verification:${user._id}:${user.emailVerificationTokenHash}` }
     });
-
-    user.emailVerificationSentAt = result.skipped ? user.emailVerificationSentAt : new Date();
-    user.emailVerificationStatus = result.skipped ? "skipped" : "sent";
-    user.emailVerificationError = result.skipped ? result.reason : "";
-    await user.save();
 
     return result;
   } catch (error) {

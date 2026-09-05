@@ -9,6 +9,11 @@ import { User } from "../models/User.js";
 import { sendTaskNotificationEmail } from "../services/email.js";
 import { limitExceeded, limitPayload, notifyOrganizationLimit, organizationUsage, planFor } from "../services/plans.js";
 import { deleteObjectForKey, downloadUrlForKey } from "../services/storage.js";
+import { canViewTask, projectMember, isProjectAdmin } from "../services/taskAccess.js";
+import { taskSearchFilter } from "../services/taskSearch.js";
+import { taskFilterForProjects } from "../services/taskAccess.js";
+import { asyncRoute } from "../middleware/asyncRoute.js";
+import { calendarParts, nextOccurrence, validTimeZone } from "../services/taskSchedule.js";
 
 export const tasksRouter = express.Router();
 
@@ -24,25 +29,8 @@ function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
 
-function projectMember(project, userId) {
-  return project.members.find((member) => asString(member.user) === asString(userId));
-}
-
-function isProjectAdmin(project, userId) {
-  return projectMember(project, userId)?.role === "admin";
-}
-
 function isArchivedProject(project) {
   return Boolean(project?.isArchived || project?.archivedAt);
-}
-
-function isVisibleTask(task, project, userId) {
-  return (
-    isProjectAdmin(project, userId) ||
-    asString(task.creator) === asString(userId) ||
-    asString(task.assignee) === asString(userId) ||
-    task.observers.some((observer) => asString(observer) === asString(userId))
-  );
 }
 
 function canUpdateTaskAttachments(task, project, userId) {
@@ -109,14 +97,14 @@ function frontendUrl() {
 async function notifyUser({ user, project, task, message }) {
   if (!user) return;
 
-  await Notification.create({
+  const notification = await Notification.create({
     user,
     project,
     task,
     message
   });
 
-  void sendTaskEmail({ user, project, task, message });
+  await sendTaskEmail({ user, project, task, message, notificationId: notification._id });
 }
 
 async function sendLimitResponse(res, { organization, plan, usage, key, increment = 1, message }) {
@@ -124,7 +112,7 @@ async function sendLimitResponse(res, { organization, plan, usage, key, incremen
   return res.status(402).json(limitPayload({ organization, plan, usage, key, increment, message }));
 }
 
-async function sendTaskEmail({ user, project, task, message }) {
+async function sendTaskEmail({ user, project, task, message, notificationId }) {
   try {
     const recipient = await User.findById(user);
     if (!recipient) return;
@@ -137,7 +125,9 @@ async function sendTaskEmail({ user, project, task, message }) {
       projectName: projectDoc?.name || "Taskspot",
       taskDescription: taskDoc?.description || "Задача",
       message,
-      taskUrl: `${frontendUrl().replace(/\/$/, "")}/app/tasks/${task}`
+      taskUrl: `${frontendUrl().replace(/\/$/, "")}/app/tasks/${task}`,
+      context: { kind: "task", userId: String(user), projectId: String(project), taskId: String(task),
+        dedupeKey: `notification:${notificationId}` }
     });
   } catch (error) {
     console.error("Failed to send task email", error);
@@ -247,10 +237,18 @@ function normalizeRecurrence(recurrence, fallbackDueDate) {
     throw error;
   }
 
+  const timeZone = recurrence?.timeZone || process.env.TASK_TIME_ZONE || "Europe/Moscow";
+  if (!validTimeZone(timeZone)) throw Object.assign(new Error("Некорректный часовой пояс"), { statusCode: 400 });
+  const firstDate = new Date(recurrence?.nextRunAt || fallbackDueDate || Date.now());
+  if (!Number.isFinite(firstDate.getTime())) throw Object.assign(new Error("Некорректная дата повтора"), { statusCode: 400 });
+  const anchorDay = calendarParts(firstDate, timeZone).day;
   return {
+    timeZone,
+    anchorDay,
+    lastError: "",
     enabled,
     frequency,
-    nextRunAt: enabled ? recurrence.nextRunAt || fallbackDueDate : undefined
+    nextRunAt: enabled ? (recurrence.nextRunAt ? firstDate : nextOccurrence(firstDate, frequency, timeZone, anchorDay)) : undefined
   };
 }
 
@@ -281,7 +279,7 @@ async function loadTask(req, res, next) {
     return res.status(403).json({ message: "Task access denied" });
   }
 
-  if (!isVisibleTask(task, project, req.user._id)) {
+  if (!canViewTask(task, project, req.user._id)) {
     return res.status(403).json({ message: "Task is not visible for this user" });
   }
 
@@ -422,40 +420,43 @@ tasksRouter.delete("/:taskId/attachments/:attachmentId", loadTask, async (req, r
   await respondWithTask(res, req.task);
 });
 
-tasksRouter.get("/", async (req, res) => {
+tasksRouter.get("/", asyncRoute(async (req, res) => {
   const { projectId } = req.query;
   const requestedLimit = Number(req.query.limit) || 100;
-  const limit = Math.min(Math.max(requestedLimit, 1), 200);
-  const page = Math.max(Number(req.query.page) || 1, 1);
+  const limit = Math.trunc(Math.min(Math.max(requestedLimit, 1), 200));
+  const requestedPage = Math.trunc(Math.max(Number(req.query.page) || 1, 1));
+  if (!Number.isFinite(limit) || !Number.isFinite(requestedPage) || !mongoose.isValidObjectId(projectId)) {
+    return res.status(400).json({ message: "Некорректные параметры списка задач" });
+  }
   const project = await Project.findById(projectId);
 
   if (!project || !projectMember(project, req.user._id)) {
     return res.status(403).json({ message: "Project access denied" });
   }
 
-  const filter = { project: project._id };
-
-  if (!isProjectAdmin(project, req.user._id)) {
-    filter.$or = [
-      { creator: req.user._id },
-      { assignee: req.user._id },
-      { observers: req.user._id }
-    ];
+  let searchFilter;
+  try {
+    searchFilter = await taskSearchFilter(project, req.query);
+  } catch (error) {
+    if (error.statusCode === 400) return res.status(400).json({ message: error.message });
+    throw error;
   }
-
-  const [tasks, total] = await Promise.all([
-    Task.find(filter)
+  const filter = { $and: [taskFilterForProjects([project], req.user._id), searchFilter] };
+  const total = await Task.countDocuments(filter);
+  const page = Math.min(requestedPage, Math.max(1, Math.ceil(total / limit)));
+  const sortField = ["updatedAt", "createdAt", "description", "dueDate", "status"].includes(req.query.sort)
+    ? req.query.sort : "updatedAt";
+  const direction = req.query.order === "asc" ? 1 : -1;
+  const tasks = await Task.find(filter)
       .populate("creator", "name lastName email")
       .populate("assignee", "name lastName email")
       .populate("observers", "name lastName email")
-      .sort({ updatedAt: -1 })
+      .sort({ [sortField]: direction, _id: direction })
       .skip((page - 1) * limit)
-      .limit(limit),
-    Task.countDocuments(filter)
-  ]);
+      .limit(limit);
 
   res.json({ tasks, pagination: { page, limit, total } });
-});
+}));
 
 tasksRouter.post("/", async (req, res) => {
   const {

@@ -1,5 +1,6 @@
 import net from "node:net";
 import nodemailer from "nodemailer";
+import { enqueueEmail, safeEmailError } from "./emailQueue.js";
 
 const EMAIL_LOG_PREFIX = "[taskspot:email]";
 
@@ -140,11 +141,10 @@ function isRetryableSmtpError(error) {
 
 function smtpErrorDetails(error) {
   return {
-    error: error?.message || "Unknown SMTP error",
+    error: safeEmailError(error),
     code: error?.code,
     command: error?.command,
     responseCode: error?.responseCode,
-    response: error?.response
   };
 }
 
@@ -156,7 +156,9 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
-async function sendMail({ to, subject, text, html }) {
+const sendMail = enqueueEmail;
+
+export async function deliverMail({ to, subject, text, html, messageId }) {
   const readiness = smtpReadiness();
 
   if (readiness.missing.length) {
@@ -166,7 +168,7 @@ async function sendMail({ to, subject, text, html }) {
       to: maskEmail(to),
       subject
     }, "warn");
-    return { skipped: true, reason: `SMTP is not configured: ${readiness.missing.join(", ")}` };
+    throw Object.assign(new Error("SMTP is not configured"), { code: "SMTP_NOT_CONFIGURED" });
   }
 
   let lastError;
@@ -191,8 +193,12 @@ async function sendMail({ to, subject, text, html }) {
         to,
         subject,
         text,
-        html
+        html,
+        messageId
       });
+      if (!info.accepted?.length) {
+        throw Object.assign(new Error("Recipient rejected"), { code: "EENVELOPE", responseCode: 550 });
+      }
 
       logEmail("smtp_sent", {
         to: maskEmail(to),
@@ -307,7 +313,7 @@ export async function checkEmailTransport() {
   };
 }
 
-export async function sendProjectInvitationEmail({ email, projectName, inviterName, role, invitationUrl }) {
+export async function sendProjectInvitationEmail({ email, projectName, inviterName, role, invitationUrl, context }) {
   const roleLabel = role === "admin" ? "администратор" : "участник";
   const safeProject = escapeHtml(projectName);
   const safeInviter = escapeHtml(inviterName);
@@ -334,10 +340,10 @@ export async function sendProjectInvitationEmail({ email, projectName, inviterNa
         <p style="color:#6b7a86;">Если кнопка не открывается, скопируйте ссылку: ${safeUrl}</p>
       </div>
     `
-  });
+  }, context);
 }
 
-export async function sendProjectMemberAddedEmail({ email, projectName, inviterName, appUrl }) {
+export async function sendProjectMemberAddedEmail({ email, projectName, inviterName, appUrl, context }) {
   const safeProject = escapeHtml(projectName);
   const safeInviter = escapeHtml(inviterName);
   const safeUrl = escapeHtml(appUrl);
@@ -360,10 +366,10 @@ export async function sendProjectMemberAddedEmail({ email, projectName, inviterN
         </p>
       </div>
     `
-  });
+  }, context);
 }
 
-export async function sendEmailVerificationEmail({ email, name, verificationUrl }) {
+export async function sendEmailVerificationEmail({ email, name, verificationUrl, context }) {
   const safeName = escapeHtml(name || "пользователь");
   const safeUrl = escapeHtml(verificationUrl);
 
@@ -390,10 +396,10 @@ export async function sendEmailVerificationEmail({ email, name, verificationUrl 
         <p style="color:#6b7a86;">Если вы не регистрировались в Taskspot, просто проигнорируйте это письмо.</p>
       </div>
     `
-  });
+  }, context);
 }
 
-export async function sendTaskNotificationEmail({ email, projectName, taskDescription, message, taskUrl }) {
+export async function sendTaskNotificationEmail({ email, projectName, taskDescription, message, taskUrl, context }) {
   const safeProject = escapeHtml(projectName);
   const safeTask = escapeHtml(taskDescription);
   const safeMessage = escapeHtml(message);
@@ -420,5 +426,5 @@ export async function sendTaskNotificationEmail({ email, projectName, taskDescri
         </p>
       </div>
     `
-  });
+  }, context);
 }

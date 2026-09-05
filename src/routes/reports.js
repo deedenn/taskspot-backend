@@ -2,6 +2,7 @@ import express from "express";
 import { requireRegularUser } from "../middleware/auth.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
+import { taskFilterForProjects } from "../services/taskAccess.js";
 
 export const reportsRouter = express.Router();
 
@@ -9,12 +10,6 @@ reportsRouter.use(requireRegularUser);
 
 function idOf(value) {
   return value?._id?.toString() || value?.toString();
-}
-
-function isAdmin(project, userId) {
-  return project.members.some(
-    (member) => idOf(member.user) === idOf(userId) && member.role === "admin"
-  );
 }
 
 function isActive(task) {
@@ -31,17 +26,7 @@ function fullName(user) {
 
 reportsRouter.get("/control", async (req, res) => {
   const projects = await Project.find({ "members.user": req.user._id }).populate("members.user", "name lastName email");
-  const adminProjectIds = projects.filter((project) => isAdmin(project, req.user._id)).map((project) => project._id);
-  const visibleProjectIds = projects.map((project) => project._id);
-  const filter = {
-    $or: [
-      { project: { $in: adminProjectIds } },
-      {
-        project: { $in: visibleProjectIds },
-        $or: [{ creator: req.user._id }, { assignee: req.user._id }, { observers: req.user._id }]
-      }
-    ]
-  };
+  const filter = taskFilterForProjects(projects, req.user._id);
 
   const tasks = await Task.find(filter)
     .populate("project", "name")

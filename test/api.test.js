@@ -50,7 +50,7 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.equal(data.requiresEmailVerification, true);
     assert.ok(data.verificationToken);
     assert.equal(data.email, email.toLowerCase());
-    assert.ok(["sent", "skipped", "failed"].includes(data.emailDeliveryStatus));
+    assert.ok(["pending", "sent", "skipped", "failed"].includes(data.emailDeliveryStatus));
 
     return data;
   }
@@ -168,6 +168,52 @@ if (!process.env.TEST_MONGODB_URI) {
     if (server) {
       await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }
+  });
+
+  describe("task visibility", () => {
+    test("includes admin-only tasks and revokes all task access after member removal", async () => {
+      const suffix = `${Date.now()}_access`;
+      const owner = await register({ name: "Owner", email: `owner_${suffix}@example.com` });
+      const creator = await register({ name: "Creator", email: `creator_${suffix}@example.com` });
+      const assignee = await register({ name: "Assignee", email: `assignee_${suffix}@example.com` });
+      const observer = await register({ name: "Observer", email: `observer_${suffix}@example.com` });
+      const project = await createProject(owner.token);
+      for (const user of [creator, assignee, observer]) {
+        const added = await request(`/api/projects/${project._id}/members`, {
+          method: "POST", token: owner.token, body: { email: user.user.email }
+        });
+        assert.equal(added.response.status, 200);
+      }
+      const created = await createTask({ token: creator.token, projectId: project._id,
+        description: "Visible only to the task team and project admin",
+        assignee: assignee.user._id, observers: [observer.user._id]
+      });
+      assert.equal(created.response.status, 201, created.data.message);
+      const task = created.data.task;
+      const adminDashboard = await request("/api/dashboard", { token: owner.token });
+      assert.equal(adminDashboard.data.all.filter((item) => item._id === task._id).length, 1);
+      assert.equal(adminDashboard.data.initiated.length, 0);
+      await Notification.create({ user: creator.user._id, project: project._id, task: task._id, message: "Private task" });
+      const { Task } = await import("../src/models/Task.js");
+      const stored = await Task.findById(task._id);
+      stored.attachments.push({ name: "private.txt", key: `test/${task._id}`, size: 5 });
+      await stored.save();
+      const attachmentId = stored.attachments[0]._id;
+      const removed = await request(`/api/projects/${project._id}/members/${creator.user._id}`, { method: "DELETE", token: owner.token });
+      assert.equal(removed.response.status, 200);
+      for (const path of ["/api/dashboard", "/api/notifications", "/api/reports/control"]) {
+        const result = await request(path, { token: creator.token });
+        assert.equal(result.response.status, 200);
+        assert.equal(JSON.stringify(result.data).includes(task.description), false, path);
+      }
+      for (const path of [`/api/tasks/${task._id}`, `/api/tasks?projectId=${project._id}`, `/api/tasks/${task._id}/attachments/${attachmentId}/download-url`]) {
+        assert.equal((await request(path, { token: creator.token })).response.status, 403, path);
+      }
+      assert.equal((await request(`/api/tasks/${task._id}`, { token: assignee.token })).response.status, 200);
+      const archived = await request(`/api/projects/${project._id}/archive`, { method: "PATCH", token: owner.token });
+      assert.equal(archived.response.status, 200);
+      assert.equal((await request(`/api/tasks/${task._id}`, { token: observer.token })).response.status, 200);
+    });
   });
 
   describe("auth and profile", () => {
@@ -307,7 +353,7 @@ if (!process.env.TEST_MONGODB_URI) {
 
       assert.equal(added.response.status, 200, added.data.message);
       assert.ok(added.data.project.members.some((item) => item.user.email === member.user.email));
-      assert.equal(added.data.email.status, "skipped");
+      assert.equal(added.data.email.status, "pending");
 
       const projects = await request("/api/projects", { token: member.token });
       assert.equal(projects.response.status, 200, projects.data.message);

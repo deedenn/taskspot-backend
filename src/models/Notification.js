@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 
 const notificationSchema = new mongoose.Schema(
   {
+    dedupeKey: String,
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -35,5 +36,6 @@ notificationSchema.index({ user: 1, read: 1, createdAt: -1 });
 notificationSchema.index({ organization: 1, createdAt: -1 });
 notificationSchema.index({ project: 1, createdAt: -1 });
 notificationSchema.index({ task: 1, createdAt: -1 });
+notificationSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
 
 export const Notification = mongoose.model("Notification", notificationSchema);

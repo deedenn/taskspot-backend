@@ -2,39 +2,44 @@ import express from "express";
 import { requireRegularUser } from "../middleware/auth.js";
 import { Notification } from "../models/Notification.js";
 import { Task } from "../models/Task.js";
+import { idOf, visibleTaskFilter, visibleNotificationFilter } from "../services/taskAccess.js";
+import { asyncRoute } from "../middleware/asyncRoute.js";
 
 export const dashboardRouter = express.Router();
 
 dashboardRouter.use(requireRegularUser);
 
-dashboardRouter.get("/", async (req, res) => {
-  const [initiated, assigned, observing, notifications] = await Promise.all([
-    Task.find({ creator: req.user._id })
-      .populate("project", "name isArchived archivedAt")
-      .populate("assignee", "name lastName email")
-      .sort({ updatedAt: -1 }),
-    Task.find({ assignee: req.user._id })
-      .populate("project", "name isArchived archivedAt")
-      .populate("creator", "name lastName email")
-      .sort({ updatedAt: -1 }),
-    Task.find({ observers: req.user._id })
+dashboardRouter.get("/", asyncRoute(async (req, res) => {
+  const [taskFilter, notificationFilter] = await Promise.all([
+    visibleTaskFilter(req.user._id), visibleNotificationFilter(req.user._id)
+  ]);
+  const [all, notifications] = await Promise.all([
+    Task.find(taskFilter)
       .populate("project", "name isArchived archivedAt")
       .populate("creator", "name lastName email")
       .populate("assignee", "name lastName email")
-      .sort({ updatedAt: -1 }),
-    Notification.find({ user: req.user._id })
+      .populate("observers", "name lastName email")
+      .sort({ updatedAt: -1, _id: -1 }),
+    Notification.find(notificationFilter)
       .populate("project", "name")
       .populate("task", "description status")
       .sort({ createdAt: -1 })
       .limit(20)
   ]);
 
-  res.json({ initiated, assigned, observing, notifications });
-});
+  const userId = idOf(req.user);
+  res.json({
+    all,
+    initiated: all.filter((task) => idOf(task.creator) === userId),
+    assigned: all.filter((task) => idOf(task.assignee) === userId),
+    observing: all.filter((task) => task.observers.some((user) => idOf(user) === userId)),
+    notifications
+  });
+}));
 
-dashboardRouter.patch("/notifications/:notificationId/read", async (req, res) => {
+dashboardRouter.patch("/notifications/:notificationId/read", asyncRoute(async (req, res) => {
   const notification = await Notification.findOneAndUpdate(
-    { _id: req.params.notificationId, user: req.user._id },
+    { ...await visibleNotificationFilter(req.user._id), _id: req.params.notificationId },
     { read: true },
     { new: true }
   );
@@ -44,4 +49,4 @@ dashboardRouter.patch("/notifications/:notificationId/read", async (req, res) =>
   }
 
   res.json({ notification });
-});
+}));
