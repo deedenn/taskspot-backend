@@ -20,7 +20,9 @@ export async function transferEmailIntent(Model, filter, path, intent) {
 }
 
 export async function drainEmailOutbox() {
-  const users = await User.find({ "emailOutbox.key": { $exists: true } }).select("+emailOutbox").limit(100);
+  const fields = ["emailOutbox", "passwordReset.outbox", "adminChallenge.outbox"];
+  const users = await User.find({ $or: fields.map((field) => ({ [field + ".key"]: { $exists: true } })) })
+    .select("+emailOutbox +passwordReset +adminChallenge").limit(100);
   const projects = await Project.find({ $or: [
     { "invitations.emailOutbox.key": { $exists: true } },
     { "members.emailOutbox.key": { $exists: true } }
@@ -30,7 +32,10 @@ export async function drainEmailOutbox() {
     catch { console.error("[taskspot:email-queue]", { event: "outbox_transfer_failed", sourceId: String(filter._id) }); }
   };
   for (const user of users) {
-    await transfer(User, { _id: user._id, "emailOutbox.key": user.emailOutbox.key }, "emailOutbox", user.emailOutbox);
+    for (const field of fields) {
+      const intent = user.get(field);
+      if (intent) await transfer(User, { _id: user._id, [field + ".key"]: intent.key }, field, intent);
+    }
   }
   for (const project of projects) {
     for (const collection of ["invitations", "members"]) {

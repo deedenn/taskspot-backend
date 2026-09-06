@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import { requireJwtSecret } from "../config/env.js";
+import { validSession } from "../services/accountSecurity.js";
 import { User } from "../models/User.js";
 
 export async function requireAuth(req, res, next) {
@@ -14,7 +15,7 @@ export async function requireAuth(req, res, next) {
     const payload = jwt.verify(token, requireJwtSecret(), { algorithms: ["HS256"] });
     const user = await User.findById(payload.userId);
 
-    if (!user) {
+    if (!user || !validSession(user, payload)) {
       return res.status(401).json({ message: "User not found" });
     }
 

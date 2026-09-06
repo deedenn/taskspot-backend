@@ -2,6 +2,9 @@ import mongoose from "mongoose";
 
 const userSchema = new mongoose.Schema(
   {
+    sessionVersion: { type: Number, default: 0 },
+    passwordReset: { type: mongoose.Schema.Types.Mixed, select: false },
+    adminChallenge: { type: mongoose.Schema.Types.Mixed, select: false },
     emailOutbox: { type: mongoose.Schema.Types.Mixed, select: false },
     name: {
       type: String,
@@ -72,12 +75,19 @@ const userSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+userSchema.index({ "passwordReset.outbox.key": 1 }, { sparse: true });
+userSchema.index({ "adminChallenge.outbox.key": 1 }, { sparse: true });
+userSchema.index({ "passwordReset.tokenHash": 1 }, { sparse: true });
+userSchema.index({ "adminChallenge.id": 1 }, { sparse: true });
 userSchema.index({ emailVerificationTokenHash: 1 });
 userSchema.index({ "emailOutbox.key": 1 }, { sparse: true });
 
 userSchema.methods.toJSON = function toJSON() {
   const user = this.toObject();
   delete user.passwordHash;
+  delete user.passwordReset;
+  delete user.adminChallenge;
+  delete user.sessionVersion;
   delete user.emailVerificationTokenHash;
   delete user.emailOutbox;
   return user;

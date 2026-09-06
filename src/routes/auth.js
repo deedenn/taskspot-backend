@@ -1,8 +1,9 @@
 import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import express from "express";
-import jwt from "jsonwebtoken";
-import { requireJwtSecret } from "../config/env.js";
+
+import { sessionToken, strongPassword, requestPasswordReset, resetPassword, startAdminChallenge, finishAdminChallenge } from "../services/accountSecurity.js";
+import { asyncRoute } from "../middleware/asyncRoute.js";
 import { requireAuth } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import { Notification } from "../models/Notification.js";
@@ -15,9 +16,6 @@ import { persistEmailWith } from "../services/emailOutbox.js";
 
 export const authRouter = express.Router();
 
-const BOOTSTRAP_ADMIN_EMAIL = "admin@taskspot.ru";
-const BOOTSTRAP_ADMIN_PASSWORD = "qwerty";
-const LEGACY_BOOTSTRAP_ADMIN_PASSWORD = "admin";
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 
 const authLimiter = rateLimit({
@@ -26,12 +24,7 @@ const authLimiter = rateLimit({
   keyPrefix: "auth"
 });
 
-function createToken(user) {
-  return jwt.sign({ userId: user._id }, requireJwtSecret(), {
-    algorithm: "HS256",
-    expiresIn: "7d"
-  });
-}
+const createToken = sessionToken;
 
 function frontendUrl() {
   return process.env.CLIENT_URL || process.env.FRONTEND_URL || (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://localhost:5173");
@@ -142,55 +135,6 @@ async function acceptPendingInvitations(user) {
   );
 }
 
-async function ensureBootstrapAdmin() {
-  const existing = await User.findOne({ email: BOOTSTRAP_ADMIN_EMAIL });
-
-  if (existing) {
-    let changed = false;
-
-    if (!existing.isSuperAdmin) {
-      existing.isSuperAdmin = true;
-      existing.passwordHash = await bcrypt.hash(BOOTSTRAP_ADMIN_PASSWORD, 12);
-      changed = true;
-    }
-
-    if (existing.status !== "active") {
-      existing.status = "active";
-      changed = true;
-    }
-
-    if (await bcrypt.compare(LEGACY_BOOTSTRAP_ADMIN_PASSWORD, existing.passwordHash)) {
-      existing.passwordHash = await bcrypt.hash(BOOTSTRAP_ADMIN_PASSWORD, 12);
-      changed = true;
-    }
-
-    if (!existing.emailVerifiedAt || existing.emailVerificationStatus !== "verified") {
-      existing.emailVerifiedAt = existing.emailVerifiedAt || new Date();
-      existing.emailVerificationStatus = "verified";
-      existing.emailVerificationTokenHash = "";
-      existing.emailVerificationError = "";
-      changed = true;
-    }
-
-    if (changed) {
-      await existing.save();
-    }
-
-    return existing;
-  }
-
-  const passwordHash = await bcrypt.hash(BOOTSTRAP_ADMIN_PASSWORD, 12);
-  return User.create({
-    name: "Taskspot Admin",
-    email: BOOTSTRAP_ADMIN_EMAIL,
-    passwordHash,
-    isSuperAdmin: true,
-    status: "active",
-    emailVerifiedAt: new Date(),
-    emailVerificationStatus: "verified"
-  });
-}
-
 function publicInvitation(project, invitation) {
   return {
     email: invitation.email,
@@ -210,14 +154,7 @@ function publicInvitation(project, invitation) {
   };
 }
 
-function isStrongPassword(password) {
-  return (
-    typeof password === "string" &&
-    password.length >= 8 &&
-    /[A-Za-zА-Яа-яЁё]/.test(password) &&
-    /\d/.test(password)
-  );
-}
+const isStrongPassword = strongPassword;
 
 async function findInvitationByToken(token) {
   if (!token) return null;
@@ -323,7 +260,6 @@ authRouter.post("/email/verify", authLimiter, async (req, res) => {
     await acceptPendingInvitations(user);
     user.lastLoginAt = new Date();
     await user.save();
-
     res.json({ token: createToken(user), user });
   } catch (error) {
     res.status(500).json({ message: "Email verification failed" });
@@ -356,12 +292,9 @@ authRouter.post("/email/resend", authLimiter, async (req, res) => {
 authRouter.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    const normalizedEmail = email?.toLowerCase();
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
-    if (normalizedEmail === BOOTSTRAP_ADMIN_EMAIL) {
-      await ensureBootstrapAdmin();
-    }
-
+    if (!normalizedEmail || typeof password !== "string" || Buffer.byteLength(password, "utf8") > 72) return res.status(401).json({ message: "Invalid email or password" });
     const user = await User.findOne({ email: normalizedEmail });
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
@@ -380,12 +313,16 @@ authRouter.post("/login", authLimiter, async (req, res) => {
       });
     }
 
+    if (user.isSuperAdmin) {
+      if (!strongPassword(password, true)) return res.status(403).json({ message: "Обновите пароль администратора через серверную команду настройки" });
+      return res.json(await startAdminChallenge(user));
+    }
     user.lastLoginAt = new Date();
     await user.save();
 
     res.json({ token: createToken(user), user });
   } catch (error) {
-    res.status(500).json({ message: "Login failed" });
+    res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : "Login failed" });
   }
 });
 
@@ -417,20 +354,38 @@ authRouter.patch("/password", requireAuth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
 
-    if (!currentPassword || !isStrongPassword(newPassword)) {
-      return res.status(400).json({ message: "Current password and strong new password are required" });
+    if (typeof currentPassword !== "string" || Buffer.byteLength(currentPassword, "utf8") > 72 || !strongPassword(newPassword, req.user.isSuperAdmin)) {
+      return res.status(400).json({ message: req.user.isSuperAdmin ? "Нужен текущий пароль и новый: от 12 символов, буквы, цифры и специальный символ (до 72 байт)" : "Нужен текущий пароль и новый: от 8 символов, буквы и цифры (до 72 байт)" });
     }
 
     const isValid = await bcrypt.compare(currentPassword, req.user.passwordHash);
     if (!isValid) {
-      return res.status(400).json({ message: "Current password is incorrect" });
+      return res.status(400).json({ message: "Неверный текущий пароль" });
     }
 
-    req.user.passwordHash = await bcrypt.hash(newPassword, 12);
-    await req.user.save();
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    const changed = await User.updateOne({ _id: req.user._id, passwordHash: req.user.passwordHash }, {
+      $set: { passwordHash }, $inc: { sessionVersion: 1 }, $unset: { passwordReset: "", adminChallenge: "" }
+    });
+    if (changed.modifiedCount !== 1) return res.status(409).json({ message: "Пароль уже изменён. Войдите повторно." });
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ message: "Password update failed" });
+    res.status(500).json({ message: "Не удалось изменить пароль" });
   }
 });
+
+authRouter.post("/password/forgot", authLimiter, asyncRoute(async (req, res) => {
+  await requestPasswordReset(req.body.email);
+  res.status(202).json({ message: "Если адрес зарегистрирован и подтверждён, на него будет отправлена ссылка для смены пароля." });
+}));
+authRouter.post("/password/reset", authLimiter, asyncRoute(async (req, res) => {
+  const user = await resetPassword(req.body.token, req.body.password);
+  if (!user) return res.status(400).json({ message: "Ссылка недействительна или истекла. Запросите новую." });
+  res.json({ ok: true });
+}));
+authRouter.post("/login/code", authLimiter, asyncRoute(async (req, res) => {
+  const user = await finishAdminChallenge(req.body.challengeId, req.body.code);
+  if (!user) return res.status(400).json({ message: "Неверный или просроченный код. После 5 попыток запросите новый." });
+  res.json({ user, token: sessionToken(user, true) });
+}));

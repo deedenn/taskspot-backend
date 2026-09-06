@@ -217,7 +217,7 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     BillingRequest.countDocuments({ status: "pending" }),
     BillingRequest.countDocuments({ status: "approved", createdAt: { $gte: since } }),
     BillingRequest.aggregate([
-      { $match: { status: "approved" } },
+      { $match: { "payment.status": "paid", "payment.paidAt": { $lte: new Date() }, amount: { $gt: 0 } } },
       { $group: { _id: null, total: { $sum: "$amount" } } }
     ]),
     Project.countDocuments(),

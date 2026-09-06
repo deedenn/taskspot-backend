@@ -92,18 +92,20 @@ if (!process.env.TEST_MONGODB_URI) {
   }
 
   async function loginSuperAdmin() {
-    const { response, data } = await request("/api/auth/login", {
-      method: "POST",
-      body: {
-        email: "admin@taskspot.ru",
-        password: "qwerty"
-      }
-    });
-
-    assert.equal(response.status, 200, data.message);
-    assert.equal(data.user.isSuperAdmin, true);
-
-    return data;
+    const { User } = await import("../src/models/User.js");
+    const { setupAdmin } = await import("../src/services/adminSetup.js");
+    const email = "admin@taskspot.test", password = "Test-admin-9821!";
+    if (!await User.exists({ email })) await setupAdmin({ email, password });
+    const start = await request("/api/auth/login", { method: "POST", body: { email, password } });
+    assert.equal(start.response.status, 200, start.data.message);
+    assert.equal(start.data.requiresAdminCode, true);
+    assert.equal(start.data.token, undefined);
+    const admin = await User.findOne({ email }).select("+adminChallenge");
+    const code = admin.adminChallenge.outbox.mail.text.match(/\d{6}/)[0];
+    const finish = await request("/api/auth/login/code", { method: "POST", body: { challengeId: start.data.challengeId, code } });
+    assert.equal(finish.response.status, 200, finish.data.message);
+    assert.equal(finish.data.user.isSuperAdmin, true);
+    return finish.data;
   }
 
   async function defaultOrganization(token) {

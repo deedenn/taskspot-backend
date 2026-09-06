@@ -1,4 +1,5 @@
 import cors from "cors";
+import { analyticsRouter } from "./routes/analytics.js";
 import express from "express";
 import morgan from "morgan";
 import { adminRouter } from "./routes/admin.js";
@@ -55,6 +56,7 @@ export function createApp() {
   });
 
   app.use("/api/auth", authRouter);
+  app.use("/api/analytics", analyticsRouter);
   app.use("/api/organizations", organizationsRouter);
   app.use("/api/projects", projectsRouter);
   app.use("/api/tasks", tasksRouter);
@@ -73,6 +75,7 @@ export function createApp() {
       return res.status(400).json({ message: error.message });
     }
 
+    if (error?.statusCode >= 400 && error.statusCode < 500) return res.status(error.statusCode).json({ message: error.message });
     console.error(error?.stack || error);
     res.status(500).json({ message: "Unexpected server error" });
   });

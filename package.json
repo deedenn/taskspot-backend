@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "admin:setup": "node scripts/setup-admin.js",
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "tasks:schedule": "node scripts/check-task-schedules.js",

@@ -11,6 +11,12 @@ const LEASE_MS = 5 * 60 * 1000;
 
 async function isRelevant(job, now) {
   const context = job.context;
+  if (["password_reset", "admin_login"].includes(context.kind)) {
+    const field = context.kind === "password_reset" ? "passwordReset" : "adminChallenge";
+    return Boolean(await User.exists({ _id: context.userId, [field + ".tokenHash"]: context.tokenHash,
+      [field + ".expiresAt"]: { $gt: now }, status: "active",
+      ...(field === "adminChallenge" ? { isSuperAdmin: true } : { emailVerificationStatus: "verified" }) }));
+  }
   if (context.kind === "verification") {
     return Boolean(await User.exists({ _id: context.userId, emailVerificationTokenHash: context.tokenHash,
       emailVerifiedAt: null, emailVerificationExpiresAt: { $gt: now }, status: { $ne: "blocked" } }));
