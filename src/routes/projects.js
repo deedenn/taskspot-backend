@@ -1,4 +1,7 @@
 import express from "express";
+import mongoose from "mongoose";
+import { asyncRoute } from "../middleware/asyncRoute.js";
+import { activityActor } from "../services/projectActivity.js";
 import crypto from "node:crypto";
 import { requireRegularUser } from "../middleware/auth.js";
 import { Notification } from "../models/Notification.js";
@@ -155,7 +158,7 @@ async function attachPendingTasksToUser(project, user) {
   return assignedTasks.length;
 }
 
-async function loadProject(req, res, next) {
+async function loadProjectImpl(req, res, next) {
   const project = await Project.findById(req.params.projectId);
 
   if (!project) {
@@ -166,11 +169,14 @@ async function loadProject(req, res, next) {
     return res.status(403).json({ message: "Project access denied" });
   }
 
+  project.$locals.auditActor = activityActor(req.user);
   req.project = project;
   next();
 }
 
-async function requireAdmin(req, res, next) {
+const loadProject = asyncRoute(loadProjectImpl);
+
+function requireAdmin(req, res, next) {
   if (!isAdmin(req.project, req.user._id)) {
     return res.status(403).json({ message: "Project admin role is required" });
   }
@@ -178,7 +184,7 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
-projectsRouter.get("/", async (req, res) => {
+projectsRouter.get("/", asyncRoute(async (req, res) => {
   const projects = await Project.find({ "members.user": req.user._id })
     .populate("organization", "name plan")
     .populate("createdBy", "name lastName email")
@@ -189,9 +195,9 @@ projectsRouter.get("/", async (req, res) => {
     .sort({ updatedAt: -1 });
 
   res.json({ projects });
-});
+}));
 
-projectsRouter.post("/", async (req, res) => {
+projectsRouter.post("/", asyncRoute(async (req, res) => {
   const { name, description, organizationId } = req.body;
 
   if (!name) {
@@ -233,9 +239,9 @@ projectsRouter.post("/", async (req, res) => {
     { path: "members.user", select: "name lastName email" }
   ]);
   res.status(201).json({ project });
-});
+}));
 
-projectsRouter.post("/demo", async (req, res) => {
+projectsRouter.post("/demo", asyncRoute(async (req, res) => {
   const organization = await ensureDefaultOrganization(req.user);
   const usage = await organizationUsage(organization);
   const plan = planFor(organization);
@@ -313,9 +319,9 @@ projectsRouter.post("/demo", async (req, res) => {
     { path: "members.user", select: "name lastName email" }
   ]);
   res.status(201).json({ project, tasks });
-});
+}));
 
-projectsRouter.get("/:projectId", loadProject, async (req, res) => {
+projectsRouter.get("/:projectId", loadProject, asyncRoute(async (req, res) => {
   await req.project.populate([
     { path: "organization", select: "name plan" },
     { path: "createdBy", select: "name lastName email" },
@@ -325,9 +331,9 @@ projectsRouter.get("/:projectId", loadProject, async (req, res) => {
     { path: "archivedBy", select: "name lastName email" }
   ]);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.get("/:projectId/avatar/download-url", loadProject, async (req, res) => {
+projectsRouter.get("/:projectId/avatar/download-url", loadProject, asyncRoute(async (req, res) => {
   const avatarKey = req.project.avatar?.key;
 
   if (!avatarKey) {
@@ -339,9 +345,9 @@ projectsRouter.get("/:projectId/avatar/download-url", loadProject, async (req, r
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message });
   }
-});
+}));
 
-projectsRouter.post("/:projectId/avatar", loadProject, async (req, res) => {
+projectsRouter.post("/:projectId/avatar", loadProject, asyncRoute(async (req, res) => {
   if (req.project.isArchived || req.project.archivedAt) {
     return res.status(409).json({ message: "Archived project is available for viewing only" });
   }
@@ -388,9 +394,9 @@ projectsRouter.post("/:projectId/avatar", loadProject, async (req, res) => {
 
   await populateProject(req.project);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.delete("/:projectId/avatar", loadProject, async (req, res) => {
+projectsRouter.delete("/:projectId/avatar", loadProject, asyncRoute(async (req, res) => {
   if (req.project.isArchived || req.project.archivedAt) {
     return res.status(409).json({ message: "Archived project is available for viewing only" });
   }
@@ -412,9 +418,9 @@ projectsRouter.delete("/:projectId/avatar", loadProject, async (req, res) => {
 
   await populateProject(req.project);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.patch("/:projectId", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.patch("/:projectId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   const { name, description = "" } = req.body;
 
   if (!name?.trim()) {
@@ -426,9 +432,9 @@ projectsRouter.patch("/:projectId", loadProject, requireAdmin, async (req, res) 
   await req.project.save();
   await populateProject(req.project);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.patch("/:projectId/archive", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.patch("/:projectId/archive", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   if (!req.project.isArchived) {
     req.project.isArchived = true;
     req.project.archivedAt = new Date();
@@ -438,9 +444,9 @@ projectsRouter.patch("/:projectId/archive", loadProject, requireAdmin, async (re
 
   await populateProject(req.project);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.patch("/:projectId/restore", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.patch("/:projectId/restore", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   if (req.project.isArchived) {
     const organization = req.project.organization ? await Organization.findById(req.project.organization) : null;
 
@@ -467,9 +473,9 @@ projectsRouter.patch("/:projectId/restore", loadProject, requireAdmin, async (re
 
   await populateProject(req.project);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.delete("/:projectId", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.delete("/:projectId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   if (req.body?.confirm !== "DELETE_PROJECT_WITH_TASKS") {
     return res.status(400).json({
       message: "Project deletion requires confirmation of permanent task deletion"
@@ -512,128 +518,139 @@ projectsRouter.delete("/:projectId", loadProject, requireAdmin, async (req, res)
     tasksDeleted: taskIds.length,
     attachmentsDeleted: storageKeys.length
   });
-});
+}));
 
-projectsRouter.post("/:projectId/members", loadProject, requireAdmin, async (req, res) => {
-  const { email, role = "member" } = req.body;
-  const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+projectsRouter.post("/:projectId/members", loadProject, requireAdmin, asyncRoute(async (req, res) => {
+  const payload = await mongoose.connection.transaction(async (session) => {
+    req.project = await Project.findById(req.params.projectId).session(session);
+    if (!req.project || !isAdmin(req.project, req.user._id)) throw Object.assign(new Error("Нет прав администратора проекта"), { statusCode: 403 });
+    if (req.project.isArchived) throw Object.assign(new Error("Архивный проект доступен только для просмотра"), { statusCode: 409 });
+    req.project.$locals.auditActor = activityActor(req.user);
+    const { email, role = "member" } = req.body;
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
-  if (!normalizedEmail) {
-    return res.status(400).json({ message: "Member email is required" });
-  }
-
-  if (!["admin", "member"].includes(role)) {
-    return res.status(400).json({ message: "Unknown member role" });
-  }
-
-  const user = await User.findOne({ email: normalizedEmail });
-  const organization = req.project.organization ? await Organization.findById(req.project.organization) : null;
-  let addedExistingUser = null;
-  let memberEmail = null;
-  let invitationEmail = null;
-  let assignedPendingTasks = 0;
-
-  if (organization) {
-    const usage = await organizationUsage(organization);
-    const plan = planFor(organization);
-    const existingInProject = user ? memberEntry(req.project, user._id) : null;
-    const existingInvitation = req.project.invitations.find(
-      (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
-    );
-
-    const alreadyInOrganization = user && usage.memberUserIds.includes(user._id.toString());
-    const alreadyInvitedInOrganization = usage.pendingInviteEmails.includes(normalizedEmail);
-    const consumesSeat = !existingInProject && !existingInvitation && !alreadyInOrganization && !alreadyInvitedInOrganization;
-
-    if (consumesSeat && limitExceeded({ plan, usage, key: "users" })) {
-      return sendLimitResponse(res, {
-        organization,
-        plan,
-        usage,
-        key: "users",
-        message: "Лимит участников на текущем тарифе исчерпан"
-      });
+    if (!normalizedEmail) {
+      return res.status(400).json({ message: "Member email is required" });
     }
-  }
 
-  if (user) {
-    const existing = memberEntry(req.project, user._id);
-    if (existing) {
-      existing.role = role;
-    } else {
-      req.project.members.push({ user: user._id, role });
-      addedExistingUser = user;
-      if (organization && !organizationMember(organization, user._id)) {
-        organization.members.push({ user: user._id, role: role === "admin" ? "admin" : "member" });
-        await organization.save();
+    if (!["admin", "member"].includes(role)) {
+      return res.status(400).json({ message: "Unknown member role" });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+    const organization = req.project.organization ? await Organization.findById(req.project.organization).session(session) : null;
+    let addedExistingUser = null;
+    let memberEmail = null;
+    let invitationEmail = null;
+    let assignedPendingTasks = 0;
+
+    if (organization) {
+      const usage = await organizationUsage(organization);
+      const plan = planFor(organization);
+      const existingInProject = user ? memberEntry(req.project, user._id) : null;
+      const existingInvitation = req.project.invitations.find(
+        (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
+      );
+
+      const alreadyInOrganization = user && usage.memberUserIds.includes(user._id.toString());
+      const alreadyInvitedInOrganization = usage.pendingInviteEmails.includes(normalizedEmail);
+      const consumesSeat = !existingInProject && !existingInvitation && !alreadyInOrganization && !alreadyInvitedInOrganization;
+
+      if (consumesSeat && limitExceeded({ plan, usage, key: "users" })) {
+        return sendLimitResponse(res, {
+          organization,
+          plan,
+          usage,
+          key: "users",
+          message: "Лимит участников на текущем тарифе исчерпан"
+        });
       }
     }
 
-    const matchingInvitation = req.project.invitations.find(
-      (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
-    );
+    if (user) {
+      const existing = memberEntry(req.project, user._id);
+      if (existing) {
+        if (existing.role === "admin" && role !== "admin" && req.project.members.filter((member) => member.role === "admin").length === 1) {
+          return res.status(400).json({ message: "В проекте должен остаться хотя бы один администратор" });
+        }
+        existing.role = role;
+      } else {
+        req.project.members.push({ user: user._id, role });
+        addedExistingUser = user;
+        if (organization && !organizationMember(organization, user._id)) {
+          organization.members.push({ user: user._id, role: role === "admin" ? "admin" : "member" });
+          await organization.save();
+        }
+      }
 
-    if (matchingInvitation) {
-      matchingInvitation.status = "accepted";
-      matchingInvitation.acceptedAt = new Date();
-      matchingInvitation.emailError = "";
-    }
-  } else {
-    const existingInvitation = req.project.invitations.find(
-      (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
-    );
+      const matchingInvitation = req.project.invitations.find(
+        (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
+      );
 
-    if (existingInvitation) {
-      existingInvitation.role = role;
-      existingInvitation.token = createInvitationToken();
-      existingInvitation.expiresAt = createInvitationExpiresAt();
+      if (matchingInvitation) {
+        matchingInvitation.status = "accepted";
+        matchingInvitation.acceptedAt = new Date();
+        matchingInvitation.emailError = "";
+      }
     } else {
-      const invitation = {
-        email: normalizedEmail,
-        role,
-        invitedBy: req.user._id,
-        token: createInvitationToken(),
-        expiresAt: createInvitationExpiresAt(),
-        status: "pending"
-      };
-      req.project.invitations.push(invitation);
+      const existingInvitation = req.project.invitations.find(
+        (invitation) => invitation.email === normalizedEmail && invitation.status === "pending"
+      );
+
+      if (existingInvitation) {
+        existingInvitation.role = role;
+        existingInvitation.token = createInvitationToken();
+        existingInvitation.expiresAt = createInvitationExpiresAt();
+      } else {
+        const invitation = {
+          email: normalizedEmail,
+          role,
+          invitedBy: req.user._id,
+          token: createInvitationToken(),
+          expiresAt: createInvitationExpiresAt(),
+          status: "pending"
+        };
+        req.project.invitations.push(invitation);
+      }
     }
-  }
 
-  const pendingInvitation = !user
-    ? req.project.invitations.find((invitation) => invitation.email === normalizedEmail && invitation.status === "pending")
-    : null;
+    const pendingInvitation = !user
+      ? req.project.invitations.find((invitation) => invitation.email === normalizedEmail && invitation.status === "pending")
+      : null;
 
-  if (pendingInvitation) {
-    pendingInvitation.emailStatus = "pending";
-    pendingInvitation.emailError = "";
-    invitationEmail = {
-      status: "pending",
-      invitationId: pendingInvitation._id?.toString()
-    };
-  }
+    if (pendingInvitation) {
+      pendingInvitation.emailStatus = "pending";
+      pendingInvitation.emailError = "";
+      invitationEmail = {
+        status: "pending",
+        invitationId: pendingInvitation._id?.toString()
+      };
+    }
 
-  if (pendingInvitation) {
-    await sendInvitation(req.project, pendingInvitation, req.user);
-  } else if (addedExistingUser) {
-    const result = await sendMemberAdded(addedExistingUser, req.project, req.user);
-    assignedPendingTasks = await attachPendingTasksToUser(req.project, addedExistingUser);
-    memberEmail = {
-      status: result.queued ? "pending" : result.skipped ? "skipped" : result.failed ? "failed" : "sent",
-      error: result.reason || result.error || ""
-    };
-  } else {
-    await req.project.save();
-  }
+    if (pendingInvitation) {
+      await sendInvitation(req.project, pendingInvitation, req.user);
+    } else if (addedExistingUser) {
+      const result = await sendMemberAdded(addedExistingUser, req.project, req.user);
 
-  await req.project.populate([
-    { path: "members.user", select: "name lastName email" },
-    { path: "invitations.invitedBy", select: "name lastName email" }
-  ]);
-  res.json({ project: req.project, email: memberEmail || invitationEmail, assignedPendingTasks });
-});
+      memberEmail = {
+        status: result.queued ? "pending" : result.skipped ? "skipped" : result.failed ? "failed" : "sent",
+        error: result.reason || result.error || ""
+      };
+    } else {
+      await req.project.save();
+    }
 
-projectsRouter.post("/:projectId/templates", loadProject, requireAdmin, async (req, res) => {
+    return { project: req.project, email: memberEmail || invitationEmail, assignedPendingTasks, taskUser: user };
+  });
+  if (res.headersSent) return;
+  payload.project.$session(null);
+  await populateProject(payload.project);
+  if (payload.taskUser) payload.assignedPendingTasks = await attachPendingTasksToUser(payload.project, payload.taskUser);
+  delete payload.taskUser;
+  res.json(payload);
+}));
+
+projectsRouter.post("/:projectId/templates", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   const { title, description, priority = "medium", categories = [], checklist = [], recurrence = {} } = req.body;
 
   if (!title?.trim() || !description?.trim()) {
@@ -690,18 +707,18 @@ projectsRouter.post("/:projectId/templates", loadProject, requireAdmin, async (r
   await req.project.save();
 
   res.status(201).json({ templates: req.project.templates });
-});
+}));
 
-projectsRouter.delete("/:projectId/templates/:templateId", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.delete("/:projectId/templates/:templateId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   req.project.templates = req.project.templates.filter(
     (template) => template._id.toString() !== req.params.templateId
   );
   await req.project.save();
 
   res.json({ templates: req.project.templates });
-});
+}));
 
-projectsRouter.post("/:projectId/invitations/:invitationId/resend", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.post("/:projectId/invitations/:invitationId/resend", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   const invitation = req.project.invitations.find(
     (item) => item._id.toString() === req.params.invitationId && item.status === "pending"
   );
@@ -719,9 +736,9 @@ projectsRouter.post("/:projectId/invitations/:invitationId/resend", loadProject,
   ]);
 
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.delete("/:projectId/invitations/:invitationId", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.delete("/:projectId/invitations/:invitationId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   req.project.invitations = req.project.invitations.filter(
     (invitation) => invitation._id.toString() !== req.params.invitationId
   );
@@ -731,9 +748,9 @@ projectsRouter.delete("/:projectId/invitations/:invitationId", loadProject, requ
     { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.delete("/:projectId/members/:userId", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.delete("/:projectId/members/:userId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   const userId = req.params.userId;
   const removingSelf = userId === req.user._id.toString();
   const admins = req.project.members.filter((member) => member.role === "admin");
@@ -769,9 +786,9 @@ projectsRouter.delete("/:projectId/members/:userId", loadProject, requireAdmin, 
     { path: "invitations.invitedBy", select: "name lastName email" }
   ]);
   res.json({ project: req.project });
-});
+}));
 
-projectsRouter.post("/:projectId/categories", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.post("/:projectId/categories", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   const { name, color } = req.body;
 
   if (!name) {
@@ -781,9 +798,9 @@ projectsRouter.post("/:projectId/categories", loadProject, requireAdmin, async (
   req.project.categories.push({ name, color });
   await req.project.save();
   res.status(201).json({ categories: req.project.categories });
-});
+}));
 
-projectsRouter.delete("/:projectId/categories/:categoryId", loadProject, requireAdmin, async (req, res) => {
+projectsRouter.delete("/:projectId/categories/:categoryId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   const requestedCategoryId = req.params.categoryId || "";
   const existingCategory = req.project.categories.find(
     (category) => category._id?.toString() === requestedCategoryId
@@ -802,14 +819,45 @@ projectsRouter.delete("/:projectId/categories/:categoryId", loadProject, require
     );
   });
 
-  await Promise.all([
-    req.project.save(),
-    Task.updateMany(
-      { project: req.project._id },
-      { $pull: { categories: requestedCategoryId } }
-    )
-  ]);
+  await req.project.save();
+  await Task.updateMany({ project: req.project._id }, { $pull: { categories: requestedCategoryId } });
 
   await populateProject(req.project);
   res.json({ project: req.project, categories: req.project.categories });
-});
+}));
+
+projectsRouter.get("/:projectId/activity", loadProject, requireAdmin, asyncRoute(async (req, res) => {
+  const page = Number(req.query.page || 1);
+  const limit = Number(req.query.limit || 20);
+  if (!Number.isSafeInteger(page) || page < 1 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    return res.status(400).json({ message: "Некорректная страница журнала" });
+  }
+  const stored = await Project.findById(req.project._id).select("+auditLog").lean();
+  const events = (stored?.auditLog || []).slice().reverse();
+  const items = events.slice((page - 1) * limit, page * limit);
+  const ids = [...new Set(items.flatMap((event) => [event.actor, event.targetUser]).filter(Boolean).map(String))];
+  const users = await User.find({ _id: { $in: ids } }).select("name lastName email").lean();
+  const names = new Map(users.map((user) => [String(user._id), fullName(user)]));
+  res.json({
+    items: items.map((event) => ({
+      ...event, actorName: event.actorName || names.get(String(event.actor)) || "Удалённый пользователь",
+      target: names.get(String(event.targetUser)) || event.target
+    })),
+    total: events.length, page, limit, capacity: 2000
+  });
+}));
+
+projectsRouter.patch("/:projectId/members/:userId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
+  const { role } = req.body;
+  if (!["admin", "member"].includes(role)) return res.status(400).json({ message: "Неизвестная роль" });
+  if (req.project.isArchived) return res.status(409).json({ message: "Архивный проект доступен только для просмотра" });
+  const member = memberEntry(req.project, req.params.userId);
+  if (!member) return res.status(404).json({ message: "Участник не найден" });
+  if (member.role === "admin" && role === "member" && req.project.members.filter((item) => item.role === "admin").length === 1) {
+    return res.status(400).json({ message: "В проекте должен остаться хотя бы один администратор" });
+  }
+  member.role = role;
+  await req.project.save();
+  await populateProject(req.project);
+  res.json({ project: req.project });
+}));

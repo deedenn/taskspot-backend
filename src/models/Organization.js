@@ -18,6 +18,7 @@ const organizationMemberSchema = new mongoose.Schema(
 
 const organizationSchema = new mongoose.Schema(
   {
+    templateVersion: { type: Number, default: 0, select: false },
     name: {
       type: String,
       trim: true,

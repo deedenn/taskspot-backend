@@ -1,3 +1,4 @@
+import { ProjectTemplate } from "../models/ProjectTemplate.js";
 import { Organization } from "../models/Organization.js";
 import { Notification } from "../models/Notification.js";
 import { Project } from "../models/Project.js";
@@ -104,8 +105,8 @@ export async function ensureDefaultOrganization(user) {
   });
 }
 
-export async function organizationUsage(organization) {
-  const projects = await Project.find({ organization: organization._id }).select("_id members invitations templates isArchived archivedAt");
+export async function organizationUsage(organization, { session = null } = {}) {
+  const projects = await Project.find({ organization: organization._id }).select("_id members invitations templates isArchived archivedAt").session(session);
   const projectIds = projects.map((project) => project._id);
   const activeProjectIds = projects
     .filter((project) => !project.isArchived && !project.archivedAt)
@@ -119,7 +120,7 @@ export async function organizationUsage(organization) {
   const memberUserIds = new Set();
   const extraMemberUserIds = new Set();
   const pendingInviteEmails = new Set();
-  let templates = 0;
+  let templates = await ProjectTemplate.countDocuments({ organization: organization._id }).session(session);
 
   organization.members.forEach((member) => {
     const userId = idString(member.user);
@@ -146,18 +147,16 @@ export async function organizationUsage(organization) {
     }
   });
 
-  const memberEmails = await User.find({ _id: { $in: [...memberUserIds] } }).distinct("email");
+  const memberEmails = await User.find({ _id: { $in: [...memberUserIds] } }).distinct("email").session(session);
   memberEmails.forEach((email) => pendingInviteEmails.delete(email));
 
-  const [activeTasks, attachments, recurringTasks] = await Promise.all([
-    Task.countDocuments({ project: { $in: activeProjectIds }, status: { $ne: "closed" } }),
-    Task.aggregate([
-      { $match: { project: { $in: projectIds } } },
-      { $project: { count: { $size: "$attachments" } } },
-      { $group: { _id: null, total: { $sum: "$count" } } }
-    ]),
-    Task.countDocuments({ project: { $in: activeProjectIds }, "recurrence.enabled": true })
-  ]);
+  const activeTasks = await Task.countDocuments({ project: { $in: activeProjectIds }, status: { $ne: "closed" } }).session(session);
+  const attachments = await Task.aggregate([
+    { $match: { project: { $in: projectIds } } },
+    { $project: { count: { $size: "$attachments" } } },
+    { $group: { _id: null, total: { $sum: "$count" } } }
+  ]).session(session);
+  const recurringTasks = await Task.countDocuments({ project: { $in: activeProjectIds }, "recurrence.enabled": true }).session(session);
 
   return {
     users: extraMemberUserIds.size + pendingInviteEmails.size,

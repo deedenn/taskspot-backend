@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { ACTIVITY_FIELDS, projectChanges } from "../services/projectActivity.js";
 
 function defaultInvitationExpiresAt() {
   return new Date(Date.now() + 1000 * 60 * 60 * 24 * 14);
@@ -173,6 +174,13 @@ const projectAvatarSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const activitySchema = new mongoose.Schema({
+  action: { type: String, required: true }, target: String, before: String, after: String,
+  targetUser: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  actor: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, actorName: String,
+  at: { type: Date, default: Date.now }
+});
+
 const projectSchema = new mongoose.Schema(
   {
     organization: {
@@ -193,6 +201,9 @@ const projectSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User"
     },
+    auditLog: { type: [activitySchema], select: false },
+    templateCreationKey: { type: String, select: false },
+    templateCreationDigest: { type: String, select: false },
     avatar: projectAvatarSchema,
     members: [projectMemberSchema],
     categories: [categorySchema],
@@ -213,6 +224,22 @@ const projectSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+projectSchema.set("optimisticConcurrency", true);
+projectSchema.index({ templateCreationKey: 1 }, { unique: true, sparse: true });
+projectSchema.pre("save", async function () {
+  const fields = ACTIVITY_FIELDS.filter((field) => this.isModified(field));
+  if (!this.isNew && !fields.length) return;
+  const previous = this.isNew ? null : await this.constructor.findById(this._id)
+    .select(ACTIVITY_FIELDS.join(" ") + " +auditLog").session(this.$session()).lean();
+  const changes = projectChanges(previous, this, fields);
+  if (!changes.length) return;
+  const actor = this.$locals.auditActor;
+  this.auditLog = [...(previous?.auditLog || []), ...changes.map((event) => ({
+    ...event, actor: actor?.user || (this.isNew ? this.createdBy : undefined),
+    actorName: actor?.name || (this.isNew ? "" : "Система"), at: new Date()
+  }))].slice(-2000);
+});
+
 projectSchema.index({ "invitations.emailOutbox.key": 1 }, { sparse: true });
 projectSchema.index({ "members.emailOutbox.key": 1 }, { sparse: true });
 projectSchema.index({ organization: 1, updatedAt: -1 });
@@ -221,6 +248,9 @@ projectSchema.index({ "invitations.token": 1 });
 projectSchema.index({ "invitations.email": 1, "invitations.status": 1 });
 
 projectSchema.set("toJSON", { transform: (_document, result) => {
+  delete result.auditLog;
+  delete result.templateCreationKey;
+  delete result.templateCreationDigest;
   for (const item of [...(result.members || []), ...(result.invitations || [])]) delete item.emailOutbox;
   return result;
 } });

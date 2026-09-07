@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import express from "express";
+import { activityActor } from "../services/projectActivity.js";
 
 import { sessionToken, strongPassword, requestPasswordReset, resetPassword, startAdminChallenge, finishAdminChallenge } from "../services/accountSecurity.js";
 import { asyncRoute } from "../middleware/asyncRoute.js";
@@ -76,63 +77,56 @@ async function sendVerificationAndSave(user, token) {
   });
 }
 
-async function acceptPendingInvitations(user) {
+async function acceptPendingInvitations(user, session) {
+  if (!user?.emailVerifiedAt || user.isSuperAdmin || user.status !== "active") return;
+
+  const now = new Date();
   const invitedProjects = await Project.find({
-    "invitations.email": user.email,
-    "invitations.status": "pending"
-  });
+    invitations: { $elemMatch: { email: user.email, status: "pending", expiresAt: { $gt: now } } }
+  }).session(session);
 
-  await Promise.all(
-    invitedProjects.map(async (project) => {
-      const invitation = project.invitations.find(
-        (item) => item.email === user.email && item.status === "pending"
-      );
-      const isAlreadyMember = project.members.some(
-        (member) => member.user.toString() === user._id.toString()
-      );
+  for (const project of invitedProjects) {
+    const invitation = project.invitations.find(
+      (item) => item.email === user.email && item.status === "pending" && item.expiresAt > now
+    );
+    if (!invitation) continue;
 
-      if (invitation && !isAlreadyMember) {
-        project.members.push({ user: user._id, role: invitation.role });
-        invitation.status = "accepted";
-        invitation.acceptedAt = new Date();
-        await project.save();
+    const existingMember = project.members.find((member) => member.user.toString() === user._id.toString());
+    const role = existingMember?.role || invitation.role;
+    project.$locals.auditActor = activityActor(user);
+    if (!existingMember) project.members.push({ user: user._id, role });
+    invitation.status = "accepted";
+    invitation.acceptedAt = now;
+    await project.save({ session });
 
-        if (project.organization) {
-          const organization = await Organization.findById(project.organization);
-          const organizationRole = invitation.role === "admin" ? "admin" : "member";
+    if (project.organization) {
+      const organization = await Organization.findById(project.organization).session(session);
 
-          if (
-            organization &&
-            !organization.members.some((member) => member.user.toString() === user._id.toString())
-          ) {
-            organization.members.push({ user: user._id, role: organizationRole });
-            await organization.save();
-          }
-        }
-
-        const assignedTasks = await Task.find({
-          project: project._id,
-          assigneeEmail: user.email,
-          $or: [{ assignee: { $exists: false } }, { assignee: null }]
-        });
-
-        await Promise.all(
-          assignedTasks.map(async (task) => {
-            task.assignee = user._id;
-            task.assigneeEmail = undefined;
-            await task.save();
-
-            await Notification.create({
-              user: user._id,
-              project: project._id,
-              task: task._id,
-              message: `Вам назначена задача в проекте «${project.name}»`
-            });
-          })
-        );
+      if (organization && !organization.members.some((member) => member.user.toString() === user._id.toString())) {
+        organization.members.push({ user: user._id, role });
+        await organization.save({ session });
       }
-    })
-  );
+    }
+
+    const assignedTasks = await Task.find({
+      project: project._id,
+      assigneeEmail: user.email,
+      $or: [{ assignee: { $exists: false } }, { assignee: null }]
+    }).session(session);
+
+    for (const task of assignedTasks) {
+      task.assignee = user._id;
+      task.assigneeEmail = undefined;
+      await task.save({ session });
+
+      await new Notification({
+        user: user._id,
+        project: project._id,
+        task: task._id,
+        message: `Вам назначена задача в проекте «${project.name}»`
+      }).save({ session });
+    }
+  }
 }
 
 function publicInvitation(project, invitation) {
@@ -245,23 +239,35 @@ authRouter.post("/email/verify", authLimiter, async (req, res) => {
     }
 
     const tokenHash = hashEmailVerificationToken(token);
-    const user = await User.findOne({ emailVerificationTokenHash: tokenHash });
+    const user = await User.db.transaction(async (session) => {
+      // Reload on every transaction attempt: a resend or expiry invalidates the old token.
+      const candidate = await User.findOne({
+        emailVerificationTokenHash: tokenHash,
+        emailVerificationExpiresAt: { $gt: new Date() },
+        emailVerifiedAt: null
+      }).session(session);
+      if (!candidate) return null;
 
-    if (!user || !user.emailVerificationExpiresAt || user.emailVerificationExpiresAt < new Date()) {
+      candidate.emailVerifiedAt = new Date();
+      candidate.emailVerificationTokenHash = "";
+      candidate.emailVerificationExpiresAt = undefined;
+      candidate.emailVerificationStatus = "verified";
+      candidate.emailVerificationError = "";
+      candidate.lastLoginAt = new Date();
+      await candidate.save({ session });
+      await acceptPendingInvitations(candidate, session);
+      return candidate;
+    });
+
+    if (!user) {
       return res.status(400).json({ message: "Verification link is invalid or expired" });
     }
 
-    user.emailVerifiedAt = new Date();
-    user.emailVerificationTokenHash = "";
-    user.emailVerificationExpiresAt = undefined;
-    user.emailVerificationStatus = "verified";
-    user.emailVerificationError = "";
-    await user.save();
-    await acceptPendingInvitations(user);
-    user.lastLoginAt = new Date();
-    await user.save();
     res.json({ token: createToken(user), user });
   } catch (error) {
+    if (error?.name === "VersionError") {
+      return res.status(409).json({ message: "Проект изменён другим участником. Повторите подтверждение email." });
+    }
     res.status(500).json({ message: "Email verification failed" });
   }
 });
@@ -319,6 +325,20 @@ authRouter.post("/login", authLimiter, async (req, res) => {
     }
     user.lastLoginAt = new Date();
     await user.save();
+
+    if (user.emailVerifiedAt) {
+      try {
+        await User.db.transaction(async (session) => {
+          const current = await User.findOne({
+            _id: user._id, passwordHash: user.passwordHash, sessionVersion: user.sessionVersion
+          }).session(session);
+          await acceptPendingInvitations(current, session);
+        });
+      } catch {
+        // Invitation repair is retryable on the next login and must not block authentication.
+        console.error("[taskspot:auth]", { event: "invitation_repair_failed", userId: String(user._id) });
+      }
+    }
 
     res.json({ token: createToken(user), user });
   } catch (error) {

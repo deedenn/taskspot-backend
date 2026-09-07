@@ -1,3 +1,4 @@
+import { projectTemplatesRouter } from "./routes/projectTemplates.js";
 import cors from "cors";
 import { analyticsRouter } from "./routes/analytics.js";
 import express from "express";
@@ -59,6 +60,7 @@ export function createApp() {
   app.use("/api/analytics", analyticsRouter);
   app.use("/api/organizations", organizationsRouter);
   app.use("/api/projects", projectsRouter);
+  app.use("/api/project-templates", projectTemplatesRouter);
   app.use("/api/tasks", tasksRouter);
   app.use("/api/uploads", uploadsRouter);
   app.use("/api/dashboard", dashboardRouter);
@@ -69,6 +71,10 @@ export function createApp() {
   app.use((error, req, res, next) => {
     if (error?.type === "entity.too.large") {
       return res.status(413).json({ message: "Request body is too large" });
+    }
+
+    if (error?.name === "VersionError") {
+      return res.status(409).json({ message: "Проект изменён другим участником. Обновите страницу и повторите действие." });
     }
 
     if (error?.name === "ValidationError" || error?.name === "CastError") {

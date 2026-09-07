@@ -1062,6 +1062,8 @@ if (!process.env.TEST_MONGODB_URI) {
       const creator = await register({ name: "Creator", email: `creator_${Date.now()}@example.com` });
       const assignee = await register({ name: "Assignee", email: `assignee_${Date.now()}@example.com` });
       const project = await createProject(creator.token, "Workflow");
+      const { Organization } = await import("../src/models/Organization.js");
+      await Organization.updateOne({ _id: project.organization._id }, { $set: { plan: "team" } });
 
       const member = await request(`/api/projects/${project._id}/members`, {
         method: "POST",
@@ -1123,7 +1125,7 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(review.response.status, 200, review.data.message);
       assert.equal(review.data.task.status, "review");
       assert.ok(
-        await Notification.exists({ user: creator.user._id, task: taskId, message: /ready for review/ })
+        await Notification.exists({ user: creator.user._id, task: taskId, message: /ожидает проверки/ })
       );
 
       const assigneeCannotClose = await request(`/api/tasks/${taskId}`, {
@@ -1167,7 +1169,7 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(legacyDone.response.status, 200, legacyDone.data.message);
       assert.equal(legacyDone.data.task.status, "review");
       assert.ok(
-        await Notification.exists({ user: creator.user._id, task: taskId, message: /ready for review/ })
+        await Notification.exists({ user: creator.user._id, task: taskId, message: /ожидает проверки/ })
       );
 
       const closed = await request(`/api/tasks/${taskId}`, {
