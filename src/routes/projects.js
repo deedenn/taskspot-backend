@@ -801,29 +801,29 @@ projectsRouter.post("/:projectId/categories", loadProject, requireAdmin, asyncRo
 }));
 
 projectsRouter.delete("/:projectId/categories/:categoryId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
-  const requestedCategoryId = req.params.categoryId || "";
-  const existingCategory = req.project.categories.find(
-    (category) => category._id?.toString() === requestedCategoryId
-  );
-
-  if (!existingCategory) {
-    return res.status(404).json({ message: "Category not found" });
-  }
-
-  req.project.categories = req.project.categories.filter(
-    (category) => category._id?.toString() !== requestedCategoryId
-  );
-  req.project.templates.forEach((template) => {
-    template.categories = template.categories.filter(
-      (categoryId) => categoryId?.toString() !== requestedCategoryId
-    );
+  let project;
+  await mongoose.connection.transaction(async (session) => {
+    project = await Project.findById(req.project._id).session(session);
+    if (!project?.members.some((member) => idString(member.user) === idString(req.user._id) && member.role === "admin")) {
+      throw Object.assign(new Error("Нет прав на удаление категории"), { statusCode: 403 });
+    }
+    if (project.isArchived || project.archivedAt) throw Object.assign(new Error("Проект находится в архиве"), { statusCode: 409 });
+    const categoryId = req.params.categoryId;
+    if (!project.categories.some((category) => String(category._id) === categoryId)) {
+      throw Object.assign(new Error("Категория не найдена"), { statusCode: 404 });
+    }
+    project.categories = project.categories.filter((category) => String(category._id) !== categoryId);
+    project.templates.forEach((template) => {
+      template.categories = template.categories.filter((id) => String(id) !== categoryId);
+    });
+    project.$locals.auditActor = activityActor(req.user);
+    await project.save({ session });
+    await Task.updateMany({ project: project._id, categories: categoryId },
+      { $pull: { categories: categoryId } }, { session, timestamps: false });
   });
-
-  await req.project.save();
-  await Task.updateMany({ project: req.project._id }, { $pull: { categories: requestedCategoryId } });
-
-  await populateProject(req.project);
-  res.json({ project: req.project, categories: req.project.categories });
+  project.$session(null);
+  await populateProject(project);
+  res.json({ project, categories: project.categories });
 }));
 
 projectsRouter.get("/:projectId/activity", loadProject, requireAdmin, asyncRoute(async (req, res) => {

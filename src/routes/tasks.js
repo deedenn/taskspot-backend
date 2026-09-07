@@ -261,7 +261,7 @@ async function respondWithTask(res, task) {
   await task.populate([
     { path: "project", select: "name categories members isArchived archivedAt archivedBy" },
     { path: "creator", select: "name lastName email" },
-    { path: "assignee", select: "name lastName email" },
+    { path: "assignee", select: "name lastName email avatarUrl" },
     { path: "observers", select: "name lastName email" },
     { path: "attachments.addedBy", select: "name lastName email" },
     { path: "comments.author", select: "name lastName email" },
@@ -421,7 +421,7 @@ tasksRouter.get("/", asyncRoute(async (req, res) => {
   const tasks = await Task.find(filter)
       .select("-activities -attachments -checklist -recurrence")
       .populate("creator", "name lastName email")
-      .populate("assignee", "name lastName email")
+      .populate("assignee", "name lastName email avatarUrl")
       .populate("observers", "name lastName email")
       .populate("comments.author", "name lastName email")
       .sort(sort)

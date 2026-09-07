@@ -17,7 +17,7 @@ dashboardRouter.get("/", asyncRoute(async (req, res) => {
     Task.find(taskFilter)
       .populate("project", "name isArchived archivedAt")
       .populate("creator", "name lastName email")
-      .populate("assignee", "name lastName email")
+      .populate("assignee", "name lastName email avatarUrl")
       .populate("observers", "name lastName email")
       .sort({ updatedAt: -1, _id: -1 }),
     Notification.find(notificationFilter)

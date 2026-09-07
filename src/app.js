@@ -1,3 +1,4 @@
+import { workspaceRouter } from "./routes/workspace.js";
 import { projectTemplatesRouter } from "./routes/projectTemplates.js";
 import cors from "cors";
 import { analyticsRouter } from "./routes/analytics.js";
@@ -64,6 +65,7 @@ export function createApp() {
   app.use("/api/tasks", tasksRouter);
   app.use("/api/uploads", uploadsRouter);
   app.use("/api/dashboard", dashboardRouter);
+  app.use("/api/workspace", workspaceRouter);
   app.use("/api/notifications", notificationsRouter);
   app.use("/api/reports", reportsRouter);
   app.use("/api/admin", adminRouter);
