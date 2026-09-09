@@ -4,57 +4,10 @@ import { Notification } from "../models/Notification.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
+import { synchronizeOrganizationSubscription } from "./subscriptions.js";
+import { PLANS } from "./planCatalog.js";
 
-export const PLANS = {
-  free: {
-    key: "free",
-    name: "Бесплатный",
-    price: "0 ₽",
-    monthlyPrice: 0,
-    limits: {
-      organizations: 1,
-      users: 3,
-      projects: 2,
-      activeTasks: 50,
-      attachments: 20,
-      templates: 3,
-      recurringTasks: 0,
-      historyDays: 30
-    }
-  },
-  team: {
-    key: "team",
-    name: "Команда",
-    price: "990 ₽/мес",
-    monthlyPrice: 990,
-    limits: {
-      organizations: 3,
-      users: 20,
-      projects: 50,
-      activeTasks: 1000,
-      attachments: 500,
-      templates: 50,
-      recurringTasks: 100,
-      historyDays: 365
-    }
-  },
-  business: {
-    key: "business",
-    name: "Бизнес",
-    price: "2490 ₽/мес",
-    monthlyPrice: 2490,
-    limits: {
-      organizations: 10,
-      users: 100,
-      projects: 200,
-      activeTasks: 10000,
-      attachments: 5000,
-      templates: 200,
-      recurringTasks: 1000,
-      historyDays: 0
-    }
-  }
-};
+export { PLANS } from "./planCatalog.js";
 
 export function planFor(organization) {
   if (
@@ -105,7 +58,8 @@ export async function ensureDefaultOrganization(user) {
   });
 }
 
-export async function organizationUsage(organization, { session = null } = {}) {
+export async function organizationUsage(organization, { session = null, synchronize = true } = {}) {
+  if (synchronize) await synchronizeOrganizationSubscription(organization, { session });
   const projects = await Project.find({ organization: organization._id }).select("_id members invitations templates isArchived archivedAt").session(session);
   const projectIds = projects.map((project) => project._id);
   const activeProjectIds = projects
@@ -176,8 +130,8 @@ export async function organizationUsage(organization, { session = null } = {}) {
   };
 }
 
-export async function organizationPayload(organization) {
-  const usage = await organizationUsage(organization);
+export async function organizationPayload(organization, options = {}) {
+  const usage = await organizationUsage(organization, options);
   const plan = planFor(organization);
 
   return {

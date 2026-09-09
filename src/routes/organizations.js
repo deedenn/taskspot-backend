@@ -4,6 +4,12 @@ import { BillingRequest } from "../models/BillingRequest.js";
 import { Organization } from "../models/Organization.js";
 import { billingIntegrationPayload } from "../services/billingProviders.js";
 import { ensureDefaultOrganization, organizationPayload, PLANS, planFor } from "../services/plans.js";
+import {
+  cancelMockPayment,
+  confirmMockPayment,
+  createMockPaymentOrder,
+  subscriptionPayload
+} from "../services/subscriptions.js";
 
 export const organizationsRouter = express.Router();
 
@@ -51,8 +57,9 @@ function sanitizeBillingRequest(request) {
 }
 
 async function organizationPayloadWithBilling(organization) {
+  const subscriptionData = await subscriptionPayload(organization);
   const [payload, billingRequests] = await Promise.all([
-    organizationPayload(organization),
+    organizationPayload(organization, { synchronize: false }),
     BillingRequest.find({ organization: organization._id })
       .sort({ createdAt: -1 })
       .limit(5)
@@ -63,10 +70,34 @@ async function organizationPayloadWithBilling(organization) {
 
   return {
     ...payload,
+    ...subscriptionData,
     billingRequests: billingRequests.map(sanitizeBillingRequest),
     activeBillingRequest: sanitizeBillingRequest(
       billingRequests.find((request) => request.status === "pending") || billingRequests[0]
     )
+  };
+}
+
+function paymentOrderPayload(order) {
+  if (!order) return null;
+  return {
+    _id: order._id,
+    organization: order.organization,
+    requestedBy: order.requestedBy,
+    targetPlan: order.targetPlan,
+    planVersion: order.planVersion,
+    planName: order.planName,
+    periodMonths: order.periodMonths,
+    transitionType: order.transitionType,
+    status: order.status,
+    amountKopecks: order.amountKopecks,
+    currency: order.currency,
+    expiresAt: order.expiresAt,
+    paidAt: order.paidAt,
+    cancelledAt: order.cancelledAt,
+    payment: order.payment,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt
   };
 }
 
@@ -86,7 +117,10 @@ organizationsRouter.get("/", asyncRoute(async (req, res) => {
 
 organizationsRouter.post("/", asyncRoute(async (req, res) => {
   const { name } = req.body;
-  const existingOrganizations = await Organization.find({ "members.user": req.user._id }).select("plan");
+  const existingOrganizations = await Organization.find({
+    members: { $elemMatch: { user: req.user._id, role: "owner" } }
+  }).select("plan planExpiresAt planAssignedAt planSource planChangeReason createdAt");
+  await Promise.all(existingOrganizations.map((organization) => synchronizeOrganizationSubscription(organization)));
   const organizationLimit = existingOrganizations.reduce(
     (limit, organization) => Math.max(limit, planFor(organization).limits.organizations),
     PLANS.free.limits.organizations
@@ -195,4 +229,74 @@ organizationsRouter.post("/:organizationId/billing-requests", asyncRoute(async (
     billingRequest: sanitizeBillingRequest(request),
     billing: billingIntegrationPayload()
   });
+}));
+
+organizationsRouter.post("/:organizationId/payment-orders", asyncRoute(async (req, res) => {
+  const organization = await Organization.findById(req.params.organizationId);
+
+  if (!organization || !memberEntry(organization, req.user._id)) {
+    return res.status(404).json({ message: "Компания не найдена" });
+  }
+
+  if (!isOrganizationAdmin(organization, req.user._id)) {
+    return res.status(403).json({ message: "Оплатить тариф может владелец или администратор компании" });
+  }
+
+  const order = await createMockPaymentOrder({
+    organization,
+    userId: req.user._id,
+    targetPlan: req.body.plan,
+    periodMonths: Number(req.body.periodMonths),
+    idempotencyKey: req.body.idempotencyKey
+  });
+
+  res.status(201).json({
+    paymentOrder: paymentOrderPayload(order),
+    testMode: true,
+    message: "Тестовый платёж создан. Подтвердите оплату, чтобы активировать тариф."
+  });
+}));
+
+organizationsRouter.post("/:organizationId/payment-orders/:orderId/confirm", asyncRoute(async (req, res) => {
+  const organization = await Organization.findById(req.params.organizationId);
+
+  if (!organization || !memberEntry(organization, req.user._id)) {
+    return res.status(404).json({ message: "Компания не найдена" });
+  }
+
+  if (!isOrganizationAdmin(organization, req.user._id)) {
+    return res.status(403).json({ message: "Подтвердить оплату может владелец или администратор компании" });
+  }
+
+  const result = await confirmMockPayment({
+    organizationId: organization._id,
+    orderId: req.params.orderId
+  });
+  const refreshedOrganization = await Organization.findById(organization._id);
+
+  res.json({
+    paymentOrder: paymentOrderPayload(result.order),
+    ...(await subscriptionPayload(refreshedOrganization)),
+    repeated: result.repeated,
+    message: result.repeated ? "Оплата уже была подтверждена" : "Оплата подтверждена, тариф обновлён"
+  });
+}));
+
+organizationsRouter.post("/:organizationId/payment-orders/:orderId/cancel", asyncRoute(async (req, res) => {
+  const organization = await Organization.findById(req.params.organizationId);
+
+  if (!organization || !memberEntry(organization, req.user._id)) {
+    return res.status(404).json({ message: "Компания не найдена" });
+  }
+
+  if (!isOrganizationAdmin(organization, req.user._id)) {
+    return res.status(403).json({ message: "Отменить платёж может владелец или администратор компании" });
+  }
+
+  const order = await cancelMockPayment({
+    organizationId: organization._id,
+    orderId: req.params.orderId,
+    userId: req.user._id
+  });
+  res.json({ paymentOrder: paymentOrderPayload(order) });
 }));

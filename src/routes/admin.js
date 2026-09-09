@@ -1,6 +1,7 @@
 import express from "express";
 import { requireSuperAdmin } from "../middleware/superAdmin.js";
 import { BillingRequest } from "../models/BillingRequest.js";
+import { PaymentOrder } from "../models/PaymentOrder.js";
 import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
@@ -8,15 +9,10 @@ import { User } from "../models/User.js";
 import { billingIntegrationPayload } from "../services/billingProviders.js";
 import { checkEmailTransport, emailRuntimeConfig } from "../services/email.js";
 import { PLANS } from "../services/plans.js";
+import { addCalendarMonths, applyManualSubscriptionChange } from "../services/subscriptions.js";
 import { EmailJob } from "../models/EmailJob.js";
 
 export const adminRouter = express.Router();
-
-const PLAN_REVENUE = {
-  free: 0,
-  team: 990,
-  business: 2490
-};
 
 function daysAgo(days) {
   const date = new Date();
@@ -42,12 +38,6 @@ function asyncRoute(handler) {
   return (req, res, next) => {
     Promise.resolve(handler(req, res, next)).catch(next);
   };
-}
-
-function addMonths(date, months) {
-  const result = new Date(date);
-  result.setMonth(result.getMonth() + months);
-  return result;
 }
 
 function billingRequestPayload(request) {
@@ -166,6 +156,9 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     pendingBillingRequests,
     approvedBillingRequests,
     receivedRevenue,
+    pendingPaymentOrders,
+    paidPaymentOrdersInPeriod,
+    mockReceivedRevenue,
     totalProjects,
     newProjects,
     totalTasks,
@@ -220,6 +213,12 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       { $match: { "payment.status": "paid", "payment.paidAt": { $lte: new Date() }, amount: { $gt: 0 } } },
       { $group: { _id: null, total: { $sum: "$amount" } } }
     ]),
+    PaymentOrder.countDocuments({ isOpen: true, status: "awaiting_payment" }),
+    PaymentOrder.countDocuments({ status: "paid", paidAt: { $gte: since } }),
+    PaymentOrder.aggregate([
+      { $match: { status: "paid", paidAt: { $lte: now }, amountKopecks: { $gt: 0 } } },
+      { $group: { _id: null, totalKopecks: { $sum: "$amountKopecks" } } }
+    ]),
     Project.countDocuments(),
     Project.countDocuments({ createdAt: { $gte: since } }),
     Task.countDocuments(),
@@ -239,7 +238,7 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
   const planBreakdown = organizationsByPlan.map((item) => ({
     plan: item._id || "free",
     organizations: item.count,
-    monthlyRevenue: item.count * (PLAN_REVENUE[item._id] || 0)
+    monthlyRevenue: item.count * (PLANS[item._id]?.monthlyPrice || 0)
   }));
   const estimatedMonthlyRevenue = planBreakdown.reduce((sum, item) => sum + item.monthlyRevenue, 0);
   const paidOrganizations = planBreakdown
@@ -265,7 +264,7 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       byPlan: planBreakdown
     },
     revenue: {
-      received: receivedRevenue[0]?.total || 0,
+      received: (receivedRevenue[0]?.total || 0) + (mockReceivedRevenue[0]?.totalKopecks || 0) / 100,
       estimatedMonthly: estimatedMonthlyRevenue,
       estimatedAnnual: estimatedMonthlyRevenue * 12,
       paidConversionRate: percent(paidOrganizations, totalOrganizations)
@@ -273,6 +272,8 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     billing: {
       pendingRequests: pendingBillingRequests,
       approvedInPeriod: approvedBillingRequests,
+      pendingPaymentOrders,
+      paidPaymentOrdersInPeriod,
       integration: billingIntegrationPayload()
     },
     projects: {
@@ -325,6 +326,27 @@ adminRouter.get("/billing-requests", asyncRoute(async (req, res) => {
   });
 }));
 
+adminRouter.get("/payment-orders", asyncRoute(async (req, res) => {
+  const status = String(req.query.status || "all").trim();
+  const filter = {};
+
+  if (status !== "all") {
+    if (!["awaiting_payment", "paid", "expired", "cancelled", "failed", "refunded"].includes(status)) {
+      return res.status(400).json({ message: "Некорректный статус платежа" });
+    }
+    filter.status = status;
+  }
+
+  const paymentOrders = await PaymentOrder.find(filter)
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .populate("organization", "name plan planExpiresAt")
+    .populate("requestedBy", "name lastName email")
+    .lean();
+
+  res.json({ paymentOrders, billing: billingIntegrationPayload() });
+}));
+
 adminRouter.patch("/billing-requests/:requestId", asyncRoute(async (req, res) => {
   const { status, expiresAt, adminNote, paymentStatus = "paid" } = req.body;
 
@@ -342,7 +364,7 @@ adminRouter.patch("/billing-requests/:requestId", asyncRoute(async (req, res) =>
     return res.status(400).json({ message: "Можно обработать только новую заявку" });
   }
 
-  const organization = await Organization.findById(request.organization);
+  let organization = await Organization.findById(request.organization);
 
   if (!organization) {
     return res.status(404).json({ message: "Компания заявки не найдена" });
@@ -357,19 +379,21 @@ adminRouter.patch("/billing-requests/:requestId", asyncRoute(async (req, res) =>
       }
       planExpiresAt = parsedDate;
     } else {
-      planExpiresAt = addMonths(new Date(), request.periodMonths || 1);
+      planExpiresAt = addCalendarMonths(new Date(), request.periodMonths || 1);
     }
 
-    organization.plan = request.plan;
-    organization.planExpiresAt = planExpiresAt;
-    organization.planAssignedAt = new Date();
-    organization.planAssignedBy = req.user._id;
-    organization.planSource = "manual";
-    organization.planChangeReason =
+    const changeReason =
       typeof adminNote === "string" && adminNote.trim()
         ? adminNote.trim()
         : `Заявка на тариф ${PLANS[request.plan]?.name || request.plan} на ${request.periodMonths} мес.`;
-    await organization.save();
+    await applyManualSubscriptionChange({
+      organization,
+      plan: request.plan,
+      expiresAt: planExpiresAt,
+      actorId: req.user._id,
+      note: changeReason
+    });
+    organization = await Organization.findById(request.organization);
   }
 
   request.status = status;
@@ -534,13 +558,14 @@ adminRouter.patch("/users/:userId/plan", async (req, res) => {
     return res.status(404).json({ message: "У пользователя нет организации для назначения тарифа" });
   }
 
-  organization.plan = plan;
-  organization.planExpiresAt = planExpiresAt;
-  organization.planAssignedAt = new Date();
-  organization.planAssignedBy = req.user._id;
-  organization.planSource = "manual";
-  organization.planChangeReason = typeof note === "string" ? note.trim() : "";
-  await organization.save();
+  await applyManualSubscriptionChange({
+    organization,
+    plan,
+    expiresAt: planExpiresAt,
+    actorId: req.user._id,
+    note: typeof note === "string" ? note.trim() : ""
+  });
+  organization = await Organization.findById(organization._id);
 
   const [payload] = await attachUserPlans([
     user.toObject({

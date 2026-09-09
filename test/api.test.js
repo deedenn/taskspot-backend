@@ -22,6 +22,11 @@ if (!process.env.TEST_MONGODB_URI) {
 
   const { createApp } = await import("../src/app.js");
   const { BillingRequest } = await import("../src/models/BillingRequest.js");
+  const { BillingEvent } = await import("../src/models/BillingEvent.js");
+  const { PaymentOrder } = await import("../src/models/PaymentOrder.js");
+  const { Subscription } = await import("../src/models/Subscription.js");
+  const { SubscriptionPeriod } = await import("../src/models/SubscriptionPeriod.js");
+  const { Organization } = await import("../src/models/Organization.js");
   const { Notification } = await import("../src/models/Notification.js");
   let server;
   let baseUrl;
@@ -790,6 +795,103 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(organizations.response.status, 200, organizations.data.message);
       assert.equal(organizations.data.organizations[0].plan.key, "team");
       assert.equal(organizations.data.organizations[0].activeBillingRequest.status, "approved");
+    });
+
+    test("mock payment activates a plan once and renewal preserves the current period", async () => {
+      const owner = await register({ name: "Mock Payment Owner", email: `mock_payment_${Date.now()}@example.com` });
+      const organization = await defaultOrganization(owner.token);
+
+      const created = await request(`/api/organizations/${organization._id}/payment-orders`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          plan: "team",
+          periodMonths: 3,
+          idempotencyKey: `activate-${Date.now()}`
+        }
+      });
+      assert.equal(created.response.status, 201, created.data.message);
+      assert.equal(created.data.paymentOrder.status, "awaiting_payment");
+      assert.equal(created.data.paymentOrder.payment.status, "pending");
+      assert.equal(created.data.paymentOrder.amountKopecks, 297000);
+      assert.equal((await Organization.findById(organization._id)).plan, "free");
+
+      const confirmed = await request(
+        `/api/organizations/${organization._id}/payment-orders/${created.data.paymentOrder._id}/confirm`,
+        { method: "POST", token: owner.token }
+      );
+      assert.equal(confirmed.response.status, 200, confirmed.data.message);
+      assert.equal(confirmed.data.paymentOrder.status, "paid");
+      assert.equal(confirmed.data.paymentOrder.payment.status, "succeeded");
+      assert.equal(confirmed.data.subscription.currentPlan, "team");
+
+      const repeated = await request(
+        `/api/organizations/${organization._id}/payment-orders/${created.data.paymentOrder._id}/confirm`,
+        { method: "POST", token: owner.token }
+      );
+      assert.equal(repeated.response.status, 200, repeated.data.message);
+      assert.equal(repeated.data.repeated, true);
+
+      const subscription = await Subscription.findOne({ organization: organization._id });
+      assert.equal(await SubscriptionPeriod.countDocuments({ subscription: subscription._id, sourceOrder: created.data.paymentOrder._id }), 1);
+      assert.equal(await BillingEvent.countDocuments({ idempotencyKey: `subscription:${subscription._id}:order:${created.data.paymentOrder._id}` }), 1);
+
+      const renewal = await request(`/api/organizations/${organization._id}/payment-orders`, {
+        method: "POST",
+        token: owner.token,
+        body: {
+          plan: "team",
+          periodMonths: 1,
+          idempotencyKey: `renew-${Date.now()}`
+        }
+      });
+      assert.equal(renewal.response.status, 201, renewal.data.message);
+      assert.equal(renewal.data.paymentOrder.transitionType, "renew");
+
+      const renewed = await request(
+        `/api/organizations/${organization._id}/payment-orders/${renewal.data.paymentOrder._id}/confirm`,
+        { method: "POST", token: owner.token }
+      );
+      assert.equal(renewed.response.status, 200, renewed.data.message);
+      assert.equal(renewed.data.subscription.currentPlan, "team");
+      assert.equal(renewed.data.subscription.scheduledPeriod.transitionType, "renew");
+      assert.equal(await PaymentOrder.countDocuments({ organization: organization._id, status: "paid" }), 2);
+
+      const admin = await loginSuperAdmin();
+      const paidOrders = await request("/api/admin/payment-orders?status=paid", { token: admin.token });
+      assert.equal(paidOrders.response.status, 200, paidOrders.data.message);
+      assert.ok(paidOrders.data.paymentOrders.some((item) => item._id === created.data.paymentOrder._id));
+    });
+
+    test("mock payment upgrades immediately and schedules a downgrade", async () => {
+      const owner = await register({ name: "Plan Transition Owner", email: `plan_transition_${Date.now()}@example.com` });
+      const organization = await defaultOrganization(owner.token);
+
+      async function pay(plan, key) {
+        const created = await request(`/api/organizations/${organization._id}/payment-orders`, {
+          method: "POST",
+          token: owner.token,
+          body: { plan, periodMonths: 1, idempotencyKey: key }
+        });
+        assert.equal(created.response.status, 201, created.data.message);
+        const confirmed = await request(
+          `/api/organizations/${organization._id}/payment-orders/${created.data.paymentOrder._id}/confirm`,
+          { method: "POST", token: owner.token }
+        );
+        assert.equal(confirmed.response.status, 200, confirmed.data.message);
+        return confirmed.data;
+      }
+
+      await pay("team", `activate-team-${Date.now()}`);
+      const upgraded = await pay("business", `upgrade-business-${Date.now()}`);
+      assert.equal(upgraded.subscription.currentPlan, "business");
+      assert.equal(upgraded.paymentOrder.transitionType, "upgrade");
+
+      const downgraded = await pay("team", `downgrade-team-${Date.now()}`);
+      assert.equal(downgraded.subscription.currentPlan, "business");
+      assert.equal(downgraded.paymentOrder.transitionType, "downgrade");
+      assert.equal(downgraded.subscription.scheduledPeriod.plan, "team");
+      assert.equal(downgraded.subscription.scheduledPeriod.status, "scheduled");
     });
 
     test("creates projects without preset categories and allows category deletion", async () => {

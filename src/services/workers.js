@@ -5,11 +5,24 @@ import { processEmailJob, reconcileEmailStatuses } from "./emailWorker.js";
 import { runScheduledTasks } from "./taskScheduler.js";
 import { drainEmailOutbox } from "./emailOutbox.js";
 import { validTimeZone } from "./taskSchedule.js";
+import { BillingEvent } from "../models/BillingEvent.js";
+import { PaymentOrder } from "../models/PaymentOrder.js";
+import { Subscription } from "../models/Subscription.js";
+import { SubscriptionPeriod } from "../models/SubscriptionPeriod.js";
+import { expireOpenPaymentOrders, synchronizeExpiredSubscriptions } from "./subscriptions.js";
 
 export async function startWorkers() {
   if (!validTimeZone(process.env.TASK_TIME_ZONE || "Europe/Moscow")) throw new Error("Invalid TASK_TIME_ZONE");
   // Unique indexes are required for idempotency before any worker starts.
-  await Promise.all([EmailJob.createIndexes(), Notification.createIndexes(), Task.createIndexes()]);
+  await Promise.all([
+    EmailJob.createIndexes(),
+    Notification.createIndexes(),
+    Task.createIndexes(),
+    BillingEvent.createIndexes(),
+    PaymentOrder.createIndexes(),
+    Subscription.createIndexes(),
+    SubscriptionPeriod.createIndexes()
+  ]);
   let stopped = false;
   const timers = new Set();
   const active = new Set();
@@ -39,6 +52,12 @@ export async function startWorkers() {
     }
   }, 5000);
   loop(runScheduledTasks, 60000);
+  loop(function subscriptionPeriods() {
+    return Promise.all([
+      synchronizeExpiredSubscriptions(),
+      expireOpenPaymentOrders()
+    ]);
+  }, 60000);
   return async () => {
     stopped = true;
     timers.forEach(clearTimeout);

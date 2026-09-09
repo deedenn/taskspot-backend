@@ -1,4 +1,10 @@
 export const BILLING_PROVIDERS = {
+  mock: {
+    key: "mock",
+    name: "Тестовая оплата",
+    ready: true,
+    testMode: true
+  },
   manual: {
     key: "manual",
     name: "Ручное включение",
@@ -22,8 +28,10 @@ export function providerFor(key) {
 
 export function billingIntegrationPayload() {
   return {
-    activeProvider: BILLING_PROVIDERS.manual,
+    activeProvider: BILLING_PROVIDERS.mock,
+    manualProvider: BILLING_PROVIDERS.manual,
     plannedProviders: [BILLING_PROVIDERS.digitalkassa_sbp, BILLING_PROVIDERS.tochka_sbp],
-    note: "Сейчас тариф включается вручную администратором. Модель заявки уже хранит provider/payment поля для будущего СБП."
+    testMode: true,
+    note: "Работает тестовая оплата: подтверждение пользователя обрабатывается как успешный платёж. Позже этот источник заменит webhook банка."
   };
 }
