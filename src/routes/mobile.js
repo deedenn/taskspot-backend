@@ -1,4 +1,5 @@
 import bcrypt from "bcryptjs";
+import crypto from "node:crypto";
 import express from "express";
 import mongoose from "mongoose";
 import { rateLimit } from "../middleware/rateLimit.js";
@@ -9,12 +10,14 @@ import { Notification } from "../models/Notification.js";
 import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { PushDevice } from "../models/PushDevice.js";
+import { PushJob } from "../models/PushJob.js";
 import { Task, TASK_PRIORITIES } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { strongPassword, requestPasswordReset, resetPassword } from "../services/accountSecurity.js";
-import { canViewTask, idOf, isProjectAdmin, projectMember, taskFilterForProjects, visibleNotificationFilter } from "../services/taskAccess.js";
+import { canViewTask, idOf, projectMember, taskFilterForProjects, visibleNotificationFilter } from "../services/taskAccess.js";
 import { limitExceeded, limitPayload, organizationUsage, planFor } from "../services/plans.js";
 import { createMobileSession, requireMobileAuth, revokeMobileSession, rotateMobileSession } from "../services/mobileSessions.js";
+import { assertMobileStatusTransition, mobileTaskCapabilities } from "../services/mobileTaskCapabilities.js";
 import {
   acceptPendingInvitations,
   findInvitationByToken,
@@ -30,6 +33,7 @@ export const mobileRouter = express.Router();
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: "mobile-auth" });
 const ACTIVE_STATUSES = ["open", "in_progress"];
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const RECEIPT_LEASE_MS = 60 * 1000;
 
 function httpError(statusCode, message, data = {}) {
   return Object.assign(new Error(message), { statusCode, data });
@@ -50,7 +54,12 @@ function taskDto(task) {
   const value = typeof task?.toObject === "function" ? task.toObject() : { ...task };
   value.version = taskVersion(value);
   delete value.__v;
+  delete value.mobileMutationKeys;
   return value;
+}
+
+function taskDtoFor(task, project, userId) {
+  return { ...taskDto(task), capabilities: mobileTaskCapabilities(task, project, userId) };
 }
 
 function encodeCursor(value) {
@@ -75,7 +84,7 @@ function expectedVersion(req) {
   return Number(source);
 }
 
-async function populatedTask(task) {
+async function populatedTask(task, userId) {
   await task.populate([
     { path: "project", select: "name categories members isArchived archivedAt" },
     { path: "creator", select: "name lastName email" },
@@ -86,44 +95,99 @@ async function populatedTask(task) {
     { path: "activities.actor", select: "name lastName email" }
   ]);
   await task.project?.populate?.("members.user", "name lastName email avatarUrl");
-  return taskDto(task);
+  return taskDtoFor(task, task.project, userId);
 }
 
 async function loadVisibleTask(taskId, userId) {
   if (!mongoose.isObjectIdOrHexString(taskId)) throw httpError(404, "Task not found");
-  const task = await Task.findById(taskId);
+  const task = await Task.findById(taskId).select("+mobileMutationKeys");
   if (!task) throw httpError(404, "Task not found");
   const project = await Project.findById(task.project);
   if (!project || !canViewTask(task, project, userId)) throw httpError(403, "Task access denied");
   return { task, project };
 }
 
+function requestHash(req) {
+  return crypto.createHash("sha256").update(`${req.method}\n${req.originalUrl}\n${JSON.stringify(req.body || {})}`).digest("hex");
+}
+
+function hasMutation(task, key) {
+  return Array.isArray(task.mobileMutationKeys) && task.mobileMutationKeys.includes(key);
+}
+
+function rememberMutation(task, key) {
+  task.mobileMutationKeys = [...new Set([...(task.mobileMutationKeys || []), key])].slice(-200);
+}
+
+async function ensureNotification({ dedupeKey, user, project, task, kind, message, data = {} }) {
+  if (!user) return null;
+  const notification = await Notification.findOneAndUpdate(
+    { dedupeKey },
+    { $setOnInsert: { dedupeKey, user, project, task, kind, message, data } },
+    { upsert: true, new: true, runValidators: true }
+  );
+  await PushJob.updateOne(
+    { notification: notification._id },
+    { $setOnInsert: {
+      notification: notification._id, user, project, task, kind, title: "Taskspot", body: message,
+      data: { ...data, ...(task ? { url: `taskspot://tasks/${idOf(task)}` } : {}) }
+    } },
+    { upsert: true }
+  );
+  return notification;
+}
+
+async function ensureStatusNotification({ task, project, next, userId, mutationKey }) {
+  let recipient;
+  let kind;
+  let message;
+  if (next === "review") { recipient = task.creator; kind = "task_review"; message = `Задача «${task.description}» ожидает проверки`; }
+  if (next === "closed" && task.assignee) { recipient = task.assignee; kind = "task_closed"; message = `Задача «${task.description}» закрыта`; }
+  if (next === "in_progress" && task.assignee) { recipient = task.assignee; kind = "task_returned"; message = `Задача «${task.description}» возвращена на доработку`; }
+  if (!recipient || idOf(recipient) === userId) return;
+  await ensureNotification({
+    dedupeKey: `mobile:${userId}:${mutationKey}:status:${kind}:${idOf(recipient)}`,
+    user: recipient, project: project._id, task: task._id, kind, message, data: { taskId: idOf(task) }
+  });
+}
+
 async function idempotent(req, work) {
   const key = String(req.get("Idempotency-Key") || "").trim();
   if (!key || key.length > 128) throw httpError(400, "Idempotency-Key is required");
-  const existing = await MobileMutationReceipt.findOne({ user: req.user._id, key }).lean();
-  if (existing?.state === "complete") return { status: existing.statusCode, body: existing.response };
-  if (existing) throw httpError(409, "Mutation is already processing");
-  try {
-    await MobileMutationReceipt.create({
-      user: req.user._id,
-      key,
-      state: "processing",
-      expiresAt: new Date(Date.now() + RECEIPT_TTL_MS)
-    });
-  } catch (error) {
-    if (error.code === 11000) throw httpError(409, "Mutation is already processing");
-    throw error;
+  const digest = requestHash(req);
+  const now = new Date();
+  const stale = new Date(now.getTime() - RECEIPT_LEASE_MS);
+  let receipt = await MobileMutationReceipt.findOne({ user: req.user._id, key });
+  if (receipt?.requestHash && receipt.requestHash !== digest) throw httpError(409, "Idempotency-Key уже использован для другого запроса", { code: "IDEMPOTENCY_KEY_REUSED" });
+  if (receipt?.state === "complete") return { status: receipt.statusCode, body: receipt.response };
+  if (receipt) {
+    const reclaimed = await MobileMutationReceipt.findOneAndUpdate(
+      { _id: receipt._id, state: "processing", lockedAt: { $lt: stale } },
+      { $set: { lockedAt: now, requestHash: digest, expiresAt: new Date(Date.now() + RECEIPT_TTL_MS) } },
+      { new: true }
+    );
+    if (!reclaimed) throw httpError(409, "Mutation is already processing", { code: "MUTATION_IN_PROGRESS" });
+    receipt = reclaimed;
+  } else {
+    try {
+      receipt = await MobileMutationReceipt.create({
+        user: req.user._id, key, requestHash: digest, lockedAt: now,
+        state: "processing", expiresAt: new Date(Date.now() + RECEIPT_TTL_MS)
+      });
+    } catch (error) {
+      if (error.code === 11000) throw httpError(409, "Mutation is already processing", { code: "MUTATION_IN_PROGRESS" });
+      throw error;
+    }
   }
   try {
-    const result = await work();
+    const result = await work(key);
     await MobileMutationReceipt.updateOne(
       { user: req.user._id, key },
       { state: "complete", statusCode: result.status, response: result.body }
     );
     return result;
   } catch (error) {
-    await MobileMutationReceipt.deleteOne({ user: req.user._id, key, state: "processing" });
+    await MobileMutationReceipt.deleteOne({ _id: receipt._id, state: "processing" });
     throw error;
   }
 }
@@ -284,19 +348,29 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
     .populate("observers", "name lastName email")
     .sort({ updatedAt: -1, _id: -1 }).limit(limit + 1).lean();
   const hasMore = tasks.length > limit;
-  const items = tasks.slice(0, limit).map(taskDto);
+  const projectById = new Map(selected.map((project) => [idOf(project), project]));
+  const items = tasks.slice(0, limit).map((task) => taskDtoFor(task, projectById.get(idOf(task.project)), req.user._id));
   const last = items.at(-1);
   res.set("Cache-Control", "no-store");
   res.json({ items, nextCursor: hasMore && last ? encodeCursor({ at: last.updatedAt, id: last._id }) : null, syncedAt: new Date().toISOString() });
 }));
 
 mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
-  const result = await idempotent(req, async () => {
+  const result = await idempotent(req, async (mutationKey) => {
     const { projectId, description, dueDate, priority = "medium", categories = [], assignee, observers = [], checklist = [] } = req.body;
     if (!mongoose.isObjectIdOrHexString(projectId)) throw httpError(400, "Некорректный проект");
     const project = await Project.findById(projectId);
     if (!project || !projectMember(project, req.user._id)) throw httpError(403, "Project access denied");
     if (project.isArchived || project.archivedAt) throw httpError(409, "Archived project does not accept new tasks");
+    const existingTask = await Task.findOne({ creator: req.user._id, mobileMutationKeys: mutationKey }).select("+mobileMutationKeys");
+    if (existingTask) {
+      if (existingTask.assignee && idOf(existingTask.assignee) !== idOf(req.user)) await ensureNotification({
+        dedupeKey: `mobile:${idOf(req.user)}:${mutationKey}:assigned`, user: existingTask.assignee,
+        project: project._id, task: existingTask._id, kind: "task_assigned",
+        message: `Вам назначена задача в проекте «${project.name}»`, data: { taskId: idOf(existingTask), projectId: idOf(project) }
+      });
+      return { status: 201, body: { task: await populatedTask(existingTask, req.user._id) } };
+    }
     if (!description?.trim()) throw httpError(400, "Description is required");
     if (!TASK_PRIORITIES.includes(priority)) throw httpError(400, "Unknown task priority");
     const memberIds = new Set(project.members.map((member) => idOf(member.user)));
@@ -324,14 +398,15 @@ mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
       priority, categories, assignee: assignee || undefined, observers,
       checklist: Array.isArray(checklist) ? checklist.filter((item) => item?.text?.trim()).map((item) => ({ text: item.text.trim(), done: Boolean(item.done) })) : [],
       status: "open",
+      mobileMutationKeys: [mutationKey],
       activities: [{ actor: req.user._id, action: "created", details: "Task created from mobile" }]
     });
     await task.save();
-    if (assignee && idOf(assignee) !== idOf(req.user)) await Notification.create({
-      user: assignee, project: project._id, task: task._id, kind: "task_assigned",
+    if (assignee && idOf(assignee) !== idOf(req.user)) await ensureNotification({
+      dedupeKey: `mobile:${idOf(req.user)}:${mutationKey}:assigned`, user: assignee, project: project._id, task: task._id, kind: "task_assigned",
       message: `Вам назначена задача в проекте «${project.name}»`, data: { taskId: idOf(task), projectId: idOf(project) }
     });
-    return { status: 201, body: { task: await populatedTask(task) } };
+    return { status: 201, body: { task: await populatedTask(task, req.user._id) } };
   });
   res.status(result.status).json(result.body);
 }));
@@ -339,75 +414,70 @@ mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
 mobileRouter.get("/tasks/:taskId", asyncRoute(async (req, res) => {
   const { task } = await loadVisibleTask(req.params.taskId, req.user._id);
   res.set("Cache-Control", "no-store");
-  res.json({ task: await populatedTask(task) });
+  res.json({ task: await populatedTask(task, req.user._id) });
 }));
 
 mobileRouter.patch("/tasks/:taskId/status", asyncRoute(async (req, res) => {
-  const result = await idempotent(req, async () => {
+  const result = await idempotent(req, async (mutationKey) => {
     const { task, project } = await loadVisibleTask(req.params.taskId, req.user._id);
-    if (taskVersion(task) !== expectedVersion(req)) throw httpError(409, "Задача уже изменена", { currentVersion: taskVersion(task) });
     const next = req.body.status === "done" ? "review" : req.body.status;
     const userId = idOf(req.user);
-    const creator = idOf(task.creator) === userId;
-    const assignee = idOf(task.assignee) === userId;
-    const admin = isProjectAdmin(project, userId);
-    if (project.isArchived || project.archivedAt) throw httpError(409, "Архивный проект доступен только для просмотра");
-    if (task.status === "closed") throw httpError(400, "Closed task status cannot be changed");
-    if (next === "review" && !assignee) throw httpError(403, "Only assignee can send task to review");
-    if (next === "closed" && (!creator || !["review", "done"].includes(task.status))) throw httpError(403, "Only creator can close a task on review");
-    if (["review", "done"].includes(task.status) && next === "in_progress" && (!creator || !req.body.comment?.trim())) {
-      throw httpError(400, "Для возврата задачи нужен комментарий инициатора");
+    if (hasMutation(task, mutationKey)) {
+      await ensureStatusNotification({ task, project, next, userId, mutationKey });
+      return { status: 200, body: { task: await populatedTask(task, req.user._id) } };
     }
-    if (!["review", "closed", "in_progress"].includes(next) || (!admin && !creator && !assignee)) throw httpError(403, "Status transition is not allowed");
+    if (taskVersion(task) !== expectedVersion(req)) throw httpError(409, "Задача уже изменена", { currentVersion: taskVersion(task), code: "VERSION_CONFLICT" });
+    const transition = assertMobileStatusTransition(task, project, req.user._id, next, req.body.comment);
+    if (!transition.allowed) throw httpError(transition.message.includes("комментарий") ? 400 : 403, transition.message);
     const previous = task.status;
     task.status = next;
     task.activities.push({ actor: req.user._id, action: "status_changed", from: previous, to: next, details: req.body.comment?.trim() || "" });
     if (next === "in_progress" && req.body.comment?.trim()) task.comments.push({ author: req.user._id, text: req.body.comment.trim() });
+    rememberMutation(task, mutationKey);
     await task.save();
-    let recipient;
-    let kind;
-    let message;
-    if (next === "review") { recipient = task.creator; kind = "task_review"; message = `Задача «${task.description}» ожидает проверки`; }
-    if (next === "closed" && task.assignee) { recipient = task.assignee; kind = "task_closed"; message = `Задача «${task.description}» закрыта`; }
-    if (next === "in_progress" && task.assignee) { recipient = task.assignee; kind = "task_returned"; message = `Задача «${task.description}» возвращена на доработку`; }
-    if (recipient && idOf(recipient) !== userId) await Notification.create({ user: recipient, project: project._id, task: task._id, kind, message, data: { taskId: idOf(task) } });
-    return { status: 200, body: { task: await populatedTask(task) } };
+    await ensureStatusNotification({ task, project, next, userId, mutationKey });
+    return { status: 200, body: { task: await populatedTask(task, req.user._id) } };
   });
   res.status(result.status).json(result.body);
 }));
 
 mobileRouter.patch("/tasks/:taskId/checklist/:itemId", asyncRoute(async (req, res) => {
-  const result = await idempotent(req, async () => {
+  const result = await idempotent(req, async (mutationKey) => {
     const { task, project } = await loadVisibleTask(req.params.taskId, req.user._id);
-    if (taskVersion(task) !== expectedVersion(req)) throw httpError(409, "Задача уже изменена", { currentVersion: taskVersion(task) });
-    const canEdit = isProjectAdmin(project, req.user._id) || idOf(task.creator) === idOf(req.user) || idOf(task.assignee) === idOf(req.user);
-    if (!canEdit) throw httpError(403, "Checklist update is not allowed");
+    if (hasMutation(task, mutationKey)) return { status: 200, body: { task: await populatedTask(task, req.user._id) } };
+    if (taskVersion(task) !== expectedVersion(req)) throw httpError(409, "Задача уже изменена", { currentVersion: taskVersion(task), code: "VERSION_CONFLICT" });
+    if (!mobileTaskCapabilities(task, project, req.user._id).canEditChecklist) throw httpError(403, "Checklist update is not allowed");
     const item = task.checklist.id(req.params.itemId);
     if (!item) throw httpError(404, "Checklist item not found");
     item.done = Boolean(req.body.done);
     task.activities.push({ actor: req.user._id, action: "checklist_changed", details: item.text });
+    rememberMutation(task, mutationKey);
     await task.save();
-    return { status: 200, body: { task: await populatedTask(task) } };
+    return { status: 200, body: { task: await populatedTask(task, req.user._id) } };
   });
   res.status(result.status).json(result.body);
 }));
 
 mobileRouter.post("/tasks/:taskId/comments", asyncRoute(async (req, res) => {
-  const result = await idempotent(req, async () => {
+  const result = await idempotent(req, async (mutationKey) => {
     const { task, project } = await loadVisibleTask(req.params.taskId, req.user._id);
     const text = String(req.body.text || "").trim();
     if (!text) throw httpError(400, "Comment text is required");
-    if (project.isArchived || project.archivedAt) throw httpError(409, "Архивный проект доступен только для просмотра");
-    task.comments.push({ author: req.user._id, text });
-    task.activities.push({ actor: req.user._id, action: "comment_added", details: text });
-    await task.save();
+    if (!mobileTaskCapabilities(task, project, req.user._id).canComment) throw httpError(409, "Архивный проект доступен только для просмотра");
+    const alreadyApplied = hasMutation(task, mutationKey);
+    if (!alreadyApplied) {
+      task.comments.push({ author: req.user._id, text });
+      task.activities.push({ actor: req.user._id, action: "comment_added", details: text });
+      rememberMutation(task, mutationKey);
+      await task.save();
+    }
     const recipients = [...new Set([task.creator, task.assignee, ...task.observers].map(idOf).filter(Boolean))]
       .filter((userId) => userId !== idOf(req.user));
-    await Promise.all(recipients.map((user) => Notification.create({
-      user, project: project._id, task: task._id, kind: "task_comment",
+    await Promise.all(recipients.map((user) => ensureNotification({
+      dedupeKey: `mobile:${idOf(req.user)}:${mutationKey}:comment:${user}`, user, project: project._id, task: task._id, kind: "task_comment",
       message: `Новый комментарий в задаче «${task.description}»`, data: { taskId: idOf(task) }
     })));
-    return { status: 201, body: { task: await populatedTask(task) } };
+    return { status: 201, body: { task: await populatedTask(task, req.user._id) } };
   });
   res.status(result.status).json(result.body);
 }));

@@ -112,6 +112,7 @@ const attachmentSchema = new mongoose.Schema(
 
 const taskSchema = new mongoose.Schema(
   {
+    mobileMutationKeys: { type: [String], default: undefined, select: false },
     project: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Project",
@@ -202,6 +203,7 @@ taskSchema.index({ assigneeEmail: 1 });
 taskSchema.index({ "recurrence.enabled": 1, status: 1 });
 taskSchema.index({ "recurrence.enabled": 1, "recurrence.nextRunAt": 1 });
 taskSchema.index({ recurrenceKey: 1 }, { unique: true, sparse: true });
+taskSchema.index({ creator: 1, mobileMutationKeys: 1 }, { sparse: true });
 taskSchema.set("optimisticConcurrency", true);
 
 export const Task = mongoose.model("Task", taskSchema);

@@ -5,6 +5,8 @@ const mobileMutationReceiptSchema = new mongoose.Schema(
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     key: { type: String, required: true },
     state: { type: String, enum: ["processing", "complete"], default: "processing" },
+    requestHash: { type: String, required: true },
+    lockedAt: { type: Date, default: Date.now },
     statusCode: Number,
     response: mongoose.Schema.Types.Mixed,
     expiresAt: { type: Date, required: true }
