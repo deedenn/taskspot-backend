@@ -1299,6 +1299,15 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(control.response.status, 200, control.data.message);
       assert.ok(Number.isInteger(control.data.summary.active));
       assert.ok(Array.isArray(control.data.byAssignee));
+
+      const efficiency = await request("/api/reports/efficiency?period=week", { token: creator.token });
+      assert.equal(efficiency.response.status, 200, efficiency.data.message);
+      assert.equal(efficiency.data.period.days, 7);
+      assert.ok(Array.isArray(efficiency.data.personal.factors));
+      assert.equal(efficiency.data.team.projects, 1);
+
+      const invalidEfficiencyPeriod = await request("/api/reports/efficiency?period=year", { token: creator.token });
+      assert.equal(invalidEfficiencyPeriod.response.status, 400);
     });
 
     test("enforces task status permissions for creator, assignee and observers", async () => {

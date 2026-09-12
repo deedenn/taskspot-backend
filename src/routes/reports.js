@@ -6,6 +6,7 @@ import { requireRegularUser } from "../middleware/auth.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { taskFilterForProjects } from "../services/taskAccess.js";
+import { buildEfficiency, efficiencyPeriod } from "../services/efficiency.js";
 
 export const reportsRouter = express.Router();
 
@@ -26,6 +27,41 @@ function isOverdue(task, today) {
 function fullName(user) {
   return [user?.name, user?.lastName].filter(Boolean).join(" ").trim() || user?.email || "";
 }
+
+reportsRouter.get("/efficiency", asyncRoute(async (req, res) => {
+  const period = efficiencyPeriod(req.query.period || "week");
+  const projects = await Project.find({ "members.user": req.user._id })
+    .select("_id name createdBy isArchived archivedAt")
+    .lean();
+  const projectIds = projects.map((project) => project._id);
+  const tasks = projectIds.length
+    ? await Task.find({
+        project: { $in: projectIds },
+        createdAt: { $lt: period.end },
+        $or: [
+          { dueDate: { $gte: period.previousStart, $lt: period.end } },
+          { "activities.createdAt": { $gte: period.previousStart, $lt: period.end } },
+          { status: { $in: ["open", "in_progress", "review", "done"] } }
+        ]
+      })
+        .select("_id project assignee assigneeEmail dueDate status checklist activities createdAt")
+        .limit(20001)
+        .lean()
+    : [];
+
+  if (tasks.length > 20000) {
+    return res.status(413).json({ message: "Слишком много задач для расчёта эффективности. Выберите более короткий период." });
+  }
+
+  const ownedProjects = projects.filter((project) => idOf(project.createdBy) === idOf(req.user._id));
+  res.set("Cache-Control", "no-store").json(buildEfficiency({
+    tasks,
+    ownedProjects,
+    userId: req.user._id,
+    periodKey: period.key,
+    now: period.end
+  }));
+}));
 
 reportsRouter.get("/control", asyncRoute(async (req, res) => {
   const projects = await Project.find({ "members.user": req.user._id }).populate("members.user", "name lastName email");

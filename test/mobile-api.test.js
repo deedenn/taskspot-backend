@@ -20,6 +20,7 @@ if (!process.env.TEST_MONGODB_URI) {
   delete process.env.SMTP_FROM;
 
   const { createApp } = await import("../src/app.js");
+  const { MobileMutationReceipt } = await import("../src/models/MobileMutationReceipt.js");
   let server;
   let baseUrl;
 
@@ -66,22 +67,36 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.equal(createdProject.response.status, 201, createdProject.data.message);
     const projectId = createdProject.data.project._id;
     const mutationHeaders = { "Idempotency-Key": `create-${suffix}` };
+    const createBody = { projectId, description: "Создано с телефона", assignee: verified.data.user._id };
     const created = await request("/api/mobile/v1/tasks", {
       method: "POST", token: verified.data.accessToken, headers: mutationHeaders,
-      body: { projectId, description: "Создано с телефона", assignee: verified.data.user._id }
+      body: createBody
     });
     assert.equal(created.response.status, 201, created.data.message);
     assert.equal(created.data.task.version, 0);
     const duplicate = await request("/api/mobile/v1/tasks", {
       method: "POST", token: verified.data.accessToken, headers: mutationHeaders,
-      body: { projectId, description: "Не должно дублироваться", assignee: verified.data.user._id }
+      body: createBody
     });
     assert.equal(duplicate.response.status, 201);
     assert.equal(duplicate.data.task._id, created.data.task._id);
+    await MobileMutationReceipt.deleteOne({ user: verified.data.user._id, key: mutationHeaders["Idempotency-Key"] });
+    const replayAfterReceiptLoss = await request("/api/mobile/v1/tasks", {
+      method: "POST", token: verified.data.accessToken, headers: mutationHeaders, body: createBody
+    });
+    assert.equal(replayAfterReceiptLoss.response.status, 201);
+    assert.equal(replayAfterReceiptLoss.data.task._id, created.data.task._id);
+    const reusedForDifferentRequest = await request("/api/mobile/v1/tasks", {
+      method: "POST", token: verified.data.accessToken, headers: mutationHeaders,
+      body: { ...createBody, description: "Не должно выполняться" }
+    });
+    assert.equal(reusedForDifferentRequest.response.status, 409);
+    assert.equal(reusedForDifferentRequest.data.code, "IDEMPOTENCY_KEY_REUSED");
 
     const feed = await request("/api/mobile/v1/feed?scope=assigned&focus=active&limit=1", { token: verified.data.accessToken });
     assert.equal(feed.response.status, 200, feed.data.message);
     assert.equal(feed.data.items.length, 1);
+    assert.deepEqual(feed.data.items[0].capabilities.statusTransitions, [{ status: "in_progress" }, { status: "review" }]);
 
     const started = await request(`/api/mobile/v1/tasks/${created.data.task._id}/status`, {
       method: "PATCH", token: verified.data.accessToken,
