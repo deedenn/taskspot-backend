@@ -10,6 +10,11 @@ import { PaymentOrder } from "../models/PaymentOrder.js";
 import { Subscription } from "../models/Subscription.js";
 import { SubscriptionPeriod } from "../models/SubscriptionPeriod.js";
 import { expireOpenPaymentOrders, synchronizeExpiredSubscriptions } from "./subscriptions.js";
+import { DeviceSession } from "../models/DeviceSession.js";
+import { MobileMutationReceipt } from "../models/MobileMutationReceipt.js";
+import { PushDevice } from "../models/PushDevice.js";
+import { PushJob } from "../models/PushJob.js";
+import { processPushJob, processPushReceipts } from "./pushWorker.js";
 
 export async function startWorkers() {
   if (!validTimeZone(process.env.TASK_TIME_ZONE || "Europe/Moscow")) throw new Error("Invalid TASK_TIME_ZONE");
@@ -21,7 +26,11 @@ export async function startWorkers() {
     BillingEvent.createIndexes(),
     PaymentOrder.createIndexes(),
     Subscription.createIndexes(),
-    SubscriptionPeriod.createIndexes()
+    SubscriptionPeriod.createIndexes(),
+    DeviceSession.createIndexes(),
+    MobileMutationReceipt.createIndexes(),
+    PushDevice.createIndexes(),
+    PushJob.createIndexes()
   ]);
   let stopped = false;
   const timers = new Set();
@@ -52,6 +61,12 @@ export async function startWorkers() {
     }
   }, 5000);
   loop(runScheduledTasks, 60000);
+  loop(async function pushQueue() {
+    for (let count = 0; count < 20 && !stopped; count += 1) {
+      if (!await processPushJob()) break;
+    }
+    await processPushReceipts();
+  }, 5000);
   loop(function subscriptionPeriods() {
     return Promise.all([
       synchronizeExpiredSubscriptions(),

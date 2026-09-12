@@ -202,5 +202,6 @@ taskSchema.index({ assigneeEmail: 1 });
 taskSchema.index({ "recurrence.enabled": 1, status: 1 });
 taskSchema.index({ "recurrence.enabled": 1, "recurrence.nextRunAt": 1 });
 taskSchema.index({ recurrenceKey: 1 }, { unique: true, sparse: true });
+taskSchema.set("optimisticConcurrency", true);
 
 export const Task = mongoose.model("Task", taskSchema);

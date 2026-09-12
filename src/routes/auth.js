@@ -35,7 +35,7 @@ function createEmailVerificationToken() {
   return crypto.randomBytes(32).toString("hex");
 }
 
-function hashEmailVerificationToken(token) {
+export function hashEmailVerificationToken(token) {
   return crypto.createHash("sha256").update(String(token)).digest("hex");
 }
 
@@ -43,11 +43,11 @@ function emailVerificationUrl(token) {
   return `${frontendUrl().replace(/\/$/, "")}/verify-email?token=${token}`;
 }
 
-function shouldVerifyEmail(user) {
+export function shouldVerifyEmail(user) {
   return !user?.emailVerifiedAt && ["pending", "sent", "failed", "skipped"].includes(user?.emailVerificationStatus);
 }
 
-function publicRegistrationResponse({ user, emailResult, verificationToken }) {
+export function publicRegistrationResponse({ user, emailResult, verificationToken }) {
   return {
     requiresEmailVerification: true,
     email: user.email,
@@ -57,7 +57,7 @@ function publicRegistrationResponse({ user, emailResult, verificationToken }) {
   };
 }
 
-async function setEmailVerificationToken(user) {
+export async function setEmailVerificationToken(user) {
   const token = createEmailVerificationToken();
   user.emailVerificationTokenHash = hashEmailVerificationToken(token);
   user.emailVerificationExpiresAt = new Date(Date.now() + EMAIL_VERIFICATION_TTL_MS);
@@ -66,7 +66,7 @@ async function setEmailVerificationToken(user) {
   return token;
 }
 
-async function sendVerificationAndSave(user, token) {
+export async function sendVerificationAndSave(user, token) {
   return sendEmailVerificationEmail({
     email: user.email,
     name: user.name,
@@ -77,7 +77,7 @@ async function sendVerificationAndSave(user, token) {
   });
 }
 
-async function acceptPendingInvitations(user, session) {
+export async function acceptPendingInvitations(user, session) {
   if (!user?.emailVerifiedAt || user.isSuperAdmin || user.status !== "active") return;
 
   const now = new Date();
@@ -150,7 +150,7 @@ function publicInvitation(project, invitation) {
 
 const isStrongPassword = strongPassword;
 
-async function findInvitationByToken(token) {
+export async function findInvitationByToken(token) {
   if (!token) return null;
 
   const project = await Project.findOne({

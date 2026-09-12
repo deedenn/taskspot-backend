@@ -3,6 +3,7 @@ import { Task } from "../models/Task.js";
 import { Project } from "../models/Project.js";
 import { Organization } from "../models/Organization.js";
 import { Notification } from "../models/Notification.js";
+import { PushJob } from "../models/PushJob.js";
 import { User } from "../models/User.js";
 import { WorkerLease } from "../models/WorkerLease.js";
 import { calendarParts, dateKey, nextOccurrence } from "./taskSchedule.js";
@@ -26,6 +27,11 @@ async function notifyTaskOnce({ task, project, userId, event, message, dueDate }
     if (error.code !== 11000) throw error;
     notification = await Notification.findOne({ dedupeKey });
   }
+  await PushJob.updateOne({ notification: notification._id }, { $setOnInsert: {
+    notification: notification._id, user: userId, project: project._id, task: task._id,
+    kind: dueDate ? "task_due" : "task_updated", title: "Taskspot", body: message,
+    data: { taskId: idOf(task), projectId: idOf(project), url: `taskspot://tasks/${task._id}` }
+  } }, { upsert: true });
   const baseUrl = process.env.CLIENT_URL || "https://taskspot.ru";
   await sendTaskNotificationEmail({ email: user.email, projectName: project.name, taskDescription: task.description,
     message, taskUrl: `${baseUrl.replace(/\/$/, "")}/app/tasks/${task._id}`,

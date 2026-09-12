@@ -13,6 +13,7 @@ import { projectsRouter } from "./routes/projects.js";
 import { reportsRouter } from "./routes/reports.js";
 import { tasksRouter } from "./routes/tasks.js";
 import { uploadsRouter } from "./routes/uploads.js";
+import { mobileRouter } from "./routes/mobile.js";
 
 export function createApp() {
   const app = express();
@@ -69,6 +70,7 @@ export function createApp() {
   app.use("/api/notifications", notificationsRouter);
   app.use("/api/reports", reportsRouter);
   app.use("/api/admin", adminRouter);
+  app.use("/api/mobile/v1", mobileRouter);
 
   app.use((error, req, res, next) => {
     if (error?.type === "entity.too.large") {
