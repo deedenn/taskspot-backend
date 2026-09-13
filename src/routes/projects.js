@@ -537,7 +537,7 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, asyncRoute
       return res.status(400).json({ message: "Unknown member role" });
     }
 
-    const user = await User.findOne({ email: normalizedEmail });
+    const user = await User.findOne({ email: normalizedEmail }).session(session);
     const organization = req.project.organization ? await Organization.findById(req.project.organization).session(session) : null;
     let addedExistingUser = null;
     let memberEmail = null;
@@ -545,7 +545,7 @@ projectsRouter.post("/:projectId/members", loadProject, requireAdmin, asyncRoute
     let assignedPendingTasks = 0;
 
     if (organization) {
-      const usage = await organizationUsage(organization);
+      const usage = await organizationUsage(organization, { session });
       const plan = planFor(organization);
       const existingInProject = user ? memberEntry(req.project, user._id) : null;
       const existingInvitation = req.project.invitations.find(

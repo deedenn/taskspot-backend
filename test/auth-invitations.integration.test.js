@@ -12,9 +12,17 @@ import { Task } from "../src/models/Task.js";
 import { User } from "../src/models/User.js";
 
 const hash = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const hasReplicaSet = (() => {
+  if (!process.env.TEST_MONGODB_URI) return false;
+  try {
+    return Boolean(new URL(process.env.TEST_MONGODB_URI).searchParams.get("replicaSet"));
+  } catch {
+    return false;
+  }
+})();
 
 test("isolated replica set: atomic email verification and login invitation repair", {
-  skip: !process.env.TEST_MONGODB_URI ? "Set TEST_MONGODB_URI to a local replica set" : false,
+  skip: !hasReplicaSet ? "Set TEST_MONGODB_URI to a local replica set" : false,
   timeout: 60000
 }, async (t) => {
   const uri = new URL(process.env.TEST_MONGODB_URI);

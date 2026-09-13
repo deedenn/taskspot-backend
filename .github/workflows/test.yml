@@ -6,12 +6,13 @@ jobs:
     services:
       mongo:
         image: mongo:7
+        command: --replSet rs0 --bind_ip_all
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'"
           --health-interval 10s --health-timeout 5s --health-retries 10
     env:
-      TEST_MONGODB_URI: mongodb://127.0.0.1:27017/taskspot_test
+      TEST_MONGODB_URI: mongodb://127.0.0.1:27017/taskspot_test?replicaSet=rs0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v5
@@ -20,4 +21,17 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
+      - name: Initialize MongoDB replica set
+        env:
+          MONGO_CONTAINER: ${{ job.services.mongo.id }}
+        run: |
+          docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]})'
+          for attempt in {1..30}; do
+            if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$MONGO_CONTAINER"
+          exit 1
       - run: npm run test:integration

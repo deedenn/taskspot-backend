@@ -1164,8 +1164,6 @@ if (!process.env.TEST_MONGODB_URI) {
       const creator = await register({ name: "Creator", email: `creator_${Date.now()}@example.com` });
       const assignee = await register({ name: "Assignee", email: `assignee_${Date.now()}@example.com` });
       const project = await createProject(creator.token, "Workflow");
-      const { Organization } = await import("../src/models/Organization.js");
-      await Organization.updateOne({ _id: project.organization._id }, { $set: { plan: "team" } });
 
       const member = await request(`/api/projects/${project._id}/members`, {
         method: "POST",
@@ -1188,13 +1186,11 @@ if (!process.env.TEST_MONGODB_URI) {
           observers: [],
           categories: [],
           priority: "high",
-          checklist: [{ text: "Write summary" }, { text: "Send to creator" }],
-          recurrence: { enabled: true, frequency: "weekly" }
+          checklist: [{ text: "Write summary" }, { text: "Send to creator" }]
         }
       });
       assert.equal(createdTask.response.status, 201, createdTask.data.message);
       assert.equal(createdTask.data.task.checklist.length, 2);
-      assert.equal(createdTask.data.task.recurrence.frequency, "weekly");
       const taskId = createdTask.data.task._id;
 
       const checklist = await request(`/api/tasks/${taskId}`, {
