@@ -15,6 +15,7 @@ import { parseTaskListQuery } from "../services/taskListQuery.js";
 import { taskFilterForProjects } from "../services/taskAccess.js";
 import { asyncRoute } from "../middleware/asyncRoute.js";
 import { normalizeRecurrence } from "../services/taskSchedule.js";
+import { parseTaskDeadline } from "../services/taskDeadline.js";
 
 export const tasksRouter = express.Router();
 
@@ -77,13 +78,16 @@ function resolveAssignee(project, value) {
 }
 
 function addActivity(task, actor, action, fields = {}) {
-  task.activities.push({
+  const activity = {
     actor,
     action,
     from: fields.from || "",
     to: fields.to || "",
     details: fields.details || ""
-  });
+  };
+  if (typeof fields.fromHasTime === "boolean") activity.fromHasTime = fields.fromHasTime;
+  if (typeof fields.toHasTime === "boolean") activity.toHasTime = fields.toHasTime;
+  task.activities.push(activity);
 }
 
 function normalizeStatus(status) {
@@ -221,21 +225,6 @@ function normalizeNewAttachment(attachment, userId, { projectId, taskId }) {
   return normalized;
 }
 
-function parseOptionalDueDate(dueDate) {
-  if (dueDate === undefined || dueDate === null || dueDate === "") {
-    return undefined;
-  }
-
-  const parsedDueDate = new Date(dueDate);
-  if (Number.isNaN(parsedDueDate.getTime())) {
-    const error = new Error("Due date is invalid");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  return parsedDueDate;
-}
-
 async function loadTask(req, res, next) {
   const task = await Task.findById(req.params.taskId);
 
@@ -259,7 +248,10 @@ async function loadTask(req, res, next) {
 
 async function respondWithTask(res, task) {
   await task.populate([
-    { path: "project", select: "name categories members isArchived archivedAt archivedBy" },
+    {
+      path: "project",
+      select: "name categories members invitations.email invitations.status invitations.expiresAt isArchived archivedAt archivedBy"
+    },
     { path: "creator", select: "name lastName email" },
     { path: "assignee", select: "name lastName email avatarUrl" },
     { path: "observers", select: "name lastName email" },
@@ -436,6 +428,7 @@ tasksRouter.post("/", async (req, res) => {
     projectId,
     description,
     dueDate,
+    dueDateHasTime = false,
     categories = [],
     assignee,
     observers = [],
@@ -468,9 +461,10 @@ tasksRouter.post("/", async (req, res) => {
   let normalizedAttachments;
   let normalizedRecurrence;
   let parsedDueDate;
+  let parsedDueDateHasTime;
 
   try {
-    parsedDueDate = parseOptionalDueDate(dueDate);
+    ({ dueDate: parsedDueDate, dueDateHasTime: parsedDueDateHasTime } = parseTaskDeadline(dueDate, dueDateHasTime));
     validCategories = normalizeCategories(project, categories);
     normalizedChecklist = normalizeChecklist(checklist);
     normalizedAttachments = normalizeAttachments(attachments, [], req.user._id);
@@ -532,6 +526,7 @@ tasksRouter.post("/", async (req, res) => {
     creator: req.user._id,
     description,
     dueDate: parsedDueDate,
+    dueDateHasTime: parsedDueDateHasTime,
     categories: validCategories,
     assignee: resolvedAssignee.assignee,
     assigneeEmail: resolvedAssignee.assigneeEmail,
@@ -563,6 +558,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   const {
     description,
     dueDate,
+    dueDateHasTime,
     categories,
     assignee,
     observers,
@@ -580,7 +576,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
   const canEditDetails = isAdmin || isCreator;
   const canUpdateChecklist = canEditDetails || isAssignee;
   const canUpdateAttachments = canUpdateTaskAttachments(req.task, req.project, userId);
-  const detailFields = ["description", "dueDate", "categories", "assignee", "observers", "priority", "recurrence"];
+  const detailFields = ["description", "dueDate", "dueDateHasTime", "categories", "assignee", "observers", "priority", "recurrence"];
   const hasDetailChanges = detailFields.some((field) => hasOwn(req.body, field));
 
   if (isArchivedProject(req.project)) {
@@ -683,23 +679,32 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
     }
   }
 
-  if (hasOwn(req.body, "dueDate")) {
+  if (hasOwn(req.body, "dueDate") || hasOwn(req.body, "dueDateHasTime")) {
     let parsedDueDate;
+    let parsedDueDateHasTime;
     try {
-      parsedDueDate = parseOptionalDueDate(dueDate);
+      ({ dueDate: parsedDueDate, dueDateHasTime: parsedDueDateHasTime } = parseTaskDeadline(
+        hasOwn(req.body, "dueDate") ? dueDate : req.task.dueDate,
+        hasOwn(req.body, "dueDateHasTime") ? dueDateHasTime : req.task.dueDateHasTime
+      ));
     } catch (error) {
       return res.status(error.statusCode || 400).json({ message: error.message });
     }
 
     const previousDueDate = req.task.dueDate?.toISOString();
+    const previousDueDateHasTime = Boolean(req.task.dueDateHasTime);
     const nextDueDate = parsedDueDate?.toISOString();
 
-    if (previousDueDate !== nextDueDate) {
+    if (previousDueDate !== nextDueDate || previousDueDateHasTime !== parsedDueDateHasTime) {
       addActivity(req.task, userId, "due_date_changed", {
         from: previousDueDate,
-        to: nextDueDate
+        to: nextDueDate,
+        fromHasTime: previousDueDateHasTime,
+        toHasTime: parsedDueDateHasTime,
+        details: nextDueDate ? (parsedDueDateHasTime ? "Срок со временем" : "Срок до конца дня") : "Срок снят"
       });
       req.task.dueDate = parsedDueDate;
+      req.task.dueDateHasTime = parsedDueDateHasTime;
     }
   }
 
@@ -825,7 +830,8 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
     }
   }
 
-  const rescheduleForDeadline = hasOwn(req.body, "dueDate") && req.task.isModified("dueDate") && req.task.recurrence?.enabled;
+  const rescheduleForDeadline = (hasOwn(req.body, "dueDate") || hasOwn(req.body, "dueDateHasTime")) &&
+    req.task.isModified("dueDate") && req.task.recurrence?.enabled;
   if (hasOwn(req.body, "recurrence") || rescheduleForDeadline) {
     let nextRecurrence;
     try {

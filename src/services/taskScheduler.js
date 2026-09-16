@@ -7,6 +7,7 @@ import { PushJob } from "../models/PushJob.js";
 import { User } from "../models/User.js";
 import { WorkerLease } from "../models/WorkerLease.js";
 import { calendarParts, dateKey, nextOccurrence } from "./taskSchedule.js";
+import { effectiveTaskDeadline } from "./taskDeadline.js";
 import { idOf, projectMember } from "./taskAccess.js";
 import { limitExceeded, notifyOrganizationLimit, organizationUsage, planFor } from "./plans.js";
 import { sendTaskNotificationEmail } from "./email.js";
@@ -105,7 +106,8 @@ export async function processRecurrence(source, now, {
     try {
       child = await Task.create({
         project: project._id, creator: source.creator, description: source.description, priority: source.priority,
-        dueDate: runAt, categories: source.categories.filter((category) => categoryIds.has(idOf(category))),
+        dueDate: runAt, dueDateHasTime: source.dueDateHasTime,
+        categories: source.categories.filter((category) => categoryIds.has(idOf(category))),
         assignee: projectMember(project, source.assignee) ? source.assignee : undefined,
         assigneeEmail: project.invitations.some((invitation) => invitation.status === "pending" &&
           invitation.email === source.assigneeEmail && invitation.expiresAt > now) ? source.assigneeEmail : undefined,
@@ -160,7 +162,6 @@ export async function processRecurrences(now = new Date(), options = {}) {
 
 export async function processReminders(now = new Date(), { assertLease = async () => {} } = {}) {
   const timeZone = process.env.TASK_TIME_ZONE || "Europe/Moscow";
-  const today = dateKey(now, timeZone);
   const tomorrow = dateKey(nextOccurrence(now, "daily", timeZone), timeZone);
   const tasks = Task.find({ status: { $in: ["open", "in_progress"] }, dueDate: { $ne: null, $lte: new Date(now.getTime() + 2 * 86400000) } }).cursor();
   try {
@@ -169,15 +170,17 @@ export async function processReminders(now = new Date(), { assertLease = async (
         await assertLease();
         const project = await Project.findById(task.project);
         if (!project || isArchived(project)) continue;
-        const deadline = dateKey(task.dueDate, timeZone);
+        const deadlineAt = effectiveTaskDeadline(task, timeZone);
+        if (!deadlineAt) continue;
+        const deadline = dateKey(deadlineAt, timeZone);
         if (deadline > tomorrow) continue;
-        const overdue = deadline < today;
+        const overdue = deadlineAt < now;
         const event = overdue ? "task_overdue" : "task_due_soon";
         const recipients = overdue ? [task.assignee, task.creator] : [task.assignee || task.creator];
         for (const userId of new Set(recipients.map(idOf).filter(Boolean))) {
           if (!projectMember(project, userId)) continue;
           await assertLease();
-          await notifyTaskOnce({ task, project, userId, event, dueDate: task.dueDate.toISOString(),
+          await notifyTaskOnce({ task, project, userId, event, dueDate: deadlineAt.toISOString(),
             message: overdue ? `Просрочена задача «${task.description}»` : `Подходит срок задачи «${task.description}»` });
         }
       } catch (error) {

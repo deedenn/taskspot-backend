@@ -7,6 +7,7 @@ import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
 import { taskFilterForProjects } from "../services/taskAccess.js";
 import { buildEfficiency, efficiencyPeriod } from "../services/efficiency.js";
+import { isTaskPastDeadline } from "../services/taskDeadline.js";
 
 export const reportsRouter = express.Router();
 
@@ -20,8 +21,8 @@ function isActive(task) {
   return !["review", "done", "closed"].includes(task.status);
 }
 
-function isOverdue(task, today) {
-  return Boolean(task.dueDate) && task.dueDate < today && isActive(task);
+function isOverdue(task, now) {
+  return isActive(task) && isTaskPastDeadline(task, now);
 }
 
 function fullName(user) {
@@ -44,7 +45,7 @@ reportsRouter.get("/efficiency", asyncRoute(async (req, res) => {
           { status: { $in: ["open", "in_progress", "review", "done"] } }
         ]
       })
-        .select("_id project assignee assigneeEmail dueDate status checklist activities createdAt")
+        .select("_id project assignee assigneeEmail dueDate dueDateHasTime status checklist activities createdAt")
         .limit(20001)
         .lean()
     : [];
@@ -74,10 +75,9 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
     .populate("observers", "name lastName email")
     .sort({ dueDate: 1 });
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const now = new Date();
 
-  const overdue = tasks.filter((task) => isOverdue(task, today));
+  const overdue = tasks.filter((task) => isOverdue(task, now));
   const waitingReview = tasks.filter((task) => ["review", "done"].includes(task.status));
   const unassigned = tasks.filter((task) => !task.assignee && !task.assigneeEmail && task.status !== "closed");
   const month = parsePeriod({});
@@ -103,7 +103,7 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
 
     if (task.status === "closed") current.closed += 1;
     else current.active += 1;
-    if (isOverdue(task, today)) current.overdue += 1;
+    if (isOverdue(task, now)) current.overdue += 1;
     if (["review", "done"].includes(task.status)) current.review += 1;
 
     assigneeMap.set(key, current);
@@ -125,7 +125,7 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
 
     if (task.status === "closed") workload.closed += 1;
     else workload.active += 1;
-    if (isOverdue(task, today)) workload.overdue += 1;
+    if (isOverdue(task, now)) workload.overdue += 1;
     if (["review", "done"].includes(task.status)) workload.review += 1;
 
     workloadByAssigneeProjectMap.set(workloadKey, workload);
@@ -184,7 +184,7 @@ reportsRouter.get("/period", asyncRoute(async (req, res) => {
     { createdAt: { $gte: period.previousStart, $lt: period.end } },
     { activities: { $elemMatch: { action: "status_changed", to: "closed", createdAt: { $gte: period.previousStart, $lt: period.end } } } },
     { status: { $ne: "closed" } }
-  ] }] }).select("project creator assignee assigneeEmail description createdAt dueDate status priority categories activities")
+  ] }] }).select("project creator assignee assigneeEmail description createdAt dueDate dueDateHasTime status priority categories activities")
     .populate("assignee", "name lastName email").limit(20001).lean();
   if (tasks.length > 20000) return res.status(413).json({ message: "Отчёт слишком большой. Выберите один проект или сократите период." });
   const report = buildPeriodReport(tasks, selected, period);

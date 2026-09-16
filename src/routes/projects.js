@@ -800,6 +800,47 @@ projectsRouter.post("/:projectId/categories", loadProject, requireAdmin, asyncRo
   res.status(201).json({ categories: req.project.categories });
 }));
 
+projectsRouter.patch("/:projectId/categories/:categoryId", loadProject, asyncRoute(async (req, res) => {
+  if (req.project.isArchived || req.project.archivedAt) {
+    return res.status(409).json({ message: "Проект находится в архиве" });
+  }
+
+  if (!isProjectCreator(req.project, req.user._id)) {
+    return res.status(403).json({ message: "Изменять категории может только создатель проекта" });
+  }
+
+  const category = req.project.categories.find((item) => String(item._id) === req.params.categoryId);
+  if (!category) {
+    return res.status(404).json({ message: "Категория не найдена" });
+  }
+
+  const body = req.body || {};
+  const hasName = Object.prototype.hasOwnProperty.call(body, "name");
+  const hasColor = Object.prototype.hasOwnProperty.call(body, "color");
+  if (!hasName && !hasColor) {
+    return res.status(400).json({ message: "Укажите название или цвет категории" });
+  }
+
+  const name = hasName ? String(body.name || "").trim() : category.name;
+  const color = hasColor ? String(body.color || "").trim().toLowerCase() : category.color || "#1677ff";
+  if (!name) {
+    return res.status(400).json({ message: "Название категории обязательно" });
+  }
+  if (name.length > 80) {
+    return res.status(400).json({ message: "Название категории не должно превышать 80 символов" });
+  }
+  if (!/^#[0-9a-f]{6}$/i.test(color)) {
+    return res.status(400).json({ message: "Цвет категории должен быть в формате #RRGGBB" });
+  }
+
+  req.project.createdBy = req.project.createdBy || req.user._id;
+  category.name = name;
+  category.color = color;
+  await req.project.save();
+  await populateProject(req.project);
+  res.json({ project: req.project, category });
+}));
+
 projectsRouter.delete("/:projectId/categories/:categoryId", loadProject, requireAdmin, asyncRoute(async (req, res) => {
   let project;
   await mongoose.connection.transaction(async (session) => {

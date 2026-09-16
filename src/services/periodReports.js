@@ -1,4 +1,5 @@
 import { dateKey } from "./taskSchedule.js";
+import { isTaskPastDeadline } from "./taskDeadline.js";
 const DAY = 86400000;
 export function parsePeriod(query, now = new Date()) {
   const today = dateKey(now, "Europe/Moscow");
@@ -42,7 +43,7 @@ export function buildPeriodReport(tasks, projects, period, now = new Date()) {
     const previousCreated = Number(within(task.createdAt, period.previousStart, period.start));
     const previousClosed = Number(within(closure, period.previousStart, period.start));
     const active = Number(!project?.isArchived && !project?.archivedAt && !["closed", "review", "done"].includes(task.status));
-    const overdue = Number(Boolean(active && task.dueDate && dateKey(new Date(task.dueDate), "Europe/Moscow") < dateKey(now, "Europe/Moscow")));
+    const overdue = Number(Boolean(active && isTaskPastDeadline(task, now)));
     const review = Number(!project?.isArchived && !project?.archivedAt && ["review", "done"].includes(task.status));
     const cycleDays = closed && task.createdAt ? Math.max(0, (closure - new Date(task.createdAt)) / DAY) : 0;
     const measures = { created, closed, previousCreated, previousClosed, active, overdue, review, cycleDays };

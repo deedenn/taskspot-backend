@@ -124,6 +124,37 @@ test("an expired commitment is not erased by moving its due date later", () => {
   assert.equal(result.personal.score, 0);
 });
 
+test("historical efficiency keeps the exact-time flag of an earlier deadline", () => {
+  const result = buildEfficiency({
+    userId,
+    periodKey: "week",
+    now: new Date("2026-09-12T12:00:00.000Z"),
+    tasks: [{
+      _id: "historical-timed-deadline",
+      project: "project-2",
+      assignee: userId,
+      createdAt: "2026-09-01T00:00:00.000Z",
+      dueDate: "2026-09-20T00:00:00.000Z",
+      dueDateHasTime: false,
+      checklist: [],
+      activities: [
+        status(userId, "in_progress", "review", "2026-09-10T10:30:00.000Z"),
+        {
+          action: "due_date_changed",
+          from: "2026-09-10T10:00:00.000Z",
+          to: "2026-09-20T00:00:00.000Z",
+          fromHasTime: true,
+          toHasTime: false,
+          createdAt: "2026-09-13T10:00:00.000Z"
+        }
+      ]
+    }]
+  });
+
+  assert.equal(result.personal.stats.commitments, 1);
+  assert.equal(result.personal.stats.onTime, 0);
+});
+
 test("efficiency rejects unsupported periods and keeps no-data scores empty", () => {
   assert.throws(() => efficiencyPeriod("quarter"), (error) => error.statusCode === 400);
   const result = buildEfficiency({ tasks: [], userId, periodKey: "month" });

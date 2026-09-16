@@ -9,7 +9,7 @@ import { User } from "../src/models/User.js";
 import { ensureDefaultOrganization } from "../src/services/plans.js";
 import { sessionToken } from "../src/services/accountSecurity.js";
 
-test("document improvements: global search ACL, assignee control and atomic category deletion", {
+test("document improvements: global search ACL, assignee control and category management", {
   skip: !process.env.TEST_MONGODB_URI, timeout: 60000
 }, async (t) => {
   process.env.NODE_ENV = "test"; process.env.JWT_SECRET = "document-improvements-test-secret";
@@ -17,13 +17,13 @@ test("document improvements: global search ACL, assignee control and atomic cate
   uri.pathname = "/ts_document_" + crypto.randomBytes(6).toString("hex");
   await mongoose.connect(uri.toString());
   t.after(async () => { await mongoose.connection.dropDatabase(); await mongoose.disconnect(); });
-  const [owner, member, outsider] = await User.create(["Owner", "Member", "Outsider"].map((name) => ({
+  const [owner, member, outsider, projectAdmin] = await User.create(["Owner", "Member", "Outsider", "ProjectAdmin"].map((name) => ({
     name, lastName: "Test", email: name.toLowerCase() + "@example.test", passwordHash: "unused",
     avatarUrl: "https://example.test/avatar.png", emailVerifiedAt: new Date()
   })));
   const org = await ensureDefaultOrganization(owner);
   const project = await Project.create({ name: "Альфа", organization: org._id, createdBy: owner._id,
-    members: [{ user: owner._id, role: "admin" }, { user: member._id, role: "member" }],
+    members: [{ user: owner._id, role: "admin" }, { user: member._id, role: "member" }, { user: projectAdmin._id, role: "admin" }],
     categories: [{ name: "Документы", color: "#123456" }, { name: "Работа", color: "#654321" }]
   });
   const hiddenProject = await Project.create({ name: "Secret", createdBy: outsider._id, members: [{ user: outsider._id, role: "admin" }] });
@@ -71,6 +71,16 @@ test("document improvements: global search ACL, assignee control and atomic cate
   assert.equal(filtered.data.groups.length, 1);
   assert.equal(filtered.data.people.length, ownerGroups.data.people.length);
   assert.equal(filtered.data.groups[0].user.avatarUrl, member.avatarUrl);
+  const editableCategoryPath = "/projects/" + project._id + "/categories/" + project.categories[1]._id;
+  assert.equal((await request(editableCategoryPath, projectAdmin, "PATCH", { name: "Новый раздел", color: "#abcdef" })).status, 403);
+  assert.equal((await request(editableCategoryPath, owner, "PATCH", { color: "red" })).status, 400);
+  const editedCategory = await request(editableCategoryPath, owner, "PATCH", { name: "Новый раздел", color: "#ABCDEF" });
+  assert.equal(editedCategory.status, 200, JSON.stringify(editedCategory.data));
+  assert.equal(editedCategory.data.category.name, "Новый раздел");
+  assert.equal(editedCategory.data.category.color, "#abcdef");
+  const savedCategory = (await Project.findById(project._id)).categories.id(project.categories[1]._id);
+  assert.equal(savedCategory.name, "Новый раздел");
+  assert.equal(savedCategory.color, "#abcdef");
   const categoryPath = "/projects/" + project._id + "/categories/" + project.categories[0]._id;
   assert.equal((await request(categoryPath, member, "DELETE")).status, 403);
   const before = await Task.findById(assigned._id).lean();

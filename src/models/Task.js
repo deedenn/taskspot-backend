@@ -53,6 +53,12 @@ const activitySchema = new mongoose.Schema(
       type: String,
       default: ""
     },
+    fromHasTime: {
+      type: Boolean
+    },
+    toHasTime: {
+      type: Boolean
+    },
     details: {
       type: String,
       default: ""
@@ -130,6 +136,10 @@ const taskSchema = new mongoose.Schema(
     },
     dueDate: {
       type: Date
+    },
+    dueDateHasTime: {
+      type: Boolean,
+      default: false
     },
     categories: [
       {

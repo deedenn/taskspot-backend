@@ -24,6 +24,10 @@ test("journal covers invitations, members and categories without secrets", () =>
   assert.equal(projectChanges(old, { ...old, invitations: [] })[0].action, "invitation_removed");
   assert.equal(projectChanges(old, { ...old, invitations: [{ ...old.invitations[0], emailStatus: "sent" }] }).length, 0);
   assert.equal(projectChanges({ categories: [] }, { categories: [{ _id: "c", name: "Category" }] })[0].action, "category_added");
+  const categoryChanged = projectChanges(old, { ...old, categories: [{ _id: "c", name: "New", color: "#123456" }] })[0];
+  assert.equal(categoryChanged.action, "category_changed");
+  assert.equal(categoryChanged.before, "Old blue");
+  assert.equal(categoryChanged.after, "New #123456");
 });
 
 test("journal normalizes populated user ids and truncates long text", () => {

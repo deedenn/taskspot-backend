@@ -16,7 +16,7 @@ export function dateKey(date, timeZone) {
 }
 
 // Convert calendar time to UTC, preserving local time across offset changes.
-function fromCalendar(parts, timeZone) {
+export function fromCalendar(parts, timeZone) {
   const asUtc = (value) => Date.UTC(value.year, value.month - 1, value.day, value.hour, value.minute, value.second);
   const target = asUtc(parts);
   const offsets = new Set();

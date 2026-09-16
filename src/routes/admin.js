@@ -10,6 +10,7 @@ import { billingIntegrationPayload } from "../services/billingProviders.js";
 import { checkEmailTransport, emailRuntimeConfig } from "../services/email.js";
 import { PLANS } from "../services/plans.js";
 import { addCalendarMonths, applyManualSubscriptionChange } from "../services/subscriptions.js";
+import { overdueTaskFilter } from "../services/taskDeadline.js";
 import { EmailJob } from "../models/EmailJob.js";
 
 export const adminRouter = express.Router();
@@ -225,7 +226,7 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     Task.countDocuments({ status: { $ne: "closed" } }),
     Task.countDocuments({ status: "closed" }),
     Task.countDocuments({ status: { $in: ["review", "done"] } }),
-    Task.countDocuments({ status: { $ne: "closed" }, dueDate: { $lt: new Date() } }),
+    Task.countDocuments({ status: { $ne: "closed" }, ...overdueTaskFilter(now) }),
     Task.countDocuments({ createdAt: { $gte: since } }),
     Task.countDocuments({ status: "closed", updatedAt: { $gte: since } }),
     User.find()

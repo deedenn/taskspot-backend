@@ -18,6 +18,7 @@ import { canViewTask, idOf, projectMember, taskFilterForProjects, visibleNotific
 import { limitExceeded, limitPayload, organizationUsage, planFor } from "../services/plans.js";
 import { createMobileSession, requireMobileAuth, revokeMobileSession, rotateMobileSession } from "../services/mobileSessions.js";
 import { assertMobileStatusTransition, mobileTaskCapabilities } from "../services/mobileTaskCapabilities.js";
+import { overdueTaskFilter, parseTaskDeadline, startOfTaskDay } from "../services/taskDeadline.js";
 import {
   findInvitationByToken,
   normalizeRegistrationEmail,
@@ -289,10 +290,11 @@ mobileRouter.get("/bootstrap", asyncRoute(async (req, res) => {
     .populate("members.user", "name lastName email avatarUrl")
     .sort({ updatedAt: -1 }).lean();
   const visible = taskFilterForProjects(projects, req.user._id);
+  const now = new Date();
   const [active, today, overdue, review, unassigned, unread] = await Promise.all([
     Task.countDocuments({ $and: [visible, { status: { $in: ACTIVE_STATUSES } }] }),
     Task.countDocuments({ $and: [visible, { dueDate: { $gte: new Date(new Date().setHours(0, 0, 0, 0)), $lt: new Date(new Date().setHours(24, 0, 0, 0)) }, status: { $in: ACTIVE_STATUSES } }] }),
-    Task.countDocuments({ $and: [visible, { dueDate: { $lt: new Date(new Date().setHours(0, 0, 0, 0)) }, status: { $in: ACTIVE_STATUSES } }] }),
+    Task.countDocuments({ $and: [visible, overdueTaskFilter(now), { status: { $in: ACTIVE_STATUSES } }] }),
     Task.countDocuments({ $and: [visible, { status: { $in: ["review", "done"] } }] }),
     Task.countDocuments({ $and: [visible, { assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }], status: { $ne: "closed" } }] }),
     Notification.countDocuments({ ...(await visibleNotificationFilter(req.user._id)), read: false })
@@ -319,7 +321,7 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
   const endToday = new Date(startToday); endToday.setDate(endToday.getDate() + 1);
   if (focus === "active") filters.push({ status: { $in: ACTIVE_STATUSES } });
   if (focus === "today") filters.push({ dueDate: { $gte: startToday, $lt: endToday }, status: { $in: ACTIVE_STATUSES } });
-  if (focus === "overdue") filters.push({ dueDate: { $lt: startToday }, status: { $in: ACTIVE_STATUSES } });
+  if (focus === "overdue") filters.push(overdueTaskFilter(new Date()), { status: { $in: ACTIVE_STATUSES } });
   if (focus === "review") filters.push({ status: { $in: ["review", "done"] } });
   if (focus === "unassigned") filters.push({ assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }], status: { $ne: "closed" } });
   const search = String(req.query.search || "").trim();
@@ -328,7 +330,7 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
   const cursor = decodeCursor(req.query.cursor);
   if (cursor) filters.push({ $or: [{ updatedAt: { $lt: cursor.at } }, { updatedAt: cursor.at, _id: { $lt: cursor.id } }] });
   const tasks = await Task.find({ $and: filters })
-    .select("description project creator assignee assigneeEmail observers dueDate status priority categories updatedAt createdAt")
+    .select("description project creator assignee assigneeEmail observers dueDate dueDateHasTime status priority categories updatedAt createdAt")
     .populate("project", "name isArchived archivedAt")
     .populate("creator", "name lastName email")
     .populate("assignee", "name lastName email avatarUrl")
@@ -344,7 +346,7 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
 
 mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
   const result = await idempotent(req, async (mutationKey) => {
-    const { projectId, description, dueDate, priority = "medium", categories = [], assignee, observers = [], checklist = [] } = req.body;
+    const { projectId, description, dueDate, dueDateHasTime = false, priority = "medium", categories = [], assignee, observers = [], checklist = [] } = req.body;
     if (!mongoose.isObjectIdOrHexString(projectId)) throw httpError(400, "Некорректный проект");
     const project = await Project.findById(projectId);
     if (!project || !projectMember(project, req.user._id)) throw httpError(403, "Project access denied");
@@ -366,11 +368,7 @@ mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
     if (!Array.isArray(observers) || observers.some((userId) => !memberIds.has(idOf(userId)))) throw httpError(400, "Observers must be project members");
     const categoryIds = new Set(project.categories.map((category) => idOf(category)));
     if (!Array.isArray(categories) || categories.some((categoryId) => !categoryIds.has(idOf(categoryId)))) throw httpError(400, "Categories must belong to the project");
-    let parsedDueDate;
-    if (dueDate) {
-      parsedDueDate = new Date(dueDate);
-      if (Number.isNaN(parsedDueDate.getTime())) throw httpError(400, "Due date is invalid");
-    }
+    const parsedDeadline = parseTaskDeadline(dueDate, dueDateHasTime);
     if (project.organization) {
       const organization = await Organization.findById(project.organization);
       if (organization) {
@@ -382,7 +380,8 @@ mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
       }
     }
     const task = new Task({
-      project: project._id, creator: req.user._id, description: description.trim(), dueDate: parsedDueDate,
+      project: project._id, creator: req.user._id, description: description.trim(),
+      dueDate: parsedDeadline.dueDate, dueDateHasTime: parsedDeadline.dueDateHasTime,
       priority, categories, assignee: assignee || undefined, observers,
       checklist: Array.isArray(checklist) ? checklist.filter((item) => item?.text?.trim()).map((item) => ({ text: item.text.trim(), done: Boolean(item.done) })) : [],
       status: "open",
@@ -474,19 +473,26 @@ mobileRouter.post("/tasks/:taskId/comments", asyncRoute(async (req, res) => {
 mobileRouter.get("/control/summary", asyncRoute(async (req, res) => {
   const projects = await Project.find({ "members.user": req.user._id }).select("members").lean();
   const visible = taskFilterForProjects(projects, req.user._id);
-  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const now = new Date();
+  const startToday = startOfTaskDay(now);
   const active = { status: { $in: ACTIVE_STATUSES } };
   const [activeCount, overdueCount, reviewCount, unassignedCount, overdue, waitingReview, unassigned, groups] = await Promise.all([
     Task.countDocuments({ $and: [visible, active] }),
-    Task.countDocuments({ $and: [visible, active, { dueDate: { $lt: today } }] }),
+    Task.countDocuments({ $and: [visible, active, overdueTaskFilter(now)] }),
     Task.countDocuments({ $and: [visible, { status: { $in: ["review", "done"] } }] }),
     Task.countDocuments({ $and: [visible, { status: { $ne: "closed" }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }),
-    Task.find({ $and: [visible, active, { dueDate: { $lt: today } }] }).select("description project assignee dueDate status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ dueDate: 1 }).limit(10).lean(),
-    Task.find({ $and: [visible, { status: { $in: ["review", "done"] } }] }).select("description project assignee dueDate status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ updatedAt: -1 }).limit(10).lean(),
-    Task.find({ $and: [visible, { status: { $ne: "closed" }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }).select("description project dueDate status priority").populate("project", "name").sort({ updatedAt: -1 }).limit(10).lean(),
+    Task.find({ $and: [visible, active, overdueTaskFilter(now)] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ dueDate: 1 }).limit(10).lean(),
+    Task.find({ $and: [visible, { status: { $in: ["review", "done"] } }] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ updatedAt: -1 }).limit(10).lean(),
+    Task.find({ $and: [visible, { status: { $ne: "closed" }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }).select("description project dueDate dueDateHasTime status priority").populate("project", "name").sort({ updatedAt: -1 }).limit(10).lean(),
     Task.aggregate([
       { $match: visible },
-      { $group: { _id: "$assignee", active: { $sum: { $cond: [{ $in: ["$status", ACTIVE_STATUSES] }, 1, 0] } }, overdue: { $sum: { $cond: [{ $and: [{ $in: ["$status", ACTIVE_STATUSES] }, { $lt: ["$dueDate", today] }] }, 1, 0] } }, review: { $sum: { $cond: [{ $in: ["$status", ["review", "done"]] }, 1, 0] } } } },
+      { $group: { _id: "$assignee", active: { $sum: { $cond: [{ $in: ["$status", ACTIVE_STATUSES] }, 1, 0] } }, overdue: { $sum: { $cond: [{ $and: [
+        { $in: ["$status", ACTIVE_STATUSES] },
+        { $or: [
+          { $and: [{ $eq: ["$dueDateHasTime", true] }, { $lt: ["$dueDate", now] }] },
+          { $and: [{ $ne: ["$dueDateHasTime", true] }, { $lt: ["$dueDate", startToday] }] }
+        ] }
+      ] }, 1, 0] } }, review: { $sum: { $cond: [{ $in: ["$status", ["review", "done"]] }, 1, 0] } } } },
       { $sort: { overdue: -1, active: -1 } }, { $limit: 20 }
     ])
   ]);

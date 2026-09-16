@@ -42,7 +42,7 @@ async function scope(req) {
 }
 
 function publicTaskQuery(filter) {
-  return Task.find(filter).select("description project creator assignee assigneeEmail dueDate status priority categories")
+  return Task.find(filter).select("description project creator assignee assigneeEmail dueDate dueDateHasTime status priority categories")
     .populate("project", "name isArchived archivedAt")
     .populate("assignee", "name lastName avatarUrl")
     .sort({ dueDate: 1, _id: 1 });

@@ -518,15 +518,25 @@ if (!process.env.TEST_MONGODB_URI) {
           projectId: project._id,
           description: "Prepare account",
           dueDate: new Date(Date.now() + 86400000).toISOString(),
-          assignee: `pending:${invitedEmail}`,
           observers: [],
           categories: [],
           priority: "urgent"
         }
       });
       assert.equal(task.response.status, 201, task.data.message);
-      assert.equal(task.data.task.assigneeEmail, invitedEmail);
       assert.equal(task.data.task.priority, "urgent");
+      assert.ok(task.data.task.project.invitations.some(
+        (item) => item.email === invitedEmail && item.status === "pending"
+      ));
+
+      const assigned = await request(`/api/tasks/${task.data.task._id}`, {
+        method: "PATCH",
+        token: owner.token,
+        body: { assignee: `pending:${invitedEmail}` }
+      });
+      assert.equal(assigned.response.status, 200, assigned.data.message);
+      assert.equal(assigned.data.task.assignee, undefined);
+      assert.equal(assigned.data.task.assigneeEmail, invitedEmail);
 
       const invitee = await register({
         name: "Invitee",

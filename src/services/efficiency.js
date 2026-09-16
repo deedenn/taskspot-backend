@@ -1,4 +1,5 @@
 import { dateKey } from "./taskSchedule.js";
+import { effectiveTaskDeadline } from "./taskDeadline.js";
 
 const DAY = 24 * 60 * 60 * 1000;
 const PERIOD_DAYS = { week: 7, month: 30 };
@@ -55,24 +56,35 @@ function assigneeAt(task, at) {
 }
 
 function dueDateAt(task, at) {
-  const value = historicalValue(task, {
-    action: "due_date_changed",
-    current: task.dueDate || "",
-    at
-  });
+  let value = task.dueDate || "";
+  let hasTime = Boolean(task.dueDateHasTime);
+  const activities = sortedActivities(task).filter(
+    (event) => event.action === "due_date_changed" && new Date(event.createdAt) >= at
+  );
+
+  for (let index = activities.length - 1; index >= 0; index -= 1) {
+    value = activities[index].from || "";
+    hasTime = activities[index].fromHasTime ?? false;
+  }
+
   if (!value) return null;
   const date = new Date(value);
-  return Number.isFinite(date.getTime()) ? date : null;
+  return Number.isFinite(date.getTime())
+    ? effectiveTaskDeadline({ dueDate: date, dueDateHasTime: hasTime })
+    : null;
 }
 
 function committedDueDate(task, period) {
   const current = dueDateAt(task, period.end);
   const missedBeforeReplanning = sortedActivities(task)
     .filter((event) => event.action === "due_date_changed" && within(event.createdAt, period.start, period.end))
-    .map((event) => ({ dueDate: event.from ? new Date(event.from) : null, changedAt: new Date(event.createdAt) }))
+    .map((event) => ({
+      dueDate: event.from ? effectiveTaskDeadline({ dueDate: event.from, dueDateHasTime: event.fromHasTime ?? false }) : null,
+      changedAt: new Date(event.createdAt)
+    }))
     .filter(({ dueDate, changedAt }) =>
       dueDate && Number.isFinite(dueDate.getTime()) && within(dueDate, period.start, period.end) &&
-      changedAt >= new Date(dueDate.getTime() + DAY)
+      changedAt > dueDate
     )
     .map(({ dueDate }) => dueDate);
   const candidates = [current, ...missedBeforeReplanning].filter(Boolean);
@@ -175,7 +187,7 @@ function calculateScope(tasks, period, { actorId = "", projectIds = null } = {})
     .map((task) => ({ task, dueDate: committedDueDate(task, period) }))
     .filter(({ task, dueDate }) =>
       within(dueDate, period.start, period.end) &&
-      (!actor || assigneeAt(task, new Date(dueDate.getTime() + DAY)) === actor)
+      (!actor || assigneeAt(task, new Date(dueDate.getTime() + 1)) === actor)
     );
 
   const deliveredCommitments = commitments.filter(({ task }) =>
@@ -183,7 +195,7 @@ function calculateScope(tasks, period, { actorId = "", projectIds = null } = {})
   );
   const onTime = commitments.filter(({ task, dueDate }) => {
     const delivery = firstDeliveryBefore(task, period.end, actor);
-    return delivery && new Date(delivery.createdAt) < new Date(dueDate.getTime() + DAY);
+    return delivery && new Date(delivery.createdAt) <= dueDate;
   });
 
   const submissions = scopedTasks.flatMap((task) =>
@@ -307,11 +319,11 @@ function buildRhythm(tasks, period, options) {
     const commitments = scoped
       .map((task) => ({ task, dueDate: committedDueDate(task, period) }))
       .filter(({ task, dueDate }) =>
-        within(dueDate, start, end) && assigneeAt(task, new Date(dueDate.getTime() + DAY)) === actor
+        within(dueDate, start, end) && assigneeAt(task, new Date(dueDate.getTime() + 1)) === actor
       );
     const onTime = commitments.filter(({ task, dueDate }) => {
       const delivery = firstDeliveryBefore(task, period.end, actor);
-      return delivery && new Date(delivery.createdAt) < new Date(dueDate.getTime() + DAY);
+      return delivery && new Date(delivery.createdAt) <= dueDate;
     }).length;
     const submissions = scoped.reduce(
       (sum, task) => sum + deliveryEvents(task, actor).filter((event) => within(event.createdAt, start, end)).length,
