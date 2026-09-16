@@ -27,8 +27,8 @@ function idString(value) {
   return (value._id || value).toString();
 }
 
-export async function ensureDefaultOrganization(user) {
-  const existing = await Organization.findOne({
+export async function ensureDefaultOrganization(user, { session = null } = {}) {
+  const query = Organization.findOne({
     $or: [
       { personalOwner: user._id },
       {
@@ -42,20 +42,25 @@ export async function ensureDefaultOrganization(user) {
       }
     ]
   });
+  const existing = await (session ? query.session(session) : query);
 
   if (existing && !existing.personalOwner) {
     existing.personalOwner = user._id;
-    await existing.save();
+    await existing.save(session ? { session } : undefined);
   }
 
   if (existing) return existing;
 
-  return Organization.create({
+  const values = {
     name: `${user.name || "Моя"} компания`,
     plan: "free",
     personalOwner: user._id,
     members: [{ user: user._id, role: "owner" }]
-  });
+  };
+
+  if (!session) return Organization.create(values);
+  const [organization] = await Organization.create([values], { session });
+  return organization;
 }
 
 export async function organizationUsage(organization, { session = null, synchronize = true } = {}) {

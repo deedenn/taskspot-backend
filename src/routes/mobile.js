@@ -19,13 +19,13 @@ import { limitExceeded, limitPayload, organizationUsage, planFor } from "../serv
 import { createMobileSession, requireMobileAuth, revokeMobileSession, rotateMobileSession } from "../services/mobileSessions.js";
 import { assertMobileStatusTransition, mobileTaskCapabilities } from "../services/mobileTaskCapabilities.js";
 import {
-  acceptPendingInvitations,
   findInvitationByToken,
-  hashEmailVerificationToken,
+  normalizeRegistrationEmail,
   publicRegistrationResponse,
   sendVerificationAndSave,
   setEmailVerificationToken,
-  shouldVerifyEmail
+  shouldVerifyEmail,
+  verifyEmailAndProvision
 } from "./auth.js";
 
 export const mobileRouter = express.Router();
@@ -202,11 +202,11 @@ function normalizePlatform(value) {
 
 mobileRouter.post("/auth/register", authLimiter, asyncRoute(async (req, res) => {
   const { name, lastName, email, password, invitationToken } = req.body;
-  if (!name?.trim() || !lastName?.trim() || !email || !password) throw httpError(400, "Name, last name, email and password are required");
+  const normalizedEmail = normalizeRegistrationEmail(email);
+  if (!name?.trim() || !lastName?.trim() || !normalizedEmail || !password) throw httpError(400, "Name, last name, email and password are required");
   if (!strongPassword(password)) throw httpError(400, "Password must contain at least 8 characters, letters and digits");
   const invited = await findInvitationByToken(invitationToken);
   if (invitationToken && !invited) throw httpError(400, "Invitation is invalid or expired");
-  const normalizedEmail = String(email).trim().toLowerCase();
   if (invited && invited.invitation.email !== normalizedEmail) throw httpError(400, "Use the email address from the invitation");
   const exists = await User.findOne({ email: normalizedEmail });
   if (exists) return res.status(409).json({
@@ -225,30 +225,13 @@ mobileRouter.post("/auth/register", authLimiter, asyncRoute(async (req, res) => 
 mobileRouter.post("/auth/email/verify", authLimiter, asyncRoute(async (req, res) => {
   const { installationId, platform } = installation(req.body);
   if (!req.body.token) throw httpError(400, "Verification token is required");
-  const tokenHash = hashEmailVerificationToken(req.body.token);
-  const user = await User.db.transaction(async (session) => {
-    const candidate = await User.findOne({
-      emailVerificationTokenHash: tokenHash,
-      emailVerificationExpiresAt: { $gt: new Date() },
-      emailVerifiedAt: null
-    }).session(session);
-    if (!candidate) return null;
-    candidate.emailVerifiedAt = new Date();
-    candidate.emailVerificationTokenHash = "";
-    candidate.emailVerificationExpiresAt = undefined;
-    candidate.emailVerificationStatus = "verified";
-    candidate.emailVerificationError = "";
-    candidate.lastLoginAt = new Date();
-    await candidate.save({ session });
-    await acceptPendingInvitations(candidate, session);
-    return candidate;
-  });
-  if (!user) throw httpError(400, "Verification link is invalid or expired");
-  res.json(await createMobileSession(user, { installationId, platform }));
+  const result = await verifyEmailAndProvision(req.body.token);
+  if (!result) throw httpError(400, "Verification link is invalid or expired");
+  res.json(await createMobileSession(result.user, { installationId, platform }));
 }));
 
 mobileRouter.post("/auth/email/resend", authLimiter, asyncRoute(async (req, res) => {
-  const email = String(req.body.email || "").trim().toLowerCase();
+  const email = normalizeRegistrationEmail(req.body.email);
   const user = email ? await User.findOne({ email }) : null;
   if (!user || !shouldVerifyEmail(user)) return res.json({ ok: true });
   const verificationToken = await setEmailVerificationToken(user);

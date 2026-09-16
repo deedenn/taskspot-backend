@@ -103,7 +103,12 @@ async function mirrorOrganization(organization, subscription, currentPeriod, { s
   subscription.currentPlan = currentPeriod.plan;
 }
 
-async function initializeSubscription(subscription, organization, { session = null, now = new Date() } = {}) {
+async function initializeSubscription(subscription, organization, {
+  session = null,
+  now = new Date(),
+  initialSource = "migration",
+  initialNote = ""
+} = {}) {
   const legacyPlan = PLANS[organization.plan] ? organization.plan : "free";
   const legacyStart = organization.planAssignedAt || organization.createdAt || now;
   let currentPeriod;
@@ -142,9 +147,11 @@ async function initializeSubscription(subscription, organization, { session = nu
       startsAt: legacyStart,
       endsAt: legacyPlan === "free" ? undefined : organization.planExpiresAt,
       activatedAt: legacyStart,
-      source: "migration",
+      source: initialSource,
       transitionType: "initial",
-      note: organization.planChangeReason || "Перенесено из текущего тарифа организации"
+      note: initialNote || organization.planChangeReason || (initialSource === "system"
+        ? "Тариф Free назначен при регистрации"
+        : "Перенесено из текущего тарифа организации")
     }, session);
   }
 
@@ -155,7 +162,12 @@ async function initializeSubscription(subscription, organization, { session = nu
   return subscription;
 }
 
-export async function ensureSubscription(organization, { session = null, now = new Date() } = {}) {
+export async function ensureSubscription(organization, {
+  session = null,
+  now = new Date(),
+  initialSource = "migration",
+  initialNote = ""
+} = {}) {
   let subscription = await querySession(Subscription.findOne({ organization: organization._id }), session);
   if (subscription?.currentPeriod) return subscription;
 
@@ -167,7 +179,7 @@ export async function ensureSubscription(organization, { session = null, now = n
     ), session);
   }
 
-  return initializeSubscription(subscription, organization, { session, now });
+  return initializeSubscription(subscription, organization, { session, now, initialSource, initialNote });
 }
 
 export async function synchronizeOrganizationSubscription(organization, { session = null, now = new Date() } = {}) {

@@ -96,6 +96,14 @@ if (!process.env.TEST_MONGODB_URI) {
     return data.project;
   }
 
+  async function starterProject(token) {
+    const { response, data } = await request("/api/projects", { token });
+    assert.equal(response.status, 200, data.message);
+    const project = data.projects.find((item) => item.name === "Проект") || data.projects[0];
+    assert.ok(project, "A verified user must have a starter project");
+    return project;
+  }
+
   async function loginSuperAdmin() {
     const { User } = await import("../src/models/User.js");
     const { setupAdmin } = await import("../src/services/adminSetup.js");
@@ -347,6 +355,62 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.ok(login.data.token);
     });
 
+    test("verification atomically provisions Free workspace and a usable starter project", async () => {
+      const email = `workspace_${Date.now()}@example.com`;
+      const registered = await register({ name: "Новый", lastName: "Пользователь", email });
+
+      assert.equal(registered.onboarding.plan, "free");
+      assert.equal(registered.onboarding.projectName, "Проект");
+      assert.ok(registered.onboarding.organizationId);
+      assert.ok(registered.onboarding.projectId);
+
+      const organizations = await request("/api/organizations", { token: registered.token });
+      assert.equal(organizations.response.status, 200, organizations.data.message);
+      assert.equal(organizations.data.organizations.length, 1);
+      const workspace = organizations.data.organizations[0];
+      assert.equal(workspace.plan.key, "free");
+      assert.equal(workspace.subscription.currentPlan, "free");
+      assert.equal(workspace.subscription.currentPeriod.plan, "free");
+      assert.equal(workspace.subscription.currentPeriod.status, "active");
+      assert.equal(workspace.subscription.currentPeriod.source, "system");
+
+      const projects = await request("/api/projects", { token: registered.token });
+      assert.equal(projects.response.status, 200, projects.data.message);
+      assert.equal(projects.data.projects.length, 1);
+      const project = projects.data.projects[0];
+      assert.equal(project._id, registered.onboarding.projectId);
+      assert.equal(project.name, "Проект");
+      assert.equal(project.createdBy._id, registered.user._id);
+      assert.equal(project.members.length, 1);
+      assert.equal(project.members[0].user._id, registered.user._id);
+      assert.equal(project.members[0].role, "admin");
+
+      const task = await createTask({
+        token: registered.token,
+        projectId: project._id,
+        description: "Первая задача",
+        assignee: registered.user._id
+      });
+      assert.equal(task.response.status, 201, task.data.message);
+
+      const renamed = await request(`/api/projects/${project._id}`, {
+        method: "PATCH",
+        token: registered.token,
+        body: { name: "Рабочий проект" }
+      });
+      assert.equal(renamed.response.status, 200, renamed.data.message);
+      assert.equal(renamed.data.project.name, "Рабочий проект");
+
+      await createProject(registered.token, "Второй проект");
+      const overLimit = await request("/api/projects", {
+        method: "POST",
+        token: registered.token,
+        body: { name: "Третий проект" }
+      });
+      assert.equal(overLimit.response.status, 402);
+      assert.equal(overLimit.data.key, "projects");
+    });
+
     test("super admin is limited to service routes and can block users", async () => {
       const user = await register({ name: "Blocked User", email: `blocked_${Date.now()}@example.com` });
 
@@ -545,7 +609,7 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(organizations.data.organizations.length, 1);
       assert.equal(organizations.data.organizations[0].plan.key, "free");
 
-      const first = await createProject(owner.token, "First");
+      const first = await starterProject(owner.token);
       await createProject(owner.token, "Second");
 
       const third = await request("/api/projects", {
@@ -663,7 +727,7 @@ if (!process.env.TEST_MONGODB_URI) {
     test("manual paid plan lifts project and recurrence limits until it expires", async () => {
       const owner = await register({ name: "Paid Owner", email: `paid_owner_${Date.now()}@example.com` });
       const organization = await defaultOrganization(owner.token);
-      const first = await createProject(owner.token, "Paid first");
+      const first = await starterProject(owner.token);
       await createProject(owner.token, "Paid second");
 
       const recurringOnFree = await createTask({

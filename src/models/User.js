@@ -70,6 +70,18 @@ const userSchema = new mongoose.Schema(
     emailVerificationError: {
       type: String,
       default: ""
+    },
+    workspaceProvisioningVersion: {
+      type: Number,
+      default: 0
+    },
+    personalOrganization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization"
+    },
+    starterProject: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Project"
     }
   },
   { timestamps: true }
@@ -90,6 +102,9 @@ userSchema.methods.toJSON = function toJSON() {
   delete user.sessionVersion;
   delete user.emailVerificationTokenHash;
   delete user.emailOutbox;
+  delete user.workspaceProvisioningVersion;
+  delete user.personalOrganization;
+  delete user.starterProject;
   return user;
 };
 

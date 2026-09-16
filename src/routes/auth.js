@@ -14,6 +14,7 @@ import { Task } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { sendEmailVerificationEmail } from "../services/email.js";
 import { persistEmailWith } from "../services/emailOutbox.js";
+import { provisionPersonalWorkspace } from "../services/workspaceProvisioning.js";
 
 export const authRouter = express.Router();
 
@@ -33,6 +34,13 @@ function frontendUrl() {
 
 function createEmailVerificationToken() {
   return crypto.randomBytes(32).toString("hex");
+}
+
+export function normalizeRegistrationEmail(value) {
+  if (typeof value !== "string") return "";
+  const email = value.trim().toLowerCase();
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return "";
+  return email;
 }
 
 export function hashEmailVerificationToken(token) {
@@ -129,6 +137,31 @@ export async function acceptPendingInvitations(user, session) {
   }
 }
 
+export async function verifyEmailAndProvision(token) {
+  const tokenHash = hashEmailVerificationToken(token);
+  return User.db.transaction(async (session) => {
+    // Reload on every transaction attempt: a resend or expiry invalidates the old token.
+    const candidate = await User.findOne({
+      emailVerificationTokenHash: tokenHash,
+      emailVerificationExpiresAt: { $gt: new Date() },
+      emailVerifiedAt: null,
+      status: "active"
+    }).session(session);
+    if (!candidate) return null;
+
+    candidate.emailVerifiedAt = new Date();
+    candidate.emailVerificationTokenHash = "";
+    candidate.emailVerificationExpiresAt = undefined;
+    candidate.emailVerificationStatus = "verified";
+    candidate.emailVerificationError = "";
+    candidate.lastLoginAt = new Date();
+    await candidate.save({ session });
+    await acceptPendingInvitations(candidate, session);
+    const workspace = await provisionPersonalWorkspace(candidate, { session });
+    return { user: candidate, workspace };
+  });
+}
+
 function publicInvitation(project, invitation) {
   return {
     email: invitation.email,
@@ -184,8 +217,9 @@ authRouter.get("/invitations/:token", async (req, res) => {
 authRouter.post("/register", authLimiter, async (req, res) => {
   try {
     const { name, lastName, email, password, invitationToken } = req.body;
+    const normalizedEmail = normalizeRegistrationEmail(email);
 
-    if (!name?.trim() || !lastName?.trim() || !email || !password) {
+    if (!name?.trim() || !lastName?.trim() || !normalizedEmail || !password) {
       return res.status(400).json({ message: "Name, last name, email and password are required" });
     }
 
@@ -198,11 +232,10 @@ authRouter.post("/register", authLimiter, async (req, res) => {
       return res.status(400).json({ message: "Invitation is invalid or expired" });
     }
 
-    if (invited && invited.invitation.email !== email.toLowerCase()) {
+    if (invited && invited.invitation.email !== normalizedEmail) {
       return res.status(400).json({ message: "Use the email address from the invitation" });
     }
 
-    const normalizedEmail = email.toLowerCase();
     const exists = await User.findOne({ email: normalizedEmail });
     if (exists) {
       return res.status(409).json({
@@ -226,7 +259,10 @@ authRouter.post("/register", authLimiter, async (req, res) => {
 
     res.status(201).json(publicRegistrationResponse({ user, emailResult, verificationToken }));
   } catch (error) {
-    res.status(500).json({ message: "Registration failed", error: error.message });
+    if (error?.code === 11000) {
+      return res.status(409).json({ message: "Email is already registered" });
+    }
+    res.status(500).json({ message: "Registration failed" });
   }
 });
 
@@ -238,32 +274,24 @@ authRouter.post("/email/verify", authLimiter, async (req, res) => {
       return res.status(400).json({ message: "Verification token is required" });
     }
 
-    const tokenHash = hashEmailVerificationToken(token);
-    const user = await User.db.transaction(async (session) => {
-      // Reload on every transaction attempt: a resend or expiry invalidates the old token.
-      const candidate = await User.findOne({
-        emailVerificationTokenHash: tokenHash,
-        emailVerificationExpiresAt: { $gt: new Date() },
-        emailVerifiedAt: null
-      }).session(session);
-      if (!candidate) return null;
+    const result = await verifyEmailAndProvision(token);
 
-      candidate.emailVerifiedAt = new Date();
-      candidate.emailVerificationTokenHash = "";
-      candidate.emailVerificationExpiresAt = undefined;
-      candidate.emailVerificationStatus = "verified";
-      candidate.emailVerificationError = "";
-      candidate.lastLoginAt = new Date();
-      await candidate.save({ session });
-      await acceptPendingInvitations(candidate, session);
-      return candidate;
-    });
-
-    if (!user) {
+    if (!result) {
       return res.status(400).json({ message: "Verification link is invalid or expired" });
     }
 
-    res.json({ token: createToken(user), user });
+    const { user, workspace } = result;
+    res.json({
+      token: createToken(user),
+      user,
+      onboarding: {
+        organizationId: workspace.organization._id,
+        projectId: workspace.project._id,
+        projectName: workspace.project.name,
+        plan: workspace.plan,
+        isNewWorkspace: workspace.isNewWorkspace
+      }
+    });
   } catch (error) {
     if (error?.name === "VersionError") {
       return res.status(409).json({ message: "Проект изменён другим участником. Повторите подтверждение email." });
@@ -274,7 +302,7 @@ authRouter.post("/email/verify", authLimiter, async (req, res) => {
 
 authRouter.post("/email/resend", authLimiter, async (req, res) => {
   try {
-    const normalizedEmail = req.body.email?.toLowerCase();
+    const normalizedEmail = normalizeRegistrationEmail(req.body.email);
     const user = normalizedEmail ? await User.findOne({ email: normalizedEmail }) : null;
 
     if (!user || !shouldVerifyEmail(user)) {
@@ -290,8 +318,8 @@ authRouter.post("/email/resend", authLimiter, async (req, res) => {
       ...(emailResult.reason || emailResult.error ? { emailDeliveryError: emailResult.reason || emailResult.error } : {}),
       ...(process.env.NODE_ENV === "test" ? { verificationToken } : {})
     });
-  } catch (error) {
-    res.status(500).json({ message: "Email verification resend failed", error: error.message });
+  } catch {
+    res.status(500).json({ message: "Email verification resend failed" });
   }
 });
 

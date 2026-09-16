@@ -8,6 +8,8 @@ import { authRouter } from "../src/routes/auth.js";
 import { Notification } from "../src/models/Notification.js";
 import { Organization } from "../src/models/Organization.js";
 import { Project } from "../src/models/Project.js";
+import { Subscription } from "../src/models/Subscription.js";
+import { SubscriptionPeriod } from "../src/models/SubscriptionPeriod.js";
 import { Task } from "../src/models/Task.js";
 import { User } from "../src/models/User.js";
 
@@ -38,7 +40,7 @@ test("isolated replica set: atomic email verification and login invitation repai
     try { await mongoose.connection.dropDatabase(); }
     finally { await mongoose.disconnect(); }
   });
-  for (const Model of [User, Organization, Project, Task, Notification]) await Model.init();
+  for (const Model of [User, Organization, Project, Subscription, SubscriptionPeriod, Task, Notification]) await Model.init();
   const app = express();
   app.use(express.json());
   app.use("/auth", authRouter);
@@ -113,6 +115,53 @@ test("isolated replica set: atomic email verification and login invitation repai
     assert.equal(state.notifications.length, state.tasks.length);
     return state;
   }
+
+  await t.test("starter workspace provisioning rolls back with verification and retries exactly once", async (t) => {
+    const token = crypto.randomBytes(24).toString("hex");
+    const user = await User.create({
+      name: "Starter",
+      lastName: "Owner",
+      email: `${token}@example.test`,
+      passwordHash,
+      emailVerificationStatus: "pending",
+      emailVerificationTokenHash: hash(token),
+      emailVerificationExpiresAt: new Date(Date.now() + 60000)
+    });
+    const insertOne = Project.collection.insertOne;
+    const failure = t.mock.method(Project.collection, "insertOne", async function (document, options) {
+      if (document.name === "Проект" && String(document.createdBy) === String(user._id)) {
+        throw new Error("Injected starter project failure");
+      }
+      return insertOne.call(this, document, options);
+    });
+
+    assert.equal((await request("/email/verify", { token })).status, 500);
+    const rolledBackUser = await User.findById(user._id);
+    assert.equal(rolledBackUser.emailVerifiedAt, undefined);
+    assert.equal(rolledBackUser.workspaceProvisioningVersion, 0);
+    assert.equal(await Organization.countDocuments({ personalOwner: user._id }), 0);
+    assert.equal(await Project.countDocuments({ createdBy: user._id }), 0);
+    assert.equal(await Subscription.countDocuments(), 0);
+    assert.equal(await SubscriptionPeriod.countDocuments(), 0);
+
+    failure.mock.restore();
+    const verified = await request("/email/verify", { token });
+    assert.equal(verified.status, 200);
+    assert.equal(verified.data.onboarding.plan, "free");
+    assert.equal(verified.data.onboarding.projectName, "Проект");
+    const organization = await Organization.findOne({ personalOwner: user._id });
+    assert.ok(organization);
+    const project = await Project.findOne({ organization: organization._id, createdBy: user._id });
+    const subscription = await Subscription.findOne({ organization: organization._id });
+    assert.equal(organization.members[0].role, "owner");
+    assert.ok(project);
+    assert.equal(project.members[0].role, "admin");
+    assert.equal(subscription.currentPlan, "free");
+    assert.equal(await SubscriptionPeriod.countDocuments({ subscription: subscription._id, status: "active", plan: "free" }), 1);
+    assert.equal((await User.findById(user._id)).workspaceProvisioningVersion, 1);
+    assert.equal((await request("/email/verify", { token })).status, 400);
+    assert.equal(await Project.countDocuments({ organization: organization._id, createdBy: user._id }), 1);
+  });
 
   await t.test("late failure rolls back user, both projects, organization, tasks and notifications; token remains usable", async (t) => {
     const f = await fixture();
