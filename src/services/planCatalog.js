@@ -1,4 +1,4 @@
-export const PLAN_VERSION = 1;
+export const PLAN_VERSION = 2;
 
 export const PLANS = {
   free: {
@@ -13,7 +13,7 @@ export const PLANS = {
       users: 3,
       projects: 2,
       activeTasks: 50,
-      attachments: 20,
+      attachments: 5,
       templates: 3,
       recurringTasks: 0,
       historyDays: 30
@@ -29,9 +29,9 @@ export const PLANS = {
     limits: {
       organizations: 3,
       users: 20,
-      projects: 50,
+      projects: 10,
       activeTasks: 1000,
-      attachments: 500,
+      attachments: 100,
       templates: 50,
       recurringTasks: 100,
       historyDays: 365
