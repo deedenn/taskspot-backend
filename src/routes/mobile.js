@@ -14,10 +14,11 @@ import { PushJob } from "../models/PushJob.js";
 import { Task, TASK_PRIORITIES } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { strongPassword, requestPasswordReset, resetPassword } from "../services/accountSecurity.js";
-import { canViewTask, idOf, projectMember, taskFilterForProjects, visibleNotificationFilter } from "../services/taskAccess.js";
+import { canViewTask, idOf, isProjectAdmin, projectMember, taskFilterForProjects, visibleNotificationFilter } from "../services/taskAccess.js";
 import { limitExceeded, limitPayload, organizationUsage, planFor } from "../services/plans.js";
 import { createMobileSession, requireMobileAuth, revokeMobileSession, rotateMobileSession } from "../services/mobileSessions.js";
 import { assertMobileStatusTransition, mobileTaskCapabilities } from "../services/mobileTaskCapabilities.js";
+import { attachmentKey, downloadUrlForKey, isStorageConfigured, maxUploadSize, safeFileName, uploadUrlForKey } from "../services/storage.js";
 import { overdueTaskFilter, parseTaskDeadline, startOfTaskDay } from "../services/taskDeadline.js";
 import {
   findInvitationByToken,
@@ -92,16 +93,18 @@ async function populatedTask(task, userId) {
     { path: "assignee", select: "name lastName email avatarUrl" },
     { path: "observers", select: "name lastName email" },
     { path: "attachments.addedBy", select: "name lastName email" },
-    { path: "comments.author", select: "name lastName email" },
-    { path: "activities.actor", select: "name lastName email" }
   ]);
   await task.project?.populate?.("members.user", "name lastName email avatarUrl");
-  return taskDtoFor(task, task.project, userId);
+  const detail = taskDtoFor(task, task.project, userId);
+  detail.timelineCounts = { comments: task.comments?.length || 0, activities: task.activities?.length || 0 };
+  detail.comments = [];
+  detail.activities = [];
+  return detail;
 }
 
-async function loadVisibleTask(taskId, userId) {
+async function loadVisibleTask(taskId, userId, { omitTimeline = false } = {}) {
   if (!mongoose.isObjectIdOrHexString(taskId)) throw httpError(404, "Task not found");
-  const task = await Task.findById(taskId).select("+mobileMutationKeys");
+  const task = await Task.findById(taskId).select(omitTimeline ? "-comments -activities" : "+mobileMutationKeys");
   if (!task) throw httpError(404, "Task not found");
   const project = await Project.findById(task.project);
   if (!project || !canViewTask(task, project, userId)) throw httpError(403, "Task access denied");
@@ -309,7 +312,7 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
   const scope = req.query.scope || "all";
   const focus = req.query.focus || "active";
   if (!["all", "assigned", "created", "watching"].includes(scope)) throw httpError(400, "Некорректный scope");
-  if (!["all", "active", "today", "overdue", "review", "unassigned"].includes(focus)) throw httpError(400, "Некорректный focus");
+  if (!["all", "active", "today", "overdue", "review", "unassigned", "closed"].includes(focus)) throw httpError(400, "Некорректный focus");
   const projects = await Project.find({ "members.user": req.user._id }).select("members name").lean();
   const selected = req.query.projectId ? projects.filter((project) => idOf(project) === req.query.projectId) : projects;
   if (req.query.projectId && !selected.length) throw httpError(403, "Нет доступа к проекту");
@@ -323,6 +326,7 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
   if (focus === "today") filters.push({ dueDate: { $gte: startToday, $lt: endToday }, status: { $in: ACTIVE_STATUSES } });
   if (focus === "overdue") filters.push(overdueTaskFilter(new Date()), { status: { $in: ACTIVE_STATUSES } });
   if (focus === "review") filters.push({ status: { $in: ["review", "done"] } });
+  if (focus === "closed") filters.push({ status: "closed" });
   if (focus === "unassigned") filters.push({ assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }], status: { $ne: "closed" } });
   const search = String(req.query.search || "").trim();
   if (search.length > 200) throw httpError(400, "Поиск ограничен 200 символами");
@@ -399,9 +403,127 @@ mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
 }));
 
 mobileRouter.get("/tasks/:taskId", asyncRoute(async (req, res) => {
-  const { task } = await loadVisibleTask(req.params.taskId, req.user._id);
+  const { task } = await loadVisibleTask(req.params.taskId, req.user._id, { omitTimeline: true });
+  const [timeline] = await Task.aggregate([
+    { $match: { _id: task._id } },
+    { $project: { comments: { $size: "$comments" }, activities: { $size: "$activities" } } }
+  ]);
   res.set("Cache-Control", "no-store");
+  const detail = await populatedTask(task, req.user._id);
+  detail.comments = [];
+  detail.activities = [];
+  detail.timelineCounts = { comments: timeline?.comments || 0, activities: timeline?.activities || 0 };
+  res.json({ task: detail });
+}));
+
+function timelineCursor(value) {
+  if (!value) return null;
+  if (!mongoose.isObjectIdOrHexString(value)) throw httpError(400, "Некорректный cursor");
+  return new mongoose.Types.ObjectId(value);
+}
+
+async function timelinePage(taskId, kind, cursor, limit) {
+  const conditions = cursor ? { $lt: ["$$entry._id", cursor] } : { $literal: true };
+  const [result] = await Task.aggregate([
+    { $match: { _id: new mongoose.Types.ObjectId(taskId) } },
+    { $project: { items: { $slice: [{ $reverseArray: { $filter: { input: `$${kind}`, as: "entry", cond: conditions } } }, limit + 1] } } }
+  ]);
+  const raw = result?.items || [];
+  const ids = [...new Set(raw.map((item) => idOf(kind === "comments" ? item.author : item.actor)).filter(Boolean))];
+  const people = await User.find({ _id: { $in: ids } }).select("name lastName email avatarUrl").lean();
+  const byId = new Map(people.map((person) => [idOf(person), person]));
+  const items = raw.slice(0, limit).map((item) => ({ ...item, [kind === "comments" ? "author" : "actor"]: byId.get(idOf(kind === "comments" ? item.author : item.actor)) || null }));
+  return { items, nextCursor: raw.length > limit ? idOf(items.at(-1)) : null };
+}
+
+for (const kind of ["comments", "activities"]) {
+  mobileRouter.get(`/tasks/:taskId/${kind}`, asyncRoute(async (req, res) => {
+    await loadVisibleTask(req.params.taskId, req.user._id, { omitTimeline: true });
+    const limit = Number(req.query.limit || 20);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw httpError(400, "Некорректный limit");
+    res.set("Cache-Control", "no-store");
+    res.json(await timelinePage(req.params.taskId, kind, timelineCursor(req.query.cursor), limit));
+  }));
+}
+
+mobileRouter.patch("/tasks/:taskId/fields", asyncRoute(async (req, res) => {
+  const { task, project } = await loadVisibleTask(req.params.taskId, req.user._id);
+  const previousAssignee = idOf(task.assignee);
+  if (!mobileTaskCapabilities(task, project, req.user._id).canEditFields) throw httpError(403, "Редактирование задачи недоступно");
+  if (taskVersion(task) !== expectedVersion(req)) throw httpError(409, "Задача уже изменена", { code: "VERSION_CONFLICT", currentVersion: taskVersion(task) });
+  const allowed = ["dueDate", "priority", "assignee", "categories", "observers"];
+  const keys = Object.keys(req.body || {});
+  if (!keys.length || keys.some((key) => !allowed.includes(key))) throw httpError(400, "Некорректные поля задачи");
+  const members = new Set(project.members.map((member) => idOf(member.user)));
+  const categories = new Set(project.categories.map((category) => idOf(category)));
+  if (Object.hasOwn(req.body, "dueDate")) {
+    if (req.body.dueDate) {
+      const deadline = new Date(req.body.dueDate);
+      if (typeof req.body.dueDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(req.body.dueDate) || !Number.isFinite(deadline.getTime()) || deadline.toISOString().slice(0, 10) !== req.body.dueDate) throw httpError(400, "Некорректный срок задачи");
+    }
+    const parsed = req.body.dueDate ? parseTaskDeadline(req.body.dueDate, false) : { dueDate: null, dueDateHasTime: false };
+    task.dueDate = parsed.dueDate;
+    task.dueDateHasTime = parsed.dueDateHasTime;
+    task.activities.push({ actor: req.user._id, action: "due_date_changed", details: parsed.dueDate ? parsed.dueDate.toISOString() : "Срок снят" });
+  }
+  if (Object.hasOwn(req.body, "priority")) {
+    if (!TASK_PRIORITIES.includes(req.body.priority)) throw httpError(400, "Некорректный приоритет");
+    task.priority = req.body.priority;
+    task.activities.push({ actor: req.user._id, action: "priority_changed", details: req.body.priority });
+  }
+  if (Object.hasOwn(req.body, "assignee")) {
+    if (req.body.assignee && !members.has(idOf(req.body.assignee))) throw httpError(400, "Исполнитель должен быть участником проекта");
+    task.assignee = req.body.assignee || null;
+    task.assigneeEmail = undefined;
+    task.activities.push({ actor: req.user._id, action: "assignee_changed", details: req.body.assignee || "Не назначен" });
+  }
+  for (const field of ["categories", "observers"]) {
+    if (!Object.hasOwn(req.body, field)) continue;
+    const values = req.body[field];
+    const valid = field === "categories" ? categories : members;
+    if (!Array.isArray(values) || values.some((value) => !valid.has(idOf(value)))) throw httpError(400, `Некорректные ${field}`);
+    task[field] = values;
+    task.activities.push({ actor: req.user._id, action: `${field}_changed`, details: values.join(", ") });
+  }
+  await task.save();
+  if (task.assignee && idOf(task.assignee) !== previousAssignee && idOf(task.assignee) !== idOf(req.user)) await ensureNotification({
+    dedupeKey: `mobile:fields:${idOf(task)}:${taskVersion(task)}:assigned`, user: task.assignee, project: project._id,
+    task: task._id, kind: "task_assigned", message: `Вам назначена задача «${task.description}»`
+  });
   res.json({ task: await populatedTask(task, req.user._id) });
+}));
+
+mobileRouter.post("/tasks/:taskId/attachments/presign", asyncRoute(async (req, res) => {
+  const { task, project } = await loadVisibleTask(req.params.taskId, req.user._id);
+  const allowed = mobileTaskCapabilities(task, project, req.user._id).canAttach;
+  if (!allowed) throw httpError(403, "Нет прав на добавление вложения");
+  if (!isStorageConfigured()) throw httpError(503, "Файловое хранилище не настроено");
+  const name = safeFileName(req.body.name);
+  const size = Number(req.body.size);
+  if (!name || !Number.isFinite(size) || size <= 0 || size > maxUploadSize()) throw httpError(400, "Недопустимый файл");
+  const key = attachmentKey({ projectId: project._id, taskId: task._id, userId: req.user._id, fileName: name });
+  res.json({ uploadUrl: uploadUrlForKey(key), attachment: { key, name, size, mimeType: String(req.body.mimeType || "application/octet-stream") } });
+}));
+
+mobileRouter.post("/tasks/:taskId/attachments", asyncRoute(async (req, res) => {
+  const { task, project } = await loadVisibleTask(req.params.taskId, req.user._id);
+  if (!mobileTaskCapabilities(task, project, req.user._id).canAttach) throw httpError(403, "Нет прав на добавление вложения");
+  if (taskVersion(task) !== expectedVersion(req)) throw httpError(409, "Задача уже изменена", { code: "VERSION_CONFLICT", currentVersion: taskVersion(task) });
+  const { key, name, size, mimeType } = req.body;
+  const prefix = `attachments/${idOf(project)}/${idOf(task)}/${idOf(req.user)}/`;
+  if (typeof key !== "string" || !key.startsWith(prefix) || !name || !Number.isFinite(Number(size)) || Number(size) <= 0 || Number(size) > maxUploadSize()) throw httpError(400, "Некорректное вложение");
+  task.attachments.push({ key, name: safeFileName(name), size: Number(size), mimeType: String(mimeType || "application/octet-stream"), addedBy: req.user._id });
+  task.activities.push({ actor: req.user._id, action: "attachment_added", details: safeFileName(name) });
+  await task.save();
+  res.status(201).json({ task: await populatedTask(task, req.user._id) });
+}));
+
+mobileRouter.get("/tasks/:taskId/attachments/:attachmentId/download-url", asyncRoute(async (req, res) => {
+  const { task } = await loadVisibleTask(req.params.taskId, req.user._id);
+  const attachment = task.attachments.id(req.params.attachmentId);
+  if (!attachment) throw httpError(404, "Вложение не найдено");
+  if (!attachment.key && !attachment.url) throw httpError(404, "Файл недоступен");
+  res.json({ url: attachment.key ? downloadUrlForKey(attachment.key) : attachment.url });
 }));
 
 mobileRouter.patch("/tasks/:taskId/status", asyncRoute(async (req, res) => {
@@ -471,12 +593,21 @@ mobileRouter.post("/tasks/:taskId/comments", asyncRoute(async (req, res) => {
 }));
 
 mobileRouter.get("/control/summary", asyncRoute(async (req, res) => {
-  const projects = await Project.find({ "members.user": req.user._id }).select("members").lean();
-  const visible = taskFilterForProjects(projects, req.user._id);
+  const projects = await Project.find({ "members.user": req.user._id, isArchived: { $ne: true } }).select("members name").lean();
+  const administered = projects.filter((project) => isProjectAdmin(project, req.user._id));
+  const teamMode = administered.length > 0;
+  const selected = req.query.projectId ? administered.filter((project) => idOf(project) === req.query.projectId) : administered;
+  if (req.query.projectId && !selected.length) throw httpError(403, "Нет прав на командный контроль проекта");
+  const assigneeId = req.query.assigneeId ? String(req.query.assigneeId) : null;
+  if (assigneeId && (!teamMode || !mongoose.isObjectIdOrHexString(assigneeId) || !selected.some((project) => project.members.some((member) => idOf(member.user) === assigneeId)))) throw httpError(403, "Нет прав на контроль участника");
+  const visible = teamMode
+    ? { project: { $in: selected.map((project) => project._id) }, ...(assigneeId ? { assignee: new mongoose.Types.ObjectId(assigneeId) } : {}) }
+    : { $and: [taskFilterForProjects(projects, req.user._id), { assignee: req.user._id }] };
   const now = new Date();
   const startToday = startOfTaskDay(now);
   const active = { status: { $in: ACTIVE_STATUSES } };
-  const [activeCount, overdueCount, reviewCount, unassignedCount, overdue, waitingReview, unassigned, groups] = await Promise.all([
+  const endToday = startOfTaskDay(new Date(startToday.getTime() + 26 * 60 * 60 * 1000));
+  const [activeCount, overdueCount, reviewCount, unassignedCount, overdue, waitingReview, unassigned, today, groups] = await Promise.all([
     Task.countDocuments({ $and: [visible, active] }),
     Task.countDocuments({ $and: [visible, active, overdueTaskFilter(now)] }),
     Task.countDocuments({ $and: [visible, { status: { $in: ["review", "done"] } }] }),
@@ -484,6 +615,7 @@ mobileRouter.get("/control/summary", asyncRoute(async (req, res) => {
     Task.find({ $and: [visible, active, overdueTaskFilter(now)] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ dueDate: 1 }).limit(10).lean(),
     Task.find({ $and: [visible, { status: { $in: ["review", "done"] } }] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ updatedAt: -1 }).limit(10).lean(),
     Task.find({ $and: [visible, { status: { $ne: "closed" }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }).select("description project dueDate dueDateHasTime status priority").populate("project", "name").sort({ updatedAt: -1 }).limit(10).lean(),
+    Task.find({ $and: [visible, active, { dueDate: { $gte: startToday, $lt: endToday } }] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").sort({ dueDate: 1 }).limit(20).lean(),
     Task.aggregate([
       { $match: visible },
       { $group: { _id: "$assignee", active: { $sum: { $cond: [{ $in: ["$status", ACTIVE_STATUSES] }, 1, 0] } }, overdue: { $sum: { $cond: [{ $and: [
@@ -500,14 +632,17 @@ mobileRouter.get("/control/summary", asyncRoute(async (req, res) => {
   const users = await User.find({ _id: { $in: userIds } }).select("name lastName avatarUrl").lean();
   const people = new Map(users.map((user) => [idOf(user), user]));
   res.json({
+    mode: teamMode ? "team" : "personal",
+    projects: administered.map((project) => ({ _id: project._id, name: project.name })),
+    selectedAssignee: assigneeId ? people.get(assigneeId) || null : null,
     summary: { active: activeCount, overdue: overdueCount, waitingReview: reviewCount, unassigned: unassignedCount },
-    overdue: overdue.map(taskDto), waitingReview: waitingReview.map(taskDto), unassigned: unassigned.map(taskDto),
-    byAssignee: groups.map((group) => ({ key: group._id ? idOf(group._id) : "unassigned", user: people.get(idOf(group._id)) || null, active: group.active, overdue: group.overdue, review: group.review }))
+    overdue: overdue.map(taskDto), waitingReview: waitingReview.map(taskDto), unassigned: unassigned.map(taskDto), today: today.map(taskDto),
+    byAssignee: teamMode ? groups.map((group) => ({ key: group._id ? idOf(group._id) : "unassigned", user: people.get(idOf(group._id)) || null, active: group.active, overdue: group.overdue, review: group.review })) : []
   });
 }));
 
 mobileRouter.get("/control/assignees", asyncRoute(async (req, res) => {
-  const projects = await Project.find({ "members.user": req.user._id }).select("members").lean();
+  const projects = (await Project.find({ "members.user": req.user._id, isArchived: { $ne: true } }).select("members").lean()).filter((project) => isProjectAdmin(project, req.user._id));
   const groups = await Task.aggregate([
     { $match: taskFilterForProjects(projects, req.user._id) },
     { $group: { _id: "$assignee", total: { $sum: 1 }, active: { $sum: { $cond: [{ $in: ["$status", ACTIVE_STATUSES] }, 1, 0] } }, review: { $sum: { $cond: [{ $in: ["$status", ["review", "done"]] }, 1, 0] } } } },

@@ -110,6 +110,60 @@ if (!process.env.TEST_MONGODB_URI) {
     });
     assert.equal(stale.response.status, 409);
 
+    const detail = await request(`/api/mobile/v1/tasks/${created.data.task._id}`, { token: verified.data.accessToken });
+    assert.equal(detail.response.status, 200, detail.data.message);
+    assert.deepEqual(detail.data.task.comments, []);
+    assert.deepEqual(detail.data.task.activities, []);
+    assert.equal(detail.data.task.timelineCounts.activities >= 2, true);
+    const firstHistory = await request(`/api/mobile/v1/tasks/${created.data.task._id}/activities?limit=1`, { token: verified.data.accessToken });
+    assert.equal(firstHistory.data.items.length, 1);
+    assert.ok(firstHistory.data.nextCursor);
+    const secondHistory = await request(`/api/mobile/v1/tasks/${created.data.task._id}/activities?limit=1&cursor=${firstHistory.data.nextCursor}`, { token: verified.data.accessToken });
+    assert.equal(secondHistory.data.items.length, 1);
+    assert.notEqual(firstHistory.data.items[0]._id, secondHistory.data.items[0]._id);
+
+    const commented = await request(`/api/mobile/v1/tasks/${created.data.task._id}/comments`, {
+      method: "POST", token: verified.data.accessToken,
+      headers: { "Idempotency-Key": `comment-${suffix}`, "If-Match": '"1"' }, body: { text: "Готово к проверке" }
+    });
+    assert.equal(commented.response.status, 201, commented.data.message);
+    const commentPage = await request(`/api/mobile/v1/tasks/${created.data.task._id}/comments?limit=1`, { token: verified.data.accessToken });
+    assert.equal(commentPage.data.items.length, 1);
+    assert.equal(commentPage.data.items[0].text, "Готово к проверке");
+
+    const edited = await request(`/api/mobile/v1/tasks/${created.data.task._id}/fields`, {
+      method: "PATCH", token: verified.data.accessToken,
+      headers: { "If-Match": '"2"' }, body: { priority: "high", dueDate: "2026-09-20" }
+    });
+    assert.equal(edited.response.status, 200, edited.data.message);
+    assert.equal(edited.data.task.priority, "high");
+    assert.equal(edited.data.task.version, 3);
+    const staleEdit = await request(`/api/mobile/v1/tasks/${created.data.task._id}/fields`, {
+      method: "PATCH", token: verified.data.accessToken,
+      headers: { "If-Match": '"2"' }, body: { priority: "low" }
+    });
+    assert.equal(staleEdit.response.status, 409);
+    const invalidDate = await request(`/api/mobile/v1/tasks/${created.data.task._id}/fields`, {
+      method: "PATCH", token: verified.data.accessToken,
+      headers: { "If-Match": '"3"' }, body: { dueDate: "2026-02-30" }
+    });
+    assert.equal(invalidDate.response.status, 400);
+
+    const review = await request(`/api/mobile/v1/tasks/${created.data.task._id}/status`, {
+      method: "PATCH", token: verified.data.accessToken,
+      headers: { "Idempotency-Key": `review-${suffix}`, "If-Match": '"3"' }, body: { status: "review" }
+    });
+    assert.equal(review.response.status, 200, review.data.message);
+    const closed = await request(`/api/mobile/v1/tasks/${created.data.task._id}/status`, {
+      method: "PATCH", token: verified.data.accessToken,
+      headers: { "Idempotency-Key": `close-${suffix}`, "If-Match": '"4"' }, body: { status: "closed" }
+    });
+    assert.equal(closed.response.status, 200, closed.data.message);
+    const closedFeed = await request("/api/mobile/v1/feed?focus=closed", { token: verified.data.accessToken });
+    assert.equal(closedFeed.data.items.some((item) => item._id === created.data.task._id), true);
+    const control = await request(`/api/mobile/v1/control/summary?projectId=${projectId}`, { token: verified.data.accessToken });
+    assert.equal(control.data.mode, "team");
+
     const refreshed = await request("/api/mobile/v1/auth/refresh", { method: "POST", body: { refreshToken: verified.data.refreshToken } });
     assert.equal(refreshed.response.status, 200, refreshed.data.message);
     const reused = await request("/api/mobile/v1/auth/refresh", { method: "POST", body: { refreshToken: verified.data.refreshToken } });

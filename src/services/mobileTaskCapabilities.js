@@ -21,6 +21,7 @@ export function mobileTaskCapabilities(task, project, userId) {
     canEditChecklist: !archived && (admin || creator || assignee),
     canComment: !archived,
     canEditFields: !archived && (admin || creator),
+    canAttach: !archived && (admin || creator || assignee),
     ...(archived ? { readOnlyReason: "Архивный проект доступен только для просмотра" } : {})
   };
 }
