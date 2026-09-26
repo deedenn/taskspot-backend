@@ -380,7 +380,8 @@ mobileRouter.post("/tasks", asyncRoute(async (req, res) => {
         const usage = await organizationUsage(organization);
         const plan = planFor(organization);
         if (limitExceeded({ plan, usage, key: "activeTasks" })) {
-          return { status: 402, body: limitPayload({ organization, plan, usage, key: "activeTasks", message: "Лимит активных задач исчерпан" }) };
+          const payload = limitPayload({ organization, plan, usage, key: "activeTasks", message: "Лимит активных задач исчерпан" });
+          throw httpError(402, payload.message, payload);
         }
       }
     }

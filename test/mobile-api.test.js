@@ -21,6 +21,9 @@ if (!process.env.TEST_MONGODB_URI) {
 
   const { createApp } = await import("../src/app.js");
   const { MobileMutationReceipt } = await import("../src/models/MobileMutationReceipt.js");
+  const { Organization } = await import("../src/models/Organization.js");
+  const { Project } = await import("../src/models/Project.js");
+  const { Task } = await import("../src/models/Task.js");
   let server;
   let baseUrl;
 
@@ -161,6 +164,33 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.equal(closed.response.status, 200, closed.data.message);
     const closedFeed = await request("/api/mobile/v1/feed?focus=closed", { token: verified.data.accessToken });
     assert.equal(closedFeed.data.items.some((item) => item._id === created.data.task._id), true);
+
+    await Task.insertMany(Array.from({ length: 50 }, (_, index) => ({
+      project: projectId,
+      creator: verified.data.user._id,
+      description: `Задача лимита ${index + 1}`
+    })));
+    const limitKey = `limit-${suffix}`;
+    const limitBody = { projectId, description: "Создастся после повышения тарифа" };
+    const blockedByPlan = await request("/api/mobile/v1/tasks", {
+      method: "POST", token: verified.data.accessToken,
+      headers: { "Idempotency-Key": limitKey }, body: limitBody
+    });
+    assert.equal(blockedByPlan.response.status, 402);
+    assert.equal(blockedByPlan.data.code, "limit_exceeded");
+    assert.equal(await MobileMutationReceipt.exists({ user: verified.data.user._id, key: limitKey }), null);
+
+    const project = await Project.findById(projectId);
+    await Organization.updateOne(
+      { _id: project.organization },
+      { plan: "team", planSource: "manual", planExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) }
+    );
+    const retriedAfterUpgrade = await request("/api/mobile/v1/tasks", {
+      method: "POST", token: verified.data.accessToken,
+      headers: { "Idempotency-Key": limitKey }, body: limitBody
+    });
+    assert.equal(retriedAfterUpgrade.response.status, 201, retriedAfterUpgrade.data.message);
+
     const control = await request(`/api/mobile/v1/control/summary?projectId=${projectId}`, { token: verified.data.accessToken });
     assert.equal(control.data.mode, "team");
 
