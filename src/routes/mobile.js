@@ -205,7 +205,8 @@ function normalizePlatform(value) {
 }
 
 mobileRouter.post("/auth/register", authLimiter, asyncRoute(async (req, res) => {
-  const { name, lastName, email, password, invitationToken } = req.body;
+  const { name, lastName, email, password, invitationToken, termsAccepted, termsVersion } = req.body;
+  if (termsAccepted !== true || termsVersion !== "2026-09-20") throw httpError(400, "Подтвердите актуальное пользовательское соглашение");
   const normalizedEmail = normalizeRegistrationEmail(email);
   if (!name?.trim() || !lastName?.trim() || !normalizedEmail || !password) throw httpError(400, "Name, last name, email and password are required");
   if (!strongPassword(password)) throw httpError(400, "Password must contain at least 8 characters, letters and digits");
@@ -219,7 +220,7 @@ mobileRouter.post("/auth/register", authLimiter, asyncRoute(async (req, res) => 
   });
   const user = new User({
     name: name.trim(), lastName: lastName.trim(), email: normalizedEmail,
-    passwordHash: await bcrypt.hash(password, 12), emailVerificationStatus: "pending"
+    passwordHash: await bcrypt.hash(password, 12), termsAcceptedAt: new Date(), termsVersion, emailVerificationStatus: "pending"
   });
   const verificationToken = await setEmailVerificationToken(user);
   const emailResult = await sendVerificationAndSave(user, verificationToken);

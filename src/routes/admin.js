@@ -11,15 +11,12 @@ import { checkEmailTransport, emailRuntimeConfig } from "../services/email.js";
 import { PLANS } from "../services/plans.js";
 import { addCalendarMonths, applyManualSubscriptionChange } from "../services/subscriptions.js";
 import { overdueTaskFilter } from "../services/taskDeadline.js";
+import { dateKey } from "../services/taskSchedule.js";
 import { EmailJob } from "../models/EmailJob.js";
+import { ProductEvent } from "../models/ProductEvent.js";
+import { ServiceMetric } from "../models/ServiceMetric.js";
 
 export const adminRouter = express.Router();
-
-function daysAgo(days) {
-  const date = new Date();
-  date.setDate(date.getDate() - days);
-  return date;
-}
 
 function daysFromNow(days) {
   const date = new Date();
@@ -29,6 +26,15 @@ function daysFromNow(days) {
 
 function percent(part, total) {
   return total ? Math.round((part / total) * 100) : 0;
+}
+
+function changePercent(current, previous) {
+  if (!previous) return current ? 100 : 0;
+  return Math.round(((current - previous) / previous) * 100);
+}
+
+function countByKey(rows) {
+  return Object.fromEntries(rows.map((row) => [row._id, row.count]));
 }
 
 function escapeRegex(value) {
@@ -137,18 +143,30 @@ adminRouter.get("/email/diagnostics", async (req, res) => {
 });
 
 adminRouter.get("/overview", asyncRoute(async (req, res) => {
-  const periodDays = Number(req.query.periodDays) || 30;
-  const since = daysAgo(periodDays);
-  const activeSince = daysAgo(30);
   const now = new Date();
+  const requestedPeriod = Number(req.query.periodDays);
+  const periodDays = Number.isInteger(requestedPeriod) && requestedPeriod >= 1 && requestedPeriod <= 365
+    ? requestedPeriod
+    : 30;
+  const since = new Date(now.getTime() - periodDays * 24 * 60 * 60 * 1000);
+  const previousSince = new Date(now.getTime() - periodDays * 2 * 24 * 60 * 60 * 1000);
+  const weekSince = new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000);
+  const monthSince = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000);
+  const todayKey = dateKey(now, "Europe/Moscow");
+  const weekKey = dateKey(weekSince, "Europe/Moscow");
+  const monthKey = dateKey(monthSince, "Europe/Moscow");
   const expiresSoon = daysFromNow(14);
+  const regularUsers = { isSuperAdmin: { $ne: true } };
 
   const [
     totalUsers,
-    activeUsers,
-    inactiveUsers,
     blockedUsers,
     newUsers,
+    previousNewUsers,
+    dailyActiveUserIds,
+    weeklyActiveUserIds,
+    monthlyActiveUserIds,
+    analyticsCoverage,
     totalOrganizations,
     organizationsByPlan,
     expiringPaidOrganizations,
@@ -156,47 +174,44 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     manualPlanOrganizations,
     pendingBillingRequests,
     approvedBillingRequests,
-    receivedRevenue,
+    manualRevenueAllTime,
+    manualRevenueInPeriod,
     pendingPaymentOrders,
-    paidPaymentOrdersInPeriod,
-    mockReceivedRevenue,
+    paymentOrdersByStatus,
+    paymentRevenueAllTime,
+    paymentRevenueInPeriod,
+    fiscalizationByStatus,
     totalProjects,
     newProjects,
+    previousNewProjects,
     totalTasks,
     activeTasks,
     closedTasks,
     reviewTasks,
     overdueTasks,
     createdTasks,
+    previousCreatedTasks,
     completedTasks,
+    previousCompletedTasks,
+    emailQueueByStatus,
+    serviceHttpMetrics,
     recentUsers
   ] = await Promise.all([
-    User.countDocuments(),
-    User.countDocuments({
-      $and: [
-        { $or: [{ status: "active" }, { status: { $exists: false } }] },
-        { $or: [{ lastLoginAt: { $gte: activeSince } }, { createdAt: { $gte: activeSince } }] }
-      ]
-    }),
-    User.countDocuments({
-      $or: [
-        { status: "inactive" },
-        {
-          $or: [{ status: "active" }, { status: { $exists: false } }],
-          lastLoginAt: { $exists: true, $lt: activeSince }
-        },
-        {
-          $or: [{ status: "active" }, { status: { $exists: false } }],
-          lastLoginAt: { $exists: false },
-          createdAt: { $lt: activeSince }
-        }
-      ]
-    }),
-    User.countDocuments({ status: "blocked" }),
-    User.countDocuments({ createdAt: { $gte: since } }),
+    User.countDocuments(regularUsers),
+    User.countDocuments({ ...regularUsers, status: "blocked" }),
+    User.countDocuments({ ...regularUsers, createdAt: { $gte: since, $lt: now } }),
+    User.countDocuments({ ...regularUsers, createdAt: { $gte: previousSince, $lt: since } }),
+    ProductEvent.distinct("user", { event: "active_day", day: todayKey }),
+    ProductEvent.distinct("user", { event: "active_day", day: { $gte: weekKey, $lte: todayKey } }),
+    ProductEvent.distinct("user", { event: "active_day", day: { $gte: monthKey, $lte: todayKey } }),
+    ProductEvent.findOne({ event: "active_day" }).sort({ at: 1 }).select("at").lean(),
     Organization.countDocuments(),
     Organization.aggregate([
-      { $group: { _id: "$plan", count: { $sum: 1 } } },
+      { $group: {
+        _id: "$plan",
+        count: { $sum: 1 },
+        activeCount: { $sum: { $cond: [{ $or: [{ $eq: ["$plan", "free"] }, { $gt: ["$planExpiresAt", now] }] }, 1, 0] } }
+      } },
       { $sort: { count: -1 } }
     ]),
     Organization.countDocuments({
@@ -211,40 +226,104 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     BillingRequest.countDocuments({ status: "pending" }),
     BillingRequest.countDocuments({ status: "approved", createdAt: { $gte: since } }),
     BillingRequest.aggregate([
-      { $match: { "payment.status": "paid", "payment.paidAt": { $lte: new Date() }, amount: { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: "$amount" } } }
+      { $match: { "payment.status": "paid", $or: [{ "payment.provider": "manual" }, { "payment.provider": { $exists: false } }], "payment.paidAt": { $lte: now }, amount: { $gt: 0 } } },
+      { $group: { _id: null, amount: { $sum: "$amount" }, count: { $sum: 1 } } }
+    ]),
+    BillingRequest.aggregate([
+      { $match: { "payment.status": "paid", $or: [{ "payment.provider": "manual" }, { "payment.provider": { $exists: false } }], "payment.paidAt": { $gte: since, $lt: now }, amount: { $gt: 0 } } },
+      { $group: { _id: null, amount: { $sum: "$amount" }, count: { $sum: 1 } } }
     ]),
     PaymentOrder.countDocuments({ isOpen: true, status: "awaiting_payment" }),
-    PaymentOrder.countDocuments({ status: "paid", paidAt: { $gte: since } }),
+    PaymentOrder.aggregate([
+      { $match: { createdAt: { $gte: since, $lt: now } } },
+      { $group: { _id: "$status", count: { $sum: 1 } } }
+    ]),
     PaymentOrder.aggregate([
       { $match: { status: "paid", paidAt: { $lte: now }, amountKopecks: { $gt: 0 } } },
-      { $group: { _id: null, totalKopecks: { $sum: "$amountKopecks" } } }
+      { $group: { _id: null, amountKopecks: { $sum: "$amountKopecks" }, count: { $sum: 1 } } }
+    ]),
+    PaymentOrder.aggregate([
+      { $match: { status: "paid", paidAt: { $gte: since, $lt: now }, amountKopecks: { $gt: 0 } } },
+      { $group: { _id: null, amountKopecks: { $sum: "$amountKopecks" }, count: { $sum: 1 } } }
+    ]),
+    PaymentOrder.aggregate([
+      { $match: { status: "paid" } },
+      { $group: { _id: "$fiscalization.status", count: { $sum: 1 } } }
     ]),
     Project.countDocuments(),
-    Project.countDocuments({ createdAt: { $gte: since } }),
+    Project.countDocuments({ createdAt: { $gte: since, $lt: now } }),
+    Project.countDocuments({ createdAt: { $gte: previousSince, $lt: since } }),
     Task.countDocuments(),
     Task.countDocuments({ status: { $ne: "closed" } }),
     Task.countDocuments({ status: "closed" }),
     Task.countDocuments({ status: { $in: ["review", "done"] } }),
     Task.countDocuments({ status: { $ne: "closed" }, ...overdueTaskFilter(now) }),
-    Task.countDocuments({ createdAt: { $gte: since } }),
-    Task.countDocuments({ status: "closed", updatedAt: { $gte: since } }),
-    User.find()
+    Task.countDocuments({ createdAt: { $gte: since, $lt: now } }),
+    Task.countDocuments({ createdAt: { $gte: previousSince, $lt: since } }),
+    Task.countDocuments({ activities: { $elemMatch: { action: "status_changed", to: "closed", createdAt: { $gte: since, $lt: now } } } }),
+    Task.countDocuments({ activities: { $elemMatch: { action: "status_changed", to: "closed", createdAt: { $gte: previousSince, $lt: since } } } }),
+    EmailJob.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+    ServiceMetric.aggregate([
+      { $match: { bucket: { $gte: new Date(now.getTime() - 24 * 60 * 60 * 1000), $lte: now } } },
+      { $group: {
+        _id: null,
+        requests: { $sum: "$requests" },
+        clientErrors: { $sum: "$clientErrors" },
+        serverErrors: { $sum: "$serverErrors" },
+        totalDurationMs: { $sum: "$totalDurationMs" },
+        maxDurationMs: { $max: "$maxDurationMs" }
+      } }
+    ]),
+    User.find(regularUsers)
       .sort({ createdAt: -1 })
       .limit(8)
       .select("name lastName email status isSuperAdmin lastLoginAt createdAt")
       .lean()
   ]);
 
+  const trackedActiveUsers = monthlyActiveUserIds.length
+    ? await User.find({ ...regularUsers, _id: { $in: monthlyActiveUserIds }, status: { $ne: "blocked" } }).select("_id").lean()
+    : [];
+  const trackedActiveIds = new Set(trackedActiveUsers.map((user) => String(user._id)));
+  const monthlyTrackedIds = monthlyActiveUserIds.filter((id) => trackedActiveIds.has(String(id)));
+  const weeklyTrackedIds = weeklyActiveUserIds.filter((id) => trackedActiveIds.has(String(id)));
+  const dailyTrackedIds = dailyActiveUserIds.filter((id) => trackedActiveIds.has(String(id)));
+  const activeUsers = monthlyTrackedIds.length;
+  const inactiveUsers = Math.max(0, totalUsers - activeUsers - blockedUsers);
+  const [activeOrganizations, collaborativeOrganizations] = await Promise.all([
+    monthlyTrackedIds.length
+      ? Organization.countDocuments({ "members.user": { $in: monthlyTrackedIds } })
+      : 0,
+    Organization.countDocuments({ "members.1": { $exists: true } })
+  ]);
   const planBreakdown = organizationsByPlan.map((item) => ({
     plan: item._id || "free",
     organizations: item.count,
-    monthlyRevenue: item.count * (PLANS[item._id]?.monthlyPrice || 0)
+    activeOrganizations: item.activeCount,
+    monthlyRevenue: item.activeCount * (PLANS[item._id]?.monthlyPrice || 0)
   }));
   const estimatedMonthlyRevenue = planBreakdown.reduce((sum, item) => sum + item.monthlyRevenue, 0);
   const paidOrganizations = planBreakdown
     .filter((item) => item.plan !== "free")
-    .reduce((sum, item) => sum + item.organizations, 0);
+    .reduce((sum, item) => sum + item.activeOrganizations, 0);
+  const paymentStatuses = countByKey(paymentOrdersByStatus);
+  const fiscalStatuses = countByKey(fiscalizationByStatus);
+  const emailStatuses = countByKey(emailQueueByStatus);
+  const completedPaymentAttempts = ["paid", "failed", "expired", "cancelled", "refunded"]
+    .reduce((sum, status) => sum + (paymentStatuses[status] || 0), 0);
+  const paidPaymentOrdersInPeriod = paymentStatuses.paid || 0;
+  const paymentRevenuePeriod = (paymentRevenueInPeriod[0]?.amountKopecks || 0) / 100;
+  const manualRevenuePeriod = manualRevenueInPeriod[0]?.amount || 0;
+  const receivedInPeriod = paymentRevenuePeriod + manualRevenuePeriod;
+  const receivedAllTime = (paymentRevenueAllTime[0]?.amountKopecks || 0) / 100 + (manualRevenueAllTime[0]?.amount || 0);
+  const paymentCountInPeriod = (paymentRevenueInPeriod[0]?.count || 0) + (manualRevenueInPeriod[0]?.count || 0);
+  const billingIntegration = billingIntegrationPayload();
+  const httpMetrics = serviceHttpMetrics[0] || {};
+  const averageResponseMs = httpMetrics.requests ? Math.round(httpMetrics.totalDurationMs / httpMetrics.requests) : 0;
+  const serverErrorRate = httpMetrics.requests
+    ? Math.round(httpMetrics.serverErrors / httpMetrics.requests * 1000) / 10
+    : 0;
+  const operationProblems = (fiscalStatuses.failed || 0) + (emailStatuses.failed || 0) + (httpMetrics.serverErrors || 0);
 
   res.json({
     periodDays,
@@ -256,6 +335,17 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       newInPeriod: newUsers,
       activationRate: percent(activeUsers, totalUsers)
     },
+    engagement: {
+      dau: dailyTrackedIds.length,
+      wau: weeklyTrackedIds.length,
+      mau: monthlyTrackedIds.length,
+      dauMau: percent(dailyTrackedIds.length, monthlyTrackedIds.length),
+      wauMau: percent(weeklyTrackedIds.length, monthlyTrackedIds.length),
+      activeOrganizations,
+      collaborativeOrganizations,
+      collaborationRate: percent(collaborativeOrganizations, totalOrganizations),
+      coverageStart: analyticsCoverage?.at || null
+    },
     organizations: {
       total: totalOrganizations,
       paid: paidOrganizations,
@@ -265,17 +355,24 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       byPlan: planBreakdown
     },
     revenue: {
-      received: (receivedRevenue[0]?.total || 0) + (mockReceivedRevenue[0]?.totalKopecks || 0) / 100,
+      received: receivedAllTime,
+      receivedAllTime,
+      receivedInPeriod,
+      averageCheck: paymentCountInPeriod ? Math.round(receivedInPeriod / paymentCountInPeriod) : 0,
       estimatedMonthly: estimatedMonthlyRevenue,
       estimatedAnnual: estimatedMonthlyRevenue * 12,
-      paidConversionRate: percent(paidOrganizations, totalOrganizations)
+      paidConversionRate: percent(paidOrganizations, totalOrganizations),
+      paymentConversionRate: percent(paidPaymentOrdersInPeriod, completedPaymentAttempts)
     },
     billing: {
       pendingRequests: pendingBillingRequests,
       approvedInPeriod: approvedBillingRequests,
       pendingPaymentOrders,
       paidPaymentOrdersInPeriod,
-      integration: billingIntegrationPayload()
+      failedPaymentOrdersInPeriod: (paymentStatuses.failed || 0) + (paymentStatuses.expired || 0),
+      fiscalizationPending: fiscalStatuses.pending || 0,
+      fiscalizationFailed: fiscalStatuses.failed || 0,
+      integration: billingIntegration
     },
     projects: {
       total: totalProjects,
@@ -292,10 +389,25 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       completionRate: percent(closedTasks, totalTasks)
     },
     growth: {
-      newUsers,
-      newProjects,
-      createdTasks,
-      completedTasks
+      newUsers: { current: newUsers, previous: previousNewUsers, change: changePercent(newUsers, previousNewUsers) },
+      newProjects: { current: newProjects, previous: previousNewProjects, change: changePercent(newProjects, previousNewProjects) },
+      createdTasks: { current: createdTasks, previous: previousCreatedTasks, change: changePercent(createdTasks, previousCreatedTasks) },
+      completedTasks: { current: completedTasks, previous: previousCompletedTasks, change: changePercent(completedTasks, previousCompletedTasks) }
+    },
+    operations: {
+      status: !billingIntegration.ready || operationProblems ? "attention" : "healthy",
+      billingReady: billingIntegration.ready,
+      emailQueued: emailStatuses.queued || 0,
+      emailFailed: emailStatuses.failed || 0,
+      fiscalizationPending: fiscalStatuses.pending || 0,
+      fiscalizationFailed: fiscalStatuses.failed || 0,
+      paymentOrdersAwaiting: pendingPaymentOrders,
+      requests24h: httpMetrics.requests || 0,
+      clientErrors24h: httpMetrics.clientErrors || 0,
+      serverErrors24h: httpMetrics.serverErrors || 0,
+      serverErrorRate,
+      averageResponseMs,
+      maxResponseMs: Math.round(httpMetrics.maxDurationMs || 0)
     },
     recentUsers
   });

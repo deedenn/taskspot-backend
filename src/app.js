@@ -14,6 +14,8 @@ import { reportsRouter } from "./routes/reports.js";
 import { tasksRouter } from "./routes/tasks.js";
 import { uploadsRouter } from "./routes/uploads.js";
 import { mobileRouter } from "./routes/mobile.js";
+import { tochkaWebhookRouter } from "./routes/tochkaWebhook.js";
+import { recordHttpMetric } from "./services/serviceMetrics.js";
 
 export function createApp() {
   const app = express();
@@ -43,6 +45,22 @@ export function createApp() {
         return callback(null, false);
       }
     })
+  );
+  if (process.env.NODE_ENV !== "test") {
+    app.use((req, res, next) => {
+      if (!req.path.startsWith("/api") || req.path === "/api/health") return next();
+      const startedAt = process.hrtime.bigint();
+      res.once("finish", () => {
+        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+        recordHttpMetric({ statusCode: res.statusCode, durationMs });
+      });
+      next();
+    });
+  }
+  app.use(
+    "/api/webhooks/tochka/sbp",
+    express.text({ type: ["text/plain", "application/jwt"], limit: "64kb" }),
+    tochkaWebhookRouter
   );
   app.use(express.json({ limit: "1mb" }));
 
@@ -85,7 +103,7 @@ export function createApp() {
       return res.status(400).json({ message: error.message });
     }
 
-    if (error?.statusCode >= 400 && error.statusCode < 500) return res.status(error.statusCode).json({ message: error.message });
+    if (error?.statusCode >= 400 && error.statusCode < 600) return res.status(error.statusCode).json({ message: error.message });
     console.error(error?.stack || error);
     res.status(500).json({ message: "Unexpected server error" });
   });

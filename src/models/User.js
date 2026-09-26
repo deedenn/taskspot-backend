@@ -71,6 +71,8 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: ""
     },
+    termsAcceptedAt: { type: Date },
+    termsVersion: { type: String, default: "" },
     workspaceProvisioningVersion: {
       type: Number,
       default: 0
@@ -93,6 +95,8 @@ userSchema.index({ "passwordReset.tokenHash": 1 }, { sparse: true });
 userSchema.index({ "adminChallenge.id": 1 }, { sparse: true });
 userSchema.index({ emailVerificationTokenHash: 1 });
 userSchema.index({ "emailOutbox.key": 1 }, { sparse: true });
+userSchema.index({ isSuperAdmin: 1, createdAt: -1 });
+userSchema.index({ isSuperAdmin: 1, status: 1 });
 
 userSchema.methods.toJSON = function toJSON() {
   const user = this.toObject();
@@ -105,6 +109,8 @@ userSchema.methods.toJSON = function toJSON() {
   delete user.workspaceProvisioningVersion;
   delete user.personalOrganization;
   delete user.starterProject;
+  delete user.termsAcceptedAt;
+  delete user.termsVersion;
   return user;
 };
 

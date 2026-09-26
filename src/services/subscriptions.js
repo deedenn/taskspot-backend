@@ -5,7 +5,17 @@ import { Organization } from "../models/Organization.js";
 import { PaymentOrder } from "../models/PaymentOrder.js";
 import { Subscription } from "../models/Subscription.js";
 import { SubscriptionPeriod } from "../models/SubscriptionPeriod.js";
+import { User } from "../models/User.js";
+import { activeBillingProvider, providerFor } from "./billingProviders.js";
+import { createSaleReceipt, getReceiptStatus, receiptIdForOrder } from "./digitalKassa.js";
 import { PLANS } from "./planCatalog.js";
+import {
+  createDynamicQr,
+  expectedMerchantId,
+  getQrPaymentStatuses,
+  normalizeIncomingPayment,
+  rublesToKopecks
+} from "./tochkaSbp.js";
 
 const OPEN_ORDER_TTL_MS = 30 * 60 * 1000;
 
@@ -369,7 +379,14 @@ async function expireStaleOpenOrders(organizationId, now, session) {
   } while (order);
 }
 
-export async function createMockPaymentOrder({ organization, userId, targetPlan, periodMonths, idempotencyKey }) {
+async function createPaymentOrderRecord({
+  organization,
+  userId,
+  targetPlan,
+  periodMonths,
+  idempotencyKey,
+  provider = "mock"
+}) {
   const plan = PLANS[targetPlan];
   if (!plan || targetPlan === "free") throw Object.assign(new Error("Выберите платный тариф"), { statusCode: 400 });
   if (![1, 3, 6, 12].includes(periodMonths)) throw Object.assign(new Error("Выберите срок тарифа: 1, 3, 6 или 12 месяцев"), { statusCode: 400 });
@@ -416,7 +433,7 @@ export async function createMockPaymentOrder({ organization, userId, targetPlan,
         throw Object.assign(new Error("Текущий тариф уже действует без ограничения срока"), { statusCode: 409 });
       }
 
-      const providerPaymentId = `mock_${crypto.randomUUID()}`;
+      const providerPaymentId = `${provider}_creating_${crypto.randomUUID()}`;
       const expiresAt = new Date(now.getTime() + OPEN_ORDER_TTL_MS);
       const [created] = await PaymentOrder.create([{
         organization: freshOrganization._id,
@@ -438,13 +455,14 @@ export async function createMockPaymentOrder({ organization, userId, targetPlan,
         idempotencyKey,
         expiresAt,
         payment: {
-          provider: "mock",
-          status: "pending",
+          provider,
+          status: provider === "mock" ? "pending" : "creating",
           providerPaymentId,
           expiresAt
         }
       }], { session });
       order = created;
+      order.$locals.paymentOrderCreated = true;
 
       await recordEvent({
         type: "PaymentOrderCreated",
@@ -460,7 +478,7 @@ export async function createMockPaymentOrder({ organization, userId, targetPlan,
           periodMonths,
           transitionType: order.transitionType,
           amountKopecks: order.amountKopecks,
-          provider: "mock"
+          provider
         },
         session
       });
@@ -482,6 +500,82 @@ export async function createMockPaymentOrder({ organization, userId, targetPlan,
   return order;
 }
 
+export function createMockPaymentOrder(values) {
+  return createPaymentOrderRecord({ ...values, provider: "mock" });
+}
+
+export async function createPaymentOrder(values) {
+  const provider = activeBillingProvider();
+  if (!provider.ready || !["mock", "tochka_sbp"].includes(provider.key)) {
+    throw Object.assign(new Error("Платёжный провайдер временно недоступен"), { statusCode: 503 });
+  }
+  if (provider.key === "mock") return createMockPaymentOrder(values);
+
+  const order = await createPaymentOrderRecord({ ...values, provider: provider.key });
+  if (order.payment.status !== "creating") return order;
+  if (!order.$locals.paymentOrderCreated) return order;
+
+  try {
+    const qr = await createDynamicQr({ order });
+    const updatedOrder = await PaymentOrder.findOneAndUpdate(
+      { _id: order._id, "payment.status": "creating" },
+      {
+        $set: {
+          "payment.status": "pending",
+          "payment.providerPaymentId": qr.qrcId,
+          "payment.qrPayload": qr.qrPayload,
+          "payment.paymentUrl": qr.paymentUrl,
+          "payment.qrImage": qr.qrImage
+        }
+      },
+      { new: true }
+    );
+    if (!updatedOrder) return PaymentOrder.findById(order._id);
+    try {
+      await recordEvent({
+        type: "PaymentQrCreated",
+        aggregateType: "payment_order",
+        aggregateId: updatedOrder._id,
+        organizationId: updatedOrder.organization,
+        actorType: "provider",
+        actorId: provider.key,
+        correlationId: updatedOrder._id,
+        causationId: qr.qrcId,
+        idempotencyKey: `order:${updatedOrder._id}:qr-created`,
+        payload: { provider: provider.key, expiresAt: updatedOrder.expiresAt }
+      });
+    } catch (eventError) {
+      if (eventError.code !== 11000) {
+        console.error("[taskspot:billing-event]", { orderId: String(updatedOrder._id), code: eventError.code || eventError.name });
+      }
+    }
+    return updatedOrder;
+  } catch (error) {
+    await PaymentOrder.updateOne(
+      { _id: order._id, "payment.status": "creating" },
+      { $set: { status: "failed", isOpen: false, "payment.status": "failed" } }
+    );
+    try {
+      await recordEvent({
+        type: "PaymentInitializationFailed",
+        aggregateType: "payment_order",
+        aggregateId: order._id,
+        organizationId: order.organization,
+        actorType: "provider",
+        actorId: provider.key,
+        correlationId: order._id,
+        idempotencyKey: `order:${order._id}:initialization-failed`,
+        payload: { code: error.code || error.name }
+      });
+    } catch (eventError) {
+      if (eventError.code !== 11000) {
+        console.error("[taskspot:billing-event]", { orderId: String(order._id), code: eventError.code || eventError.name });
+      }
+    }
+    throw error;
+  }
+}
+
 async function endCurrentPeriod(currentPeriod, status, now, reason, session) {
   currentPeriod.status = status;
   currentPeriod.endsAt = now;
@@ -494,13 +588,19 @@ export async function fulfillPaidOrder({
   organizationId,
   orderId,
   requestedByUserId = null,
-  expectedProvider = null
+  expectedProvider = null,
+  providerConfirmed = false,
+  paidAt = null,
+  operationId = "",
+  refTransactionId = "",
+  paymentRail = "sbp"
 }) {
   const session = await mongoose.startSession();
   let result;
   try {
     await session.withTransaction(async () => {
-      const now = new Date();
+      const parsedPaidAt = paidAt ? new Date(paidAt) : new Date();
+      const now = Number.isNaN(parsedPaidAt.getTime()) ? new Date() : parsedPaidAt;
       const order = await PaymentOrder.findOne({ _id: orderId, organization: organizationId }).session(session);
       if (!order) throw Object.assign(new Error("Платёж не найден"), { statusCode: 404 });
       if (expectedProvider && order.payment.provider !== expectedProvider) {
@@ -513,10 +613,13 @@ export async function fulfillPaidOrder({
         result = { order, repeated: true };
         return;
       }
-      if (!order.isOpen || order.status !== "awaiting_payment") {
+      const mayRestoreProviderPayment = providerConfirmed
+        && order.payment.provider !== "mock"
+        && ["expired", "cancelled", "failed"].includes(order.status);
+      if ((!order.isOpen || order.status !== "awaiting_payment") && !mayRestoreProviderPayment) {
         throw Object.assign(new Error("Этот платёж уже завершён"), { statusCode: 409 });
       }
-      if (order.expiresAt <= now) {
+      if (order.expiresAt <= now && !providerConfirmed) {
         order.status = "expired";
         order.isOpen = false;
         order.payment.status = "expired";
@@ -610,6 +713,15 @@ export async function fulfillPaidOrder({
       order.paidAt = now;
       order.payment.status = "succeeded";
       order.payment.succeededAt = now;
+      order.payment.operationId = operationId || order.payment.operationId;
+      order.payment.refTransactionId = refTransactionId || order.payment.refTransactionId;
+      order.payment.rail = paymentRail;
+      if (order.payment.provider !== "mock") {
+        order.fiscalization.status = "pending";
+        order.fiscalization.receiptId = order.fiscalization.receiptId || receiptIdForOrder(order._id);
+        order.fiscalization.errorCode = "";
+        order.fiscalization.errorMessage = "";
+      }
       await order.save({ session });
 
       await recordEvent({
@@ -673,7 +785,7 @@ export function confirmMockPayment({ organizationId, orderId }) {
 export async function cancelMockPayment({ organizationId, orderId, userId }) {
   const now = new Date();
   const order = await PaymentOrder.findOneAndUpdate(
-    { _id: orderId, organization: organizationId, isOpen: true },
+    { _id: orderId, organization: organizationId, isOpen: true, "payment.provider": "mock" },
     {
       $set: {
         status: "cancelled",
@@ -696,6 +808,233 @@ export async function cancelMockPayment({ organizationId, orderId, userId }) {
     idempotencyKey: `order:${order._id}:cancelled`
   });
   return order;
+}
+
+export async function handleTochkaPaymentWebhook(payload) {
+  const payment = normalizeIncomingPayment(payload);
+  if (payment.webhookType !== "incomingSbpPayment" || !["sbpPayment", "drPayment"].includes(payment.paymentType)) {
+    return { handled: false, reason: "unsupported_event" };
+  }
+  if (!payment.qrcId || !payment.operationId) {
+    return { handled: false, reason: "incomplete_event" };
+  }
+  if (!payment.merchantId || payment.merchantId !== expectedMerchantId()) {
+    return { handled: false, reason: "merchant_mismatch" };
+  }
+
+  const order = await PaymentOrder.findOne({
+    "payment.provider": "tochka_sbp",
+    "payment.providerPaymentId": payment.qrcId
+  });
+  if (!order) return { handled: false, reason: "order_not_found" };
+
+  const amountKopecks = rublesToKopecks(payment.amountRubles);
+  if (amountKopecks !== order.amountKopecks) {
+    try {
+      await recordEvent({
+        type: "PaymentWebhookRejected",
+        aggregateType: "payment_order",
+        aggregateId: order._id,
+        organizationId: order.organization,
+        actorType: "provider",
+        actorId: "tochka_sbp",
+        correlationId: order._id,
+        causationId: payment.operationId,
+        idempotencyKey: `payment:${payment.operationId}:amount-mismatch`,
+        payload: { expectedAmountKopecks: order.amountKopecks, receivedAmountKopecks: amountKopecks }
+      });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+    }
+    return { handled: false, reason: "amount_mismatch" };
+  }
+
+  const duplicateOperation = await PaymentOrder.findOne({
+    _id: { $ne: order._id },
+    "payment.operationId": payment.operationId
+  }).select("_id").lean();
+  if (duplicateOperation) return { handled: false, reason: "duplicate_operation" };
+
+  const result = await fulfillPaidOrder({
+    organizationId: order.organization,
+    orderId: order._id,
+    expectedProvider: "tochka_sbp",
+    providerConfirmed: true,
+    operationId: payment.operationId,
+    refTransactionId: payment.refTransactionId,
+    paymentRail: payment.paymentType === "drPayment" ? "digital_ruble" : "sbp"
+  });
+
+  try {
+    await fiscalizePaymentOrder(order._id);
+  } catch (error) {
+    console.error("[taskspot:fiscalization]", { orderId: String(order._id), code: error.code || error.name });
+  }
+  return { handled: true, repeated: result.repeated, orderId: order._id };
+}
+
+async function applyQrStatus(order, status) {
+  await PaymentOrder.updateOne(
+    { _id: order._id },
+    { $set: { "payment.lastCheckedAt": new Date() } }
+  );
+  if (status.status === "Accepted" && status.operationId) {
+    const result = await fulfillPaidOrder({
+      organizationId: order.organization,
+      orderId: order._id,
+      expectedProvider: "tochka_sbp",
+      providerConfirmed: true,
+      operationId: status.operationId,
+      paymentRail: status.operationId.length === 36 ? "digital_ruble" : "sbp"
+    });
+    try {
+      await fiscalizePaymentOrder(order._id);
+    } catch (error) {
+      console.error("[taskspot:fiscalization]", { orderId: String(order._id), code: error.code || error.name });
+    }
+    return result.order;
+  }
+  if (status.status === "Rejected" && order.status === "awaiting_payment") {
+    await PaymentOrder.updateOne(
+      { _id: order._id, status: "awaiting_payment" },
+      { $set: { status: "failed", isOpen: false, "payment.status": "failed" } }
+    );
+  }
+  return PaymentOrder.findById(order._id);
+}
+
+export async function reconcileTochkaPaymentOrder(orderOrId) {
+  const order = typeof orderOrId === "object" && orderOrId?._id
+    ? orderOrId
+    : await PaymentOrder.findById(orderOrId);
+  if (!order || order.payment.provider !== "tochka_sbp" || order.status === "paid") return order;
+  const [status] = await getQrPaymentStatuses(order.payment.providerPaymentId);
+  if (!status || status.qrcId !== order.payment.providerPaymentId) {
+    await PaymentOrder.updateOne({ _id: order._id }, { $set: { "payment.lastCheckedAt": new Date() } });
+    return PaymentOrder.findById(order._id);
+  }
+  return applyQrStatus(order, status);
+}
+
+export async function reconcilePendingTochkaPayments(now = new Date()) {
+  const createdAfter = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const checkedBefore = new Date(now.getTime() - 60 * 1000);
+  const orders = await PaymentOrder.find({
+    "payment.provider": "tochka_sbp",
+    "payment.providerPaymentId": { $not: /_creating_/ },
+    status: { $in: ["awaiting_payment", "expired"] },
+    createdAt: { $gte: createdAfter },
+    $or: [
+      { "payment.lastCheckedAt": { $exists: false } },
+      { "payment.lastCheckedAt": { $lte: checkedBefore } }
+    ]
+  }).limit(50);
+  if (!orders.length) return;
+
+  const statuses = await getQrPaymentStatuses(orders.map((order) => order.payment.providerPaymentId));
+  const statusByQr = new Map(statuses.map((status) => [status.qrcId, status]));
+  for (const order of orders) {
+    const status = statusByQr.get(order.payment.providerPaymentId);
+    if (status) await applyQrStatus(order, status);
+    else await PaymentOrder.updateOne({ _id: order._id }, { $set: { "payment.lastCheckedAt": now } });
+  }
+}
+
+export async function fiscalizePaymentOrder(orderId) {
+  const order = await PaymentOrder.findById(orderId);
+  if (!order || order.status !== "paid" || order.payment.provider === "mock") return null;
+  if (order.fiscalization.status === "succeeded") return order;
+
+  const fiscalProvider = providerFor("digitalkassa_sbp");
+  if (!fiscalProvider.ready) {
+    const error = Object.assign(new Error("DigitalKassa не настроена"), { code: "DIGITALKASSA_NOT_CONFIGURED" });
+    order.fiscalization.status = "failed";
+    order.fiscalization.attempts += 1;
+    order.fiscalization.lastAttemptAt = new Date();
+    order.fiscalization.errorCode = error.code;
+    order.fiscalization.errorMessage = error.message;
+    await order.save();
+    throw error;
+  }
+
+  const user = await User.findById(order.requestedBy).select("email").lean();
+  if (!user?.email) {
+    const error = Object.assign(new Error("Не найден email покупателя для чека"), { code: "RECEIPT_EMAIL_MISSING" });
+    order.fiscalization.status = "failed";
+    order.fiscalization.attempts += 1;
+    order.fiscalization.lastAttemptAt = new Date();
+    order.fiscalization.errorCode = error.code;
+    order.fiscalization.errorMessage = error.message;
+    await order.save();
+    throw error;
+  }
+
+  const previousStatus = order.fiscalization.status;
+  const previousAttempts = order.fiscalization.attempts;
+  order.fiscalization.status = "pending";
+  order.fiscalization.receiptId = order.fiscalization.receiptId || receiptIdForOrder(order._id);
+  order.fiscalization.attempts += 1;
+  order.fiscalization.lastAttemptAt = new Date();
+  await order.save();
+
+  try {
+    const result = previousStatus === "pending" && previousAttempts > 0
+      ? await getReceiptStatus(order.fiscalization.receiptId)
+      : await createSaleReceipt({ order, email: user.email });
+    order.fiscalization.status = result.succeeded ? "succeeded" : "pending";
+    order.fiscalization.receiptUrl = result.receiptUrl || order.fiscalization.receiptUrl;
+    order.fiscalization.errorCode = "";
+    order.fiscalization.errorMessage = "";
+    if (result.succeeded) order.fiscalization.completedAt = new Date();
+    await order.save();
+
+    if (result.succeeded) {
+      try {
+        await recordEvent({
+          type: "FiscalReceiptIssued",
+          aggregateType: "payment_order",
+          aggregateId: order._id,
+          organizationId: order.organization,
+          actorType: "provider",
+          actorId: "digitalkassa",
+          correlationId: order._id,
+          causationId: order.payment.operationId || order.payment.providerPaymentId,
+          idempotencyKey: `order:${order._id}:receipt-issued`,
+          payload: { receiptId: result.receiptId, receiptUrl: result.receiptUrl }
+        });
+      } catch (error) {
+        if (error.code !== 11000) throw error;
+      }
+    }
+    return order;
+  } catch (error) {
+    order.fiscalization.status = "failed";
+    order.fiscalization.errorCode = error.code || error.name;
+    order.fiscalization.errorMessage = error.message;
+    await order.save();
+    throw error;
+  }
+}
+
+export async function processPendingFiscalReceipts(now = new Date()) {
+  const retryBefore = new Date(now.getTime() - 5 * 60 * 1000);
+  const orders = await PaymentOrder.find({
+    status: "paid",
+    "payment.provider": { $ne: "mock" },
+    "fiscalization.status": { $in: ["pending", "failed"] },
+    $or: [
+      { "fiscalization.lastAttemptAt": { $exists: false } },
+      { "fiscalization.lastAttemptAt": { $lte: retryBefore } }
+    ]
+  }).select("_id").limit(20).lean();
+
+  for (const order of orders) {
+    try {
+      await fiscalizePaymentOrder(order._id);
+    } catch (error) {
+      console.error("[taskspot:fiscalization]", { orderId: String(order._id), code: error.code || error.name });
+    }
+  }
 }
 
 export async function applyManualSubscriptionChange({ organization, plan, expiresAt, actorId, note = "" }) {

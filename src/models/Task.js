@@ -214,6 +214,7 @@ taskSchema.index({ "recurrence.enabled": 1, status: 1 });
 taskSchema.index({ "recurrence.enabled": 1, "recurrence.nextRunAt": 1 });
 taskSchema.index({ recurrenceKey: 1 }, { unique: true, sparse: true });
 taskSchema.index({ creator: 1, mobileMutationKeys: 1 }, { sparse: true });
+taskSchema.index({ "activities.createdAt": 1 });
 taskSchema.set("optimisticConcurrency", true);
 
 export const Task = mongoose.model("Task", taskSchema);

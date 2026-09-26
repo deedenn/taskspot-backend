@@ -216,8 +216,12 @@ authRouter.get("/invitations/:token", async (req, res) => {
 
 authRouter.post("/register", authLimiter, async (req, res) => {
   try {
-    const { name, lastName, email, password, invitationToken } = req.body;
+    const { name, lastName, email, password, invitationToken, termsAccepted, termsVersion } = req.body;
     const normalizedEmail = normalizeRegistrationEmail(email);
+
+    if (termsAccepted !== true || termsVersion !== "2026-09-20") {
+      return res.status(400).json({ message: "Подтвердите актуальное пользовательское соглашение" });
+    }
 
     if (!name?.trim() || !lastName?.trim() || !normalizedEmail || !password) {
       return res.status(400).json({ message: "Name, last name, email and password are required" });
@@ -252,6 +256,8 @@ authRouter.post("/register", authLimiter, async (req, res) => {
       lastName: lastName.trim(),
       email: normalizedEmail,
       passwordHash,
+      termsAcceptedAt: new Date(),
+      termsVersion,
       emailVerificationStatus: "pending"
     });
     const verificationToken = await setEmailVerificationToken(user);

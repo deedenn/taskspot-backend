@@ -19,21 +19,28 @@
 
 Дата окончания вычисляется календарными месяцами в UTC с ограничением последним днём месяца. Например, месяц после 31 января заканчивается 28 или 29 февраля.
 
-## Тестовая оплата
+## Платёжные контуры
 
-1. `POST /api/organizations/:organizationId/payment-orders` создаёт заказ на 30 минут с провайдером `mock`.
-2. `POST /api/organizations/:organizationId/payment-orders/:orderId/confirm` имитирует подтверждение банка.
-3. Единая функция `fulfillPaidOrder` атомарно фиксирует успешный платёж, создаёт период, обновляет подписку и записывает события.
-4. Повторное подтверждение безопасно и не создаёт второй период.
+1. В `test` и локальной разработке `POST /api/organizations/:organizationId/payment-orders` создаёт заказ с провайдером `mock`.
+2. В production при заполненной конфигурации создаётся динамический QR через Точку (`tochka_sbp`).
+3. `POST /api/organizations/:organizationId/payment-orders/:orderId/confirm` доступен только для mock-контура и отключён для боевых платежей.
+4. Боевой платёж подтверждается подписанным RS256 webhook на `POST /api/webhooks/tochka/sbp`; резервный worker сверяет статус QR через API банка.
+5. После подтверждения создаётся чек прихода в DigitalKassa. Статус чека хранится отдельно и повторяется worker-ом, не откатывая подтверждённый банком тариф.
+6. Единая функция `fulfillPaidOrder` атомарно фиксирует успешный платёж, создаёт период, обновляет подписку и записывает события.
+7. Повторное подтверждение безопасно и не создаёт второй период.
 
-Создавать, подтверждать и отменять заказ могут только `owner` и `admin` организации. Цена берётся из серверного каталога, а не из запроса клиента.
+Создавать заказ могут только `owner` и `admin` организации. Ручное подтверждение и отмена доступны только в mock-контуре; боевой динамический QR живёт до своего `ttl`. Цена берётся из серверного каталога, а не из запроса клиента.
 
 ## События
 
 - `PaymentOrderCreated`
 - `PaymentOrderExpired`
 - `PaymentOrderCancelled`
+- `PaymentQrCreated`
+- `PaymentInitializationFailed`
+- `PaymentWebhookRejected`
 - `PaymentSucceeded`
+- `FiscalReceiptIssued`
 - `SubscriptionPeriodActivated`
 - `SubscriptionRenewed`
 - `SubscriptionUpgraded`
@@ -45,13 +52,13 @@
 
 Каждое событие имеет уникальный `idempotencyKey`, `correlationId`, источник и payload. Платёж и изменение подписки выполняются в одной MongoDB-транзакции.
 
-## Подключение банка и QR
+## Точка и DigitalKassa
 
-Банковская интеграция должна только:
+Точка отвечает за приём оплаты, DigitalKassa — только за фискальный чек. При создании QR сохраняются `qrcId`, `payload` и изображение. Webhook обрабатывается только после проверки подписи, merchant ID, QR ID и точной суммы. Поддерживаются `sbpPayment` и `drPayment`, поскольку Точка может принять цифровой рубль через тот же QR.
 
-1. создать платёж у провайдера и записать в `PaymentOrder.payment` значения `provider`, `providerPaymentId`, `qrPayload`, `paymentUrl` и `expiresAt`;
-2. проверить подпись, сумму, валюту и идентификатор входящего webhook;
-3. найти заказ по паре `payment.provider + payment.providerPaymentId`;
-4. вызвать `fulfillPaidOrder` с ожидаемым провайдером.
+Чек формируется как услуга, полный расчёт, УСН «доходы», без НДС, расчёт в интернете, часовая зона МСК. Идентификатор чека детерминирован от `PaymentOrder`, поэтому повторный запрос не создаёт второй чек.
 
-Тарифные переходы, даты, лимиты и защита от повторного webhook при этом не меняются.
+После deployment:
+
+1. `npm run billing:webhook` — создать или обновить webhook `incomingSbpPayment`.
+2. `npm run billing:check` — проверить доступ к Точке, текущую настройку webhook и доступ к группе DigitalKassa.

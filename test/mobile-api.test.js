@@ -50,7 +50,7 @@ if (!process.env.TEST_MONGODB_URI) {
     const suffix = Date.now().toString(36);
     const registered = await request("/api/mobile/v1/auth/register", {
       method: "POST",
-      body: { name: "Анна", lastName: "Мобильная", email: `mobile_${suffix}@example.com`, password: "password123" }
+      body: { name: "Анна", lastName: "Мобильная", email: `mobile_${suffix}@example.com`, password: "password123", termsAccepted: true, termsVersion: "2026-09-20" }
     });
     assert.equal(registered.response.status, 201, registered.data.message);
     const verified = await request("/api/mobile/v1/auth/email/verify", {

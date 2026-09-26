@@ -9,11 +9,20 @@ import { BillingEvent } from "../models/BillingEvent.js";
 import { PaymentOrder } from "../models/PaymentOrder.js";
 import { Subscription } from "../models/Subscription.js";
 import { SubscriptionPeriod } from "../models/SubscriptionPeriod.js";
-import { expireOpenPaymentOrders, synchronizeExpiredSubscriptions } from "./subscriptions.js";
+import {
+  expireOpenPaymentOrders,
+  processPendingFiscalReceipts,
+  reconcilePendingTochkaPayments,
+  synchronizeExpiredSubscriptions
+} from "./subscriptions.js";
 import { DeviceSession } from "../models/DeviceSession.js";
 import { MobileMutationReceipt } from "../models/MobileMutationReceipt.js";
 import { PushDevice } from "../models/PushDevice.js";
 import { PushJob } from "../models/PushJob.js";
+import { Organization } from "../models/Organization.js";
+import { User } from "../models/User.js";
+import { ServiceMetric } from "../models/ServiceMetric.js";
+import { flushHttpMetrics } from "./serviceMetrics.js";
 import { processPushJob, processPushReceipts } from "./pushWorker.js";
 
 export async function startWorkers() {
@@ -30,7 +39,10 @@ export async function startWorkers() {
     DeviceSession.createIndexes(),
     MobileMutationReceipt.createIndexes(),
     PushDevice.createIndexes(),
-    PushJob.createIndexes()
+    PushJob.createIndexes(),
+    Organization.createIndexes(),
+    User.createIndexes(),
+    ServiceMetric.createIndexes()
   ]);
   let stopped = false;
   const timers = new Set();
@@ -67,15 +79,21 @@ export async function startWorkers() {
     }
     await processPushReceipts();
   }, 5000);
+  loop(flushHttpMetrics, 30000);
   loop(function subscriptionPeriods() {
     return Promise.all([
       synchronizeExpiredSubscriptions(),
-      expireOpenPaymentOrders()
+      expireOpenPaymentOrders(),
+      reconcilePendingTochkaPayments(),
+      processPendingFiscalReceipts()
     ]);
   }, 60000);
   return async () => {
     stopped = true;
     timers.forEach(clearTimeout);
     await Promise.allSettled([...active]);
+    await flushHttpMetrics().catch((error) => {
+      console.error("[taskspot:worker]", { name: "flushHttpMetrics", code: error.code || error.name });
+    });
   };
 }

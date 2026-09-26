@@ -34,7 +34,7 @@ test("registration and invitation outbox survive reload and concurrent drain", {
     return data;
   };
 
-  const registered = await request("/auth/register", { email: "owner@example.com", name: "Owner", lastName: "Test", password: "password123" });
+  const registered = await request("/auth/register", { email: "owner@example.com", name: "Owner", lastName: "Test", password: "password123", termsAccepted: true, termsVersion: "2026-09-20" });
   assert.equal(registered.emailDeliveryStatus, "pending");
   const savedUser = await User.findOne({ email: "owner@example.com" }).select("+emailOutbox");
   assert.ok(savedUser.emailOutbox.mail.text.includes(registered.verificationToken));

@@ -10,6 +10,8 @@
     "tasks:schedule": "node scripts/check-task-schedules.js",
     "email:queue": "node scripts/check-email-queue.js",
     "smtp:check": "node scripts/check-smtp.js",
+    "billing:check": "node scripts/check-billing.js",
+    "billing:webhook": "node scripts/setup-billing-webhook.js",
     "test": "NODE_ENV=test node --test test/*.test.js",
     "test:integration": "node scripts/test-integration.js"
   },

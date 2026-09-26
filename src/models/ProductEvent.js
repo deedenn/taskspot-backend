@@ -7,4 +7,5 @@ const schema = new mongoose.Schema({
 });
 schema.index({ user: 1, event: 1, day: 1 }, { unique: true });
 schema.index({ event: 1, at: 1 });
+schema.index({ at: 1 }, { expireAfterSeconds: 400 * 24 * 60 * 60 });
 export const ProductEvent = mongoose.model("ProductEvent", schema);

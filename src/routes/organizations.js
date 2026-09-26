@@ -2,12 +2,14 @@ import express from "express";
 import { requireRegularUser } from "../middleware/auth.js";
 import { BillingRequest } from "../models/BillingRequest.js";
 import { Organization } from "../models/Organization.js";
-import { billingIntegrationPayload } from "../services/billingProviders.js";
+import { PaymentOrder } from "../models/PaymentOrder.js";
+import { activeBillingProvider, billingIntegrationPayload } from "../services/billingProviders.js";
 import { ensureDefaultOrganization, organizationPayload, PLANS, planFor } from "../services/plans.js";
 import {
   cancelMockPayment,
   confirmMockPayment,
-  createMockPaymentOrder,
+  createPaymentOrder,
+  reconcileTochkaPaymentOrder,
   subscriptionPayload
 } from "../services/subscriptions.js";
 
@@ -96,6 +98,11 @@ function paymentOrderPayload(order) {
     paidAt: order.paidAt,
     cancelledAt: order.cancelledAt,
     payment: order.payment,
+    fiscalization: order.fiscalization ? {
+      status: order.fiscalization.status,
+      receiptUrl: order.fiscalization.receiptUrl,
+      completedAt: order.fiscalization.completedAt
+    } : undefined,
     createdAt: order.createdAt,
     updatedAt: order.updatedAt
   };
@@ -242,7 +249,7 @@ organizationsRouter.post("/:organizationId/payment-orders", asyncRoute(async (re
     return res.status(403).json({ message: "Оплатить тариф может владелец или администратор компании" });
   }
 
-  const order = await createMockPaymentOrder({
+  const order = await createPaymentOrder({
     organization,
     userId: req.user._id,
     targetPlan: req.body.plan,
@@ -252,12 +259,39 @@ organizationsRouter.post("/:organizationId/payment-orders", asyncRoute(async (re
 
   res.status(201).json({
     paymentOrder: paymentOrderPayload(order),
-    testMode: true,
-    message: "Тестовый платёж создан. Подтвердите оплату, чтобы активировать тариф."
+    testMode: order.payment.provider === "mock",
+    message: order.payment.provider === "mock"
+      ? "Тестовый платёж создан. Подтвердите оплату, чтобы активировать тариф."
+      : "QR-код создан. Тариф активируется автоматически после подтверждения оплаты банком."
   });
 }));
 
+organizationsRouter.get("/:organizationId/payment-orders/:orderId", asyncRoute(async (req, res) => {
+  const organization = await Organization.findById(req.params.organizationId);
+  if (!organization || !memberEntry(organization, req.user._id)) {
+    return res.status(404).json({ message: "Компания не найдена" });
+  }
+  let order = await PaymentOrder.findOne({
+    _id: req.params.orderId,
+    organization: organization._id
+  });
+  if (!order) return res.status(404).json({ message: "Платёж не найден" });
+  const lastCheckedAt = order.payment.lastCheckedAt?.getTime() || 0;
+  if (order.status === "awaiting_payment" && order.payment.provider === "tochka_sbp" && Date.now() - lastCheckedAt >= 15000) {
+    try {
+      order = await reconcileTochkaPaymentOrder(order);
+    } catch (error) {
+      console.error("[taskspot:payment-reconciliation]", { orderId: String(order._id), code: error.code || error.name });
+    }
+  }
+  res.json({ paymentOrder: paymentOrderPayload(order) });
+}));
+
 organizationsRouter.post("/:organizationId/payment-orders/:orderId/confirm", asyncRoute(async (req, res) => {
+  const mockAllowed = process.env.NODE_ENV !== "production" || process.env.ALLOW_MOCK_PAYMENTS === "true";
+  if (!mockAllowed || activeBillingProvider().key !== "mock") {
+    return res.status(404).json({ message: "Маршрут недоступен" });
+  }
   const organization = await Organization.findById(req.params.organizationId);
 
   if (!organization || !memberEntry(organization, req.user._id)) {

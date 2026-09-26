@@ -48,7 +48,7 @@ if (!process.env.TEST_MONGODB_URI) {
   async function registerRaw({ name, lastName = "Тестов", email, password = "password123", invitationToken }) {
     const { response, data } = await request("/api/auth/register", {
       method: "POST",
-      body: { name, lastName, email, password, invitationToken }
+      body: { name, lastName, email, password, invitationToken, termsAccepted: true, termsVersion: "2026-09-20" }
     });
 
     assert.equal(response.status, 201, data.message);
@@ -183,6 +183,20 @@ if (!process.env.TEST_MONGODB_URI) {
     if (server) {
       await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }
+  });
+
+  test("registration records acceptance of the current agreement", async () => {
+    const email = `legal_${Date.now()}@example.com`;
+    const rejected = await request("/api/auth/register", { method: "POST", body: {
+      name: "Legal", lastName: "Test", email, password: "password123"
+    } });
+    assert.equal(rejected.response.status, 400);
+
+    await registerRaw({ name: "Legal", email });
+    const { User } = await import("../src/models/User.js");
+    const user = await User.findOne({ email });
+    assert.equal(user.termsVersion, "2026-09-20");
+    assert.ok(user.termsAcceptedAt instanceof Date);
   });
 
   describe("task visibility", () => {
@@ -578,7 +592,9 @@ if (!process.env.TEST_MONGODB_URI) {
           lastName: "Invite",
           email: `wrong_${Date.now()}@example.com`,
           password: "password123",
-          invitationToken: firstInvitation.token
+          invitationToken: firstInvitation.token,
+          termsAccepted: true,
+          termsVersion: "2026-09-20"
         }
       });
       assert.equal(wrongEmail.response.status, 400);
