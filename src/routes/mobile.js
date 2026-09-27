@@ -36,9 +36,25 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: "m
 const ACTIVE_STATUSES = ["open", "in_progress"];
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECEIPT_LEASE_MS = 60 * 1000;
+const MAX_PROFILE_FIELD_LENGTH = 100;
+const MAX_MOBILE_AVATAR_LENGTH = 400_000;
 
 function httpError(statusCode, message, data = {}) {
   return Object.assign(new Error(message), { statusCode, data });
+}
+
+function mobileProfileInput(body) {
+  const name = String(body?.name || "").trim();
+  const lastName = String(body?.lastName || "").trim();
+  const phone = String(body?.phone || "").trim();
+  const avatarUrl = String(body?.avatarUrl || "").trim();
+  if (!name || !lastName) throw httpError(400, "Укажите имя и фамилию");
+  if (name.length > MAX_PROFILE_FIELD_LENGTH || lastName.length > MAX_PROFILE_FIELD_LENGTH) throw httpError(400, "Имя и фамилия должны быть короче 100 символов");
+  if (phone.length > 50) throw httpError(400, "Телефон должен быть короче 50 символов");
+  if (avatarUrl.length > MAX_MOBILE_AVATAR_LENGTH) throw httpError(413, "Изображение аватара слишком большое");
+  const isDataAvatar = /^data:image\/(?:jpeg|png|webp);base64,[a-z0-9+/=]+$/i.test(avatarUrl);
+  if (avatarUrl && !isDataAvatar && !/^https:\/\//i.test(avatarUrl)) throw httpError(400, "Некорректный формат аватара");
+  return { name, lastName, phone, avatarUrl };
 }
 
 function installation(body) {
@@ -281,6 +297,13 @@ mobileRouter.post("/auth/password/reset", authLimiter, asyncRoute(async (req, re
 }));
 
 mobileRouter.use(requireMobileAuth);
+
+mobileRouter.patch("/auth/me", asyncRoute(async (req, res) => {
+  const profile = mobileProfileInput(req.body);
+  req.user.set(profile);
+  await req.user.save();
+  res.json({ user: req.user });
+}));
 
 mobileRouter.post("/auth/logout", asyncRoute(async (req, res) => {
   await revokeMobileSession({ sessionId: req.mobileSession._id });

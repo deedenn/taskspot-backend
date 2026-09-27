@@ -64,6 +64,20 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.ok(verified.data.accessToken);
     assert.ok(verified.data.refreshToken);
 
+    const invalidProfile = await request("/api/mobile/v1/auth/me", {
+      method: "PATCH", token: verified.data.accessToken,
+      body: { name: "Анна", lastName: "", phone: "", avatarUrl: "" }
+    });
+    assert.equal(invalidProfile.response.status, 400);
+    const updatedProfile = await request("/api/mobile/v1/auth/me", {
+      method: "PATCH", token: verified.data.accessToken,
+      body: { name: "Анна", lastName: "Иванова", phone: "+7 999 000-00-00", avatarUrl: "data:image/jpeg;base64,/9j/2Q==" }
+    });
+    assert.equal(updatedProfile.response.status, 200, updatedProfile.data.message);
+    assert.equal(updatedProfile.data.user.lastName, "Иванова");
+    assert.equal(updatedProfile.data.user.phone, "+7 999 000-00-00");
+    assert.equal(updatedProfile.data.user.avatarUrl, "data:image/jpeg;base64,/9j/2Q==");
+
     const createdProject = await request("/api/projects", {
       method: "POST", token: verified.data.accessToken, body: { name: "Mobile project" }
     });
