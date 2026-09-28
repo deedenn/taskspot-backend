@@ -46,7 +46,14 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
+    mustChangePassword: {
+      type: Boolean,
+      default: false
+    },
     lastLoginAt: {
+      type: Date
+    },
+    deletedAt: {
       type: Date
     },
     emailVerifiedAt: {
@@ -111,6 +118,7 @@ userSchema.methods.toJSON = function toJSON() {
   delete user.starterProject;
   delete user.termsAcceptedAt;
   delete user.termsVersion;
+  delete user.deletedAt;
   return user;
 };
 

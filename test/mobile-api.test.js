@@ -20,10 +20,12 @@ if (!process.env.TEST_MONGODB_URI) {
   delete process.env.SMTP_FROM;
 
   const { createApp } = await import("../src/app.js");
+  const { DeviceSession } = await import("../src/models/DeviceSession.js");
   const { MobileMutationReceipt } = await import("../src/models/MobileMutationReceipt.js");
   const { Organization } = await import("../src/models/Organization.js");
   const { Project } = await import("../src/models/Project.js");
   const { Task } = await import("../src/models/Task.js");
+  const { User } = await import("../src/models/User.js");
   let server;
   let baseUrl;
 
@@ -212,5 +214,38 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.equal(refreshed.response.status, 200, refreshed.data.message);
     const reused = await request("/api/mobile/v1/auth/refresh", { method: "POST", body: { refreshToken: verified.data.refreshToken } });
     assert.equal(reused.response.status, 401);
+
+    const missingConfirmation = await request("/api/mobile/v1/auth/me", {
+      method: "DELETE", token: refreshed.data.accessToken, body: { password: "password123", confirmation: "удалить" }
+    });
+    assert.equal(missingConfirmation.response.status, 400);
+    const wrongPassword = await request("/api/mobile/v1/auth/me", {
+      method: "DELETE", token: refreshed.data.accessToken, body: { password: "wrong-password", confirmation: "УДАЛИТЬ" }
+    });
+    assert.equal(wrongPassword.response.status, 403);
+    const deleted = await request("/api/mobile/v1/auth/me", {
+      method: "DELETE", token: refreshed.data.accessToken, body: { password: "password123", confirmation: "УДАЛИТЬ" }
+    });
+    assert.equal(deleted.response.status, 200, deleted.data.message);
+    assert.equal(deleted.data.ok, true);
+
+    const deletedUser = await User.findById(verified.data.user._id);
+    assert.equal(deletedUser.status, "inactive");
+    assert.equal(deletedUser.name, "Удалённый");
+    assert.equal(deletedUser.lastName, "пользователь");
+    assert.equal(deletedUser.phone, "");
+    assert.equal(deletedUser.avatarUrl, "");
+    assert.match(deletedUser.email, /^deleted-.+@deleted\.taskspot\.invalid$/);
+    assert.ok(deletedUser.deletedAt);
+    assert.equal(await DeviceSession.countDocuments({ user: verified.data.user._id }), 0);
+    assert.equal(await Project.countDocuments({ _id: projectId }), 0);
+    assert.equal(await Task.countDocuments({ project: projectId }), 0);
+
+    const afterDeletion = await request("/api/mobile/v1/bootstrap", { token: refreshed.data.accessToken });
+    assert.equal(afterDeletion.response.status, 401);
+    const refreshAfterDeletion = await request("/api/mobile/v1/auth/refresh", {
+      method: "POST", body: { refreshToken: refreshed.data.refreshToken }
+    });
+    assert.equal(refreshAfterDeletion.response.status, 401);
   });
 }

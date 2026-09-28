@@ -49,7 +49,7 @@ export async function resetPassword(token, password, now = new Date()) {
     : "Пароль: от 8 символов, буквы и цифры; не более 72 байт"), { statusCode: 400 });
   const passwordHash = await bcrypt.hash(password, 12);
   return User.findOneAndUpdate({ ...filter, _id: user._id }, {
-    $set: { passwordHash }, $inc: { sessionVersion: 1 }, $unset: { passwordReset: "", adminChallenge: "" }
+    $set: { passwordHash, mustChangePassword: false }, $inc: { sessionVersion: 1 }, $unset: { passwordReset: "", adminChallenge: "" }
   }, { new: true });
 }
 export async function startAdminChallenge(user, now = new Date()) {

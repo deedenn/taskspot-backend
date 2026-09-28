@@ -6,6 +6,13 @@ export function requireSuperAdmin(req, res, next) {
       return res.status(403).json({ message: "Super admin access is required" });
     }
 
+    if (req.user.mustChangePassword) {
+      return res.status(403).json({
+        message: "Смените временный пароль в профиле",
+        requiresPasswordChange: true
+      });
+    }
+
     next();
   });
 }

@@ -354,7 +354,7 @@ authRouter.post("/login", authLimiter, async (req, res) => {
     }
 
     if (user.isSuperAdmin) {
-      if (!strongPassword(password, true)) return res.status(403).json({ message: "Обновите пароль администратора через серверную команду настройки" });
+      if (!strongPassword(password, true) && !user.mustChangePassword) return res.status(403).json({ message: "Обновите пароль администратора через серверную команду настройки" });
       return res.json(await startAdminChallenge(user));
     }
     user.lastLoginAt = new Date();
@@ -419,7 +419,7 @@ authRouter.patch("/password", requireAuth, async (req, res) => {
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
     const changed = await User.updateOne({ _id: req.user._id, passwordHash: req.user.passwordHash }, {
-      $set: { passwordHash }, $inc: { sessionVersion: 1 }, $unset: { passwordReset: "", adminChallenge: "" }
+      $set: { passwordHash, mustChangePassword: false }, $inc: { sessionVersion: 1 }, $unset: { passwordReset: "", adminChallenge: "" }
     });
     if (changed.modifiedCount !== 1) return res.status(409).json({ message: "Пароль уже изменён. Войдите повторно." });
 

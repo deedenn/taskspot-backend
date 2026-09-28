@@ -14,6 +14,7 @@ import { PushJob } from "../models/PushJob.js";
 import { Task, TASK_PRIORITIES } from "../models/Task.js";
 import { User } from "../models/User.js";
 import { strongPassword, requestPasswordReset, resetPassword } from "../services/accountSecurity.js";
+import { deleteAccount } from "../services/accountDeletion.js";
 import { canViewTask, idOf, isProjectAdmin, projectMember, taskFilterForProjects, visibleNotificationFilter } from "../services/taskAccess.js";
 import { limitExceeded, limitPayload, organizationUsage, planFor } from "../services/plans.js";
 import { createMobileSession, requireMobileAuth, revokeMobileSession, rotateMobileSession } from "../services/mobileSessions.js";
@@ -303,6 +304,15 @@ mobileRouter.patch("/auth/me", asyncRoute(async (req, res) => {
   req.user.set(profile);
   await req.user.save();
   res.json({ user: req.user });
+}));
+
+mobileRouter.delete("/auth/me", authLimiter, asyncRoute(async (req, res) => {
+  const password = req.body?.password;
+  if (req.body?.confirmation !== "УДАЛИТЬ") throw httpError(400, "Введите УДАЛИТЬ для подтверждения");
+  if (typeof password !== "string" || !password || Buffer.byteLength(password, "utf8") > 72) throw httpError(400, "Введите пароль от аккаунта");
+  if (!(await bcrypt.compare(password, req.user.passwordHash))) throw httpError(403, "Неверный пароль");
+  const result = await deleteAccount(req.user);
+  res.json({ ok: true, deletedAt: result.deletedAt, ownershipTransfers: result.ownershipTransfers });
 }));
 
 mobileRouter.post("/auth/logout", asyncRoute(async (req, res) => {

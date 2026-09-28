@@ -70,6 +70,26 @@ test("isolated API: reset replay/races, revoked JWT, admin OTP, reports ACL and 
   for (let i = 0; i < 5; i += 1) assert.equal((await request("/auth/login/code", { challengeId: second.data.challengeId, code: wrongCode })).status, 400);
   assert.equal((await request("/auth/login/code", { challengeId: second.data.challengeId, code: secondCode })).status, 400);
 
+  await setupAdmin({ email: admin.email, password: "qwerty12345", rotate: true, temporary: true });
+  assert.equal((await request("/analytics/product", null, adminLogin.data.token)).status, 401);
+  const temporaryStart = await request("/auth/login", { email: admin.email, password: "qwerty12345" });
+  assert.equal(temporaryStart.status, 200);
+  const temporaryChallenge = (await User.findById(admin._id).select("+adminChallenge")).adminChallenge;
+  const temporaryCode = temporaryChallenge.outbox.mail.text.match(/\d{6}/)[0];
+  const temporaryLogin = await request("/auth/login/code", { challengeId: temporaryStart.data.challengeId, code: temporaryCode });
+  assert.equal(temporaryLogin.status, 200);
+  assert.equal(temporaryLogin.data.user.mustChangePassword, true);
+  const forcedProfile = await request("/auth/me", null, temporaryLogin.data.token);
+  assert.equal(forcedProfile.status, 200);
+  assert.equal((await request("/analytics/product", null, temporaryLogin.data.token)).status, 403);
+  const passwordChange = await request("/auth/password", {
+    currentPassword: "qwerty12345",
+    newPassword: "Permanent-admin-456!"
+  }, temporaryLogin.data.token, "PATCH");
+  assert.equal(passwordChange.status, 200);
+  assert.equal((await User.findById(admin._id)).mustChangePassword, false);
+  assert.equal((await request("/auth/me", null, temporaryLogin.data.token)).status, 401);
+
   const outsider = await User.create({ name: "Outsider", email: "other@example.test", passwordHash: "unused" });
   const project = await Project.create({ name: "Shared", createdBy: outsider._id, members: [{ user: outsider._id, role: "admin" }, { user: user._id, role: "member" }] });
   const hidden = await Project.create({ name: "Private", createdBy: outsider._id, members: [{ user: outsider._id, role: "admin" }] });

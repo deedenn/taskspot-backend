@@ -9,6 +9,8 @@ test("password strength rejects bootstrap credentials and bcrypt truncation", ()
   assert.equal(strongPassword("password123"), true);
   assert.equal(strongPassword("password123", true), false);
   assert.equal(strongPassword("Strong-admin-123!", true), true);
+  assert.equal(strongPassword("qwerty12345"), true);
+  assert.equal(strongPassword("qwerty12345", true), false);
 });
 test("session revocation preserves legacy regular tokens but requires admin email proof", () => {
   assert.equal(validSession({}, {}), true);
@@ -87,4 +89,38 @@ test("admin setup never silently promotes existing users or unblocks accounts", 
   t.mock.method(User, "findOne", async () => ({ _id: "user", status: "active", isSuperAdmin: false }));
   await assert.rejects(setupAdmin({ email: "admin@example.test", password: "Strong-admin-123!" }), /--promote/);
   await assert.rejects(setupAdmin({ email: "admin@example.test", password: "qwerty", promote: true }), /ADMIN_PASSWORD/);
+});
+
+test("admin setup rotates a temporary password and revokes existing sessions", async (t) => {
+  t.mock.method(User, "findOne", async () => ({
+    _id: "admin",
+    status: "active",
+    isSuperAdmin: true,
+    passwordHash: "old-hash"
+  }));
+  const update = t.mock.method(User, "updateOne", async () => ({ modifiedCount: 1 }));
+
+  const result = await setupAdmin({
+    email: "admin@example.test",
+    password: "qwerty12345",
+    rotate: true,
+    temporary: true
+  });
+
+  assert.deepEqual(result, { updated: true });
+  const [filter, change] = update.mock.calls[0].arguments;
+  assert.equal(filter.passwordHash, "old-hash");
+  assert.equal(change.$set.mustChangePassword, true);
+  assert.equal(change.$inc.sessionVersion, 1);
+  assert.deepEqual(Object.keys(change.$unset).sort(), ["adminChallenge", "emailOutbox", "passwordReset"]);
+});
+
+test("temporary password cannot create or promote an administrator", async (t) => {
+  t.mock.method(User, "findOne", async () => null);
+  await assert.rejects(setupAdmin({
+    email: "admin@example.test",
+    password: "qwerty12345",
+    rotate: true,
+    temporary: true
+  }), /существующему суперадминистратору/);
 });
