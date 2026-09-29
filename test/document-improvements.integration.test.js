@@ -102,4 +102,12 @@ test("document improvements: global search ACL, assignee control and category ma
   assert.equal(review.status, 200);
   assert.equal(review.data.task.status, "review");
   assert.notEqual((await request("/tasks/" + assigned._id, member, "PATCH", { status: "closed", confirmed: true })).status, 200);
+  assert.equal((await request("/tasks/" + assigned._id, member, "PATCH", { status: "cancelled", confirmed: true })).status, 403);
+  assert.equal((await request("/tasks/" + assigned._id, projectAdmin, "PATCH", { status: "cancelled" })).status, 400);
+  const cancelled = await request("/tasks/" + assigned._id, projectAdmin, "PATCH", { status: "cancelled", confirmed: true });
+  assert.equal(cancelled.status, 200, JSON.stringify(cancelled.data));
+  assert.equal(cancelled.data.task.status, "cancelled");
+  const creatorChangedStatus = await request("/tasks/" + unassigned._id, owner, "PATCH", { status: "open" });
+  assert.equal(creatorChangedStatus.status, 200, JSON.stringify(creatorChangedStatus.data));
+  assert.equal(creatorChangedStatus.data.task.status, "open");
 });

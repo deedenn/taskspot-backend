@@ -67,7 +67,7 @@ projectTemplatesRouter.post("/", route(async (req, res) => {
     const project = await Project.findById(source._id).session(session);
     if (!project || !isAdmin(project, req.user)) throw templateError("Нет доступа к проекту", 403);
     await checkLimits(organization, session, { templates: 1 });
-    const tasks = await Task.find({ project: project._id, status: { $nin: ["closed", "done", "review"] } })
+    const tasks = await Task.find({ project: project._id, status: { $nin: ["closed", "cancelled", "done", "review"] } })
       .sort({ createdAt: 1, _id: 1 }).limit(51).session(session);
     const blueprint = snapshotBlueprint(project, tasks);
     [saved] = await ProjectTemplate.create([{

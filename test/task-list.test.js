@@ -19,11 +19,13 @@ test("invalid pagination and structured query injection return a validation erro
   ]) assert.throws(() => parseTaskListQuery(query), { statusCode: 400 }, JSON.stringify(query));
 });
 
-test("review includes legacy completed tasks; hiding closed never exposes closed tasks", async () => {
+test("review includes legacy completed tasks; hiding terminal tasks excludes closed and cancelled", async () => {
   const project = { categories: [{ _id: "category" }] };
   assert.deepEqual(await taskSearchFilter(project, { status: "review" }), { status: { $in: ["review", "done"] } });
   const closed = await taskSearchFilter(project, { status: "closed", hideClosed: "true" });
   assert.deepEqual(closed._id, { $in: [] });
+  const cancelled = await taskSearchFilter(project, { status: "cancelled", hideClosed: "true" });
+  assert.deepEqual(cancelled._id, { $in: [] });
   await assert.rejects(taskSearchFilter(project, { category: "foreign" }), { statusCode: 400 });
 });
 

@@ -9,11 +9,11 @@ function badQuery(message) {
 
 export async function taskSearchFilter(project, query) {
   const filter = {};
-  if (query.hideClosed === "true") filter.status = { $ne: "closed" };
+  if (query.hideClosed === "true") filter.status = { $nin: ["closed", "cancelled"] };
   if (query.status) {
-    if (!["open", "in_progress", "review", "closed"].includes(query.status)) badQuery("Некорректный статус");
+    if (!["open", "in_progress", "review", "closed", "cancelled"].includes(query.status)) badQuery("Некорректный статус");
     filter.status = query.status === "review" ? { $in: ["review", "done"] } : query.status;
-    if (query.hideClosed === "true" && query.status === "closed") filter._id = { $in: [] };
+    if (query.hideClosed === "true" && ["closed", "cancelled"].includes(query.status)) filter._id = { $in: [] };
   }
   if (query.category) {
     if (!project.categories.some((category) => String(category._id) === query.category)) badQuery("Категория не найдена в проекте");

@@ -42,7 +42,7 @@ async function notifyTaskOnce({ task, project, userId, event, message, dueDate }
 
 export function recurrenceGuard(source) {
   return { _id: source._id, "recurrence.enabled": true, "recurrence.nextRunAt": source.recurrence.nextRunAt,
-    "recurrence.revision": source.recurrence.revision || { $exists: false } };
+    "recurrence.revision": source.recurrence.revision || { $exists: false }, status: { $nin: ["closed", "cancelled"] } };
 }
 
 async function deferRecurrence(source, now, message, assertLease, delay = 3600000) {
@@ -141,7 +141,7 @@ export async function processRecurrence(source, now, {
 
 export async function processRecurrences(now = new Date(), options = {}) {
   const assertLease = options.assertLease || (async () => {});
-  const sources = Task.find({ "recurrence.enabled": true, "recurrence.nextRunAt": { $lte: now },
+  const sources = Task.find({ "recurrence.enabled": true, status: { $nin: ["closed", "cancelled"] }, "recurrence.nextRunAt": { $lte: now },
     $or: [{ "recurrence.retryAt": null }, { "recurrence.retryAt": { $lte: now } }] })
     .sort({ "recurrence.nextRunAt": 1, _id: 1 }).limit(100).cursor();
   try {

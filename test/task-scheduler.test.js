@@ -124,6 +124,7 @@ test("edited/disabled schedules cannot be advanced by an old snapshot", async (t
   assert.equal(h.creates.length, 0);
   assert.equal(h.updates.length, 0);
   assert.equal(recurrenceGuard(source())["recurrence.revision"], "v1");
+  assert.deepEqual(recurrenceGuard(source()).status, { $nin: ["closed", "cancelled"] });
   const legacy = source();
   delete legacy.recurrence.revision;
   assert.deepEqual(recurrenceGuard(legacy)["recurrence.revision"], { $exists: false });

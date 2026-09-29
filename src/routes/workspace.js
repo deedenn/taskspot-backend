@@ -90,7 +90,8 @@ workspaceRouter.get("/assignees", asyncRoute(async (req, res) => {
       open: { $sum: { $cond: [{ $eq: ["$status", "open"] }, 1, 0] } },
       inProgress: { $sum: { $cond: [{ $eq: ["$status", "in_progress"] }, 1, 0] } },
       review: { $sum: { $cond: [{ $in: ["$status", ["review", "done"]] }, 1, 0] } },
-      closed: { $sum: { $cond: [{ $eq: ["$status", "closed"] }, 1, 0] } }
+      closed: { $sum: { $cond: [{ $eq: ["$status", "closed"] }, 1, 0] } },
+      cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }
     } },
     { $sort: { total: -1, _id: 1 } }
   ];

@@ -563,6 +563,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
     assignee,
     observers,
     status: rawStatus,
+    confirmed,
     priority,
     comment,
     checklist,
@@ -616,29 +617,37 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       return res.status(400).json({ message: "Unknown task status" });
     }
 
-    if (status !== req.task.status && req.task.status === "closed") {
+    if (status !== req.task.status && req.task.status === "cancelled") {
+      return res.status(400).json({ message: "Cancelled task status cannot be changed" });
+    }
+
+    if (status !== req.task.status && req.task.status === "closed" && status !== "cancelled") {
       return res.status(400).json({ message: "Closed task status cannot be changed" });
     }
 
-    if (status === "review") {
-      if (!isAssignee) {
-        return res.status(403).json({ message: "Only assignee can send task to review" });
+    if (status === "cancelled") {
+      if (!isAdmin) {
+        return res.status(403).json({ message: "Only project admin can cancel a task" });
       }
 
-      if (req.task.status === "closed") {
-        return res.status(400).json({ message: "Closed task cannot be sent to review" });
+      if (confirmed !== true) {
+        return res.status(400).json({ message: "Task cancellation must be confirmed" });
+      }
+    } else if (status === "review") {
+      if (!isAdmin && !isCreator && !isAssignee) {
+        return res.status(403).json({ message: "Only project admin, task creator or assignee can send task to review" });
       }
     } else if (status === "closed") {
-      if (!isCreator) {
-        return res.status(403).json({ message: "Only task creator can confirm and close the task" });
+      if (!isAdmin && !isCreator) {
+        return res.status(403).json({ message: "Only project admin or task creator can confirm and close the task" });
       }
 
       if (!["review", "done"].includes(req.task.status)) {
         return res.status(400).json({ message: "Only tasks on review can be closed" });
       }
     } else if (["review", "done"].includes(req.task.status) && status === "in_progress") {
-      if (!isCreator) {
-        return res.status(403).json({ message: "Only task creator can send task back to work" });
+      if (!isAdmin && !isCreator) {
+        return res.status(403).json({ message: "Only project admin or task creator can send task back to work" });
       }
 
       if (!comment?.trim()) {
@@ -895,6 +904,17 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       task: req.task._id,
       message: `Задача «${req.task.description}» возвращена на доработку`
     });
+  }
+
+  if (requestedStatus === "cancelled") {
+    const recipients = uniqueUserIds([req.task.creator, req.task.assignee])
+      .filter((recipientId) => recipientId !== asString(userId));
+    await Promise.all(recipients.map((recipientId) => notifyUser({
+      user: recipientId,
+      project: req.project._id,
+      task: req.task._id,
+      message: `Задача «${req.task.description}» отменена`
+    })));
   }
 
   await respondWithTask(res, req.task);

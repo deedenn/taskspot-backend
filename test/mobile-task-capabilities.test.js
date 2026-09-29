@@ -14,7 +14,11 @@ test("mobile capabilities expose only role-valid workflow actions", () => {
   assert.equal(open.canEditFields, false);
 
   const review = mobileTaskCapabilities({ creator, assignee, status: "review" }, project, creator);
-  assert.deepEqual(review.statusTransitions, [{ status: "closed" }, { status: "in_progress", requiresComment: true }]);
+  assert.deepEqual(review.statusTransitions, [
+    { status: "closed" },
+    { status: "in_progress", requiresComment: true },
+    { status: "cancelled", requiresConfirmation: true }
+  ]);
 });
 
 test("mobile capabilities make archived projects read-only", () => {
@@ -30,4 +34,11 @@ test("returning a task requires an initiator comment", () => {
   assert.equal(assertMobileStatusTransition(task, project, creator, "in_progress", "").allowed, false);
   assert.equal(assertMobileStatusTransition(task, project, creator, "in_progress", "Нужно исправить").allowed, true);
   assert.equal(assertMobileStatusTransition(task, project, observer, "closed", "").allowed, false);
+});
+
+test("only project admin can cancel and explicit confirmation is required", () => {
+  const task = { creator, assignee, status: "open" };
+  assert.equal(assertMobileStatusTransition(task, project, creator, "cancelled", "", false).allowed, false);
+  assert.equal(assertMobileStatusTransition(task, project, creator, "cancelled", "", true).allowed, true);
+  assert.equal(assertMobileStatusTransition(task, project, assignee, "cancelled", "", true).allowed, false);
 });

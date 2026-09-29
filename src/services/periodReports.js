@@ -42,7 +42,7 @@ export function buildPeriodReport(tasks, projects, period, now = new Date()) {
     const closed = Number(within(closure, period.start, period.end));
     const previousCreated = Number(within(task.createdAt, period.previousStart, period.start));
     const previousClosed = Number(within(closure, period.previousStart, period.start));
-    const active = Number(!project?.isArchived && !project?.archivedAt && !["closed", "review", "done"].includes(task.status));
+    const active = Number(!project?.isArchived && !project?.archivedAt && !["closed", "cancelled", "review", "done"].includes(task.status));
     const overdue = Number(Boolean(active && isTaskPastDeadline(task, now)));
     const review = Number(!project?.isArchived && !project?.archivedAt && ["review", "done"].includes(task.status));
     const cycleDays = closed && task.createdAt ? Math.max(0, (closure - new Date(task.createdAt)) / DAY) : 0;
@@ -85,7 +85,7 @@ export function reportCsv(report, group) {
   if (!["tasks", "projects", "assignees", "categories", "daily"].includes(group)) throw Object.assign(new Error("Неизвестный вид отчёта"), { statusCode: 400 });
   const rows = group === "tasks" ? report.rows : report[group];
   if (!Array.isArray(rows)) throw Object.assign(new Error("Неизвестный вид отчёта"), { statusCode: 400 });
-  const status = { open: "Открыта", in_progress: "В работе", review: "На проверке", done: "На проверке", closed: "Закрыта" };
+  const status = { open: "Открыта", in_progress: "В работе", review: "На проверке", done: "На проверке", closed: "Закрыта", cancelled: "Отменена" };
   const priority = { low: "Низкий", medium: "Обычный", high: "Высокий", urgent: "Срочный" };
   return "\ufeff" + [Object.values(columns), ...rows.map((row) => Object.keys(columns).map((key) =>
     key === "status" ? status[row[key]] || row[key] : key === "priority" ? priority[row[key]] || row[key] : row[key]

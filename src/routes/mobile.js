@@ -163,6 +163,20 @@ async function ensureNotification({ dedupeKey, user, project, task, kind, messag
 }
 
 async function ensureStatusNotification({ task, project, next, userId, mutationKey }) {
+  if (next === "cancelled") {
+    const recipients = [...new Set([task.creator, task.assignee].map(idOf).filter(Boolean))]
+      .filter((recipientId) => recipientId !== userId);
+    await Promise.all(recipients.map((recipientId) => ensureNotification({
+      dedupeKey: `mobile:${userId}:${mutationKey}:status:task_cancelled:${recipientId}`,
+      user: recipientId,
+      project: project._id,
+      task: task._id,
+      kind: "task_cancelled",
+      message: `Задача «${task.description}» отменена`,
+      data: { taskId: idOf(task) }
+    })));
+    return;
+  }
   let recipient;
   let kind;
   let message;
@@ -333,7 +347,7 @@ mobileRouter.get("/bootstrap", asyncRoute(async (req, res) => {
     Task.countDocuments({ $and: [visible, { dueDate: { $gte: new Date(new Date().setHours(0, 0, 0, 0)), $lt: new Date(new Date().setHours(24, 0, 0, 0)) }, status: { $in: ACTIVE_STATUSES } }] }),
     Task.countDocuments({ $and: [visible, overdueTaskFilter(now), { status: { $in: ACTIVE_STATUSES } }] }),
     Task.countDocuments({ $and: [visible, { status: { $in: ["review", "done"] } }] }),
-    Task.countDocuments({ $and: [visible, { assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }], status: { $ne: "closed" } }] }),
+    Task.countDocuments({ $and: [visible, { assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }], status: { $nin: ["closed", "cancelled"] } }] }),
     Notification.countDocuments({ ...(await visibleNotificationFilter(req.user._id)), read: false })
   ]);
   res.set("Cache-Control", "no-store");
@@ -346,7 +360,7 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
   const scope = req.query.scope || "all";
   const focus = req.query.focus || "active";
   if (!["all", "assigned", "created", "watching"].includes(scope)) throw httpError(400, "Некорректный scope");
-  if (!["all", "active", "today", "overdue", "review", "unassigned", "closed"].includes(focus)) throw httpError(400, "Некорректный focus");
+  if (!["all", "active", "today", "overdue", "review", "unassigned", "closed", "cancelled"].includes(focus)) throw httpError(400, "Некорректный focus");
   const projects = await Project.find({ "members.user": req.user._id }).select("members name").lean();
   const selected = req.query.projectId ? projects.filter((project) => idOf(project) === req.query.projectId) : projects;
   if (req.query.projectId && !selected.length) throw httpError(403, "Нет доступа к проекту");
@@ -361,7 +375,8 @@ mobileRouter.get("/feed", asyncRoute(async (req, res) => {
   if (focus === "overdue") filters.push(overdueTaskFilter(new Date()), { status: { $in: ACTIVE_STATUSES } });
   if (focus === "review") filters.push({ status: { $in: ["review", "done"] } });
   if (focus === "closed") filters.push({ status: "closed" });
-  if (focus === "unassigned") filters.push({ assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }], status: { $ne: "closed" } });
+  if (focus === "cancelled") filters.push({ status: "cancelled" });
+  if (focus === "unassigned") filters.push({ assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }], status: { $nin: ["closed", "cancelled"] } });
   const search = String(req.query.search || "").trim();
   if (search.length > 200) throw httpError(400, "Поиск ограничен 200 символами");
   if (search) filters.push({ description: new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") });
@@ -571,8 +586,8 @@ mobileRouter.patch("/tasks/:taskId/status", asyncRoute(async (req, res) => {
       return { status: 200, body: { task: await populatedTask(task, req.user._id) } };
     }
     if (taskVersion(task) !== expectedVersion(req)) throw httpError(409, "Задача уже изменена", { currentVersion: taskVersion(task), code: "VERSION_CONFLICT" });
-    const transition = assertMobileStatusTransition(task, project, req.user._id, next, req.body.comment);
-    if (!transition.allowed) throw httpError(transition.message.includes("комментарий") ? 400 : 403, transition.message);
+    const transition = assertMobileStatusTransition(task, project, req.user._id, next, req.body.comment, req.body.confirmed);
+    if (!transition.allowed) throw httpError(transition.message.includes("комментарий") || transition.message.includes("Подтвердите") ? 400 : 403, transition.message);
     const previous = task.status;
     task.status = next;
     task.activities.push({ actor: req.user._id, action: "status_changed", from: previous, to: next, details: req.body.comment?.trim() || "" });
@@ -646,10 +661,10 @@ mobileRouter.get("/control/summary", asyncRoute(async (req, res) => {
     Task.countDocuments({ $and: [visible, active] }),
     Task.countDocuments({ $and: [visible, active, overdueTaskFilter(now)] }),
     Task.countDocuments({ $and: [visible, { status: { $in: ["review", "done"] } }] }),
-    Task.countDocuments({ $and: [visible, { status: { $ne: "closed" }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }),
+    Task.countDocuments({ $and: [visible, { status: { $nin: ["closed", "cancelled"] }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }),
     Task.find({ $and: [visible, active, overdueTaskFilter(now)] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ dueDate: 1 }).limit(10).lean(),
     Task.find({ $and: [visible, { status: { $in: ["review", "done"] } }] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").populate("assignee", "name lastName avatarUrl").sort({ updatedAt: -1 }).limit(10).lean(),
-    Task.find({ $and: [visible, { status: { $ne: "closed" }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }).select("description project dueDate dueDateHasTime status priority").populate("project", "name").sort({ updatedAt: -1 }).limit(10).lean(),
+    Task.find({ $and: [visible, { status: { $nin: ["closed", "cancelled"] }, assignee: null, $or: [{ assigneeEmail: null }, { assigneeEmail: "" }] }] }).select("description project dueDate dueDateHasTime status priority").populate("project", "name").sort({ updatedAt: -1 }).limit(10).lean(),
     Task.find({ $and: [visible, active, { dueDate: { $gte: startToday, $lt: endToday } }] }).select("description project assignee dueDate dueDateHasTime status priority").populate("project", "name").sort({ dueDate: 1 }).limit(20).lean(),
     Task.aggregate([
       { $match: visible },

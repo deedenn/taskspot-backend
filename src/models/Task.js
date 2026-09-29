@@ -1,6 +1,6 @@
 import mongoose from "mongoose";
 
-export const TASK_STATUSES = ["open", "in_progress", "review", "done", "closed"];
+export const TASK_STATUSES = ["open", "in_progress", "review", "done", "closed", "cancelled"];
 export const TASK_PRIORITIES = ["low", "medium", "high", "urgent"];
 
 const commentSchema = new mongoose.Schema(

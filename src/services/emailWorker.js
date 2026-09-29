@@ -33,7 +33,7 @@ async function isRelevant(job, now) {
       const task = await Task.findById(context.taskId);
       if (!task || !canViewTask(task, project, context.userId)) return false;
       if (context.kind === "reminder" && (project.isArchived || project.archivedAt ||
-          ["review", "done", "closed"].includes(task.status) || task.dueDate?.toISOString() !== context.dueDate)) return false;
+          ["review", "done", "closed", "cancelled"].includes(task.status) || task.dueDate?.toISOString() !== context.dueDate)) return false;
     }
   }
   if (context.userId && !await User.exists({ _id: context.userId, status: { $ne: "blocked" } })) return false;

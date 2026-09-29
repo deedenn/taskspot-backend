@@ -18,7 +18,7 @@ function idOf(value) {
 }
 
 function isActive(task) {
-  return !["review", "done", "closed"].includes(task.status);
+  return !["review", "done", "closed", "cancelled"].includes(task.status);
 }
 
 function isOverdue(task, now) {
@@ -79,7 +79,7 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
 
   const overdue = tasks.filter((task) => isOverdue(task, now));
   const waitingReview = tasks.filter((task) => ["review", "done"].includes(task.status));
-  const unassigned = tasks.filter((task) => !task.assignee && !task.assigneeEmail && task.status !== "closed");
+  const unassigned = tasks.filter((task) => !task.assignee && !task.assigneeEmail && !["closed", "cancelled"].includes(task.status));
   const month = parsePeriod({});
   const closedThisMonth = tasks.filter((task) => {
     const closed = task.status === "closed";
@@ -98,10 +98,12 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
       active: 0,
       overdue: 0,
       review: 0,
-      closed: 0
+      closed: 0,
+      cancelled: 0
     };
 
     if (task.status === "closed") current.closed += 1;
+    else if (task.status === "cancelled") current.cancelled += 1;
     else current.active += 1;
     if (isOverdue(task, now)) current.overdue += 1;
     if (["review", "done"].includes(task.status)) current.review += 1;
@@ -120,10 +122,12 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
       active: 0,
       overdue: 0,
       review: 0,
-      closed: 0
+      closed: 0,
+      cancelled: 0
     };
 
     if (task.status === "closed") workload.closed += 1;
+    else if (task.status === "cancelled") workload.cancelled += 1;
     else workload.active += 1;
     if (isOverdue(task, now)) workload.overdue += 1;
     if (["review", "done"].includes(task.status)) workload.review += 1;
@@ -140,10 +144,12 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
       active: 0,
       overdue: 0,
       review: 0,
-      closed: 0
+      closed: 0,
+      cancelled: 0
     };
 
     if (task.status === "closed") current.closed += 1;
+    else if (task.status === "cancelled") current.cancelled += 1;
     else current.active += 1;
     if (isOverdue(task, today)) current.overdue += 1;
     if (["review", "done"].includes(task.status)) current.review += 1;
@@ -153,7 +159,7 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
 
   res.json({
     summary: {
-      active: tasks.filter((task) => task.status !== "closed").length,
+      active: tasks.filter((task) => !["closed", "cancelled"].includes(task.status)).length,
       overdue: overdue.length,
       waitingReview: waitingReview.length,
       unassigned: unassigned.length,
@@ -183,7 +189,7 @@ reportsRouter.get("/period", asyncRoute(async (req, res) => {
   const tasks = await Task.find({ $and: [visibility, { $or: [
     { createdAt: { $gte: period.previousStart, $lt: period.end } },
     { activities: { $elemMatch: { action: "status_changed", to: "closed", createdAt: { $gte: period.previousStart, $lt: period.end } } } },
-    { status: { $ne: "closed" } }
+    { status: { $nin: ["closed", "cancelled"] } }
   ] }] }).select("project creator assignee assigneeEmail description createdAt dueDate dueDateHasTime status priority categories activities")
     .populate("assignee", "name lastName email").limit(20001).lean();
   if (tasks.length > 20000) return res.status(413).json({ message: "Отчёт слишком большой. Выберите один проект или сократите период." });

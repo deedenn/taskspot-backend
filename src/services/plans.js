@@ -109,13 +109,17 @@ export async function organizationUsage(organization, { session = null, synchron
   const memberEmails = await User.find({ _id: { $in: [...memberUserIds] } }).distinct("email").session(session);
   memberEmails.forEach((email) => pendingInviteEmails.delete(email));
 
-  const activeTasks = await Task.countDocuments({ project: { $in: activeProjectIds }, status: { $ne: "closed" } }).session(session);
+  const activeTasks = await Task.countDocuments({ project: { $in: activeProjectIds }, status: { $nin: ["closed", "cancelled"] } }).session(session);
   const attachments = await Task.aggregate([
     { $match: { project: { $in: projectIds } } },
     { $project: { count: { $size: "$attachments" } } },
     { $group: { _id: null, total: { $sum: "$count" } } }
   ]).session(session);
-  const recurringTasks = await Task.countDocuments({ project: { $in: activeProjectIds }, "recurrence.enabled": true }).session(session);
+  const recurringTasks = await Task.countDocuments({
+    project: { $in: activeProjectIds },
+    "recurrence.enabled": true,
+    status: { $nin: ["closed", "cancelled"] }
+  }).session(session);
 
   return {
     users: extraMemberUserIds.size + pendingInviteEmails.size,
