@@ -12,8 +12,11 @@ workspaceRouter.use(requireRegularUser);
 const invalid = (message = "Некорректные параметры поиска", statusCode = 400) => Object.assign(new Error(message), { statusCode });
 
 function queryOptions(query) {
-  for (const key of ["q", "projectId", "assignee", "page", "limit"]) {
+  for (const key of ["q", "projectId", "assignee", "page", "limit", "excludeClosed"]) {
     if (query[key] !== undefined && typeof query[key] !== "string") throw invalid();
+  }
+  if (query.excludeClosed !== undefined && !["true", "false"].includes(query.excludeClosed)) {
+    throw invalid("Некорректный фильтр закрытых задач");
   }
   const q = (query.q || "").trim();
   if (q.length > 200) throw invalid("Поиск ограничен 200 символами");
@@ -50,6 +53,7 @@ function publicTaskQuery(filter) {
 
 workspaceRouter.get("/tasks", asyncRoute(async (req, res) => {
   const { options, projects, selected, filters } = await scope(req);
+  if (req.query.excludeClosed === "true") filters.push({ status: { $ne: "closed" } });
   const terms = [...new Set(options.q.split(/\s+/).filter(Boolean))];
   if (terms.length > 12) throw invalid("Введите не более 12 слов");
   if (terms.length) {
@@ -108,7 +112,10 @@ workspaceRouter.get("/assignees", asyncRoute(async (req, res) => {
   const page = Math.min(options.page, Math.max(1, Math.ceil(matchingPeople.length / options.limit)));
   const groups = matchingPeople.slice((page - 1) * options.limit, page * options.limit);
   for (const group of groups) {
-    group.tasks = await publicTaskQuery({ $and: [...filters, assigneeFilter(group.key)] }).limit(10);
+    group.taskTotal = Math.max(0, group.total - group.closed);
+    group.tasks = await publicTaskQuery({
+      $and: [...filters, assigneeFilter(group.key), { status: { $ne: "closed" } }]
+    }).limit(10);
   }
   res.set("Cache-Control", "no-store");
   res.json({ groups, pagination: { page, limit: options.limit, total: matchingPeople.length },

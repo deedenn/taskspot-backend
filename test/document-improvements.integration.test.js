@@ -56,6 +56,7 @@ test("document improvements: global search ACL, assignee control and category ma
   assert.equal((await search("Приватная", owner)).data.pagination.total, 1);
   assert.equal((await search(".*")).data.pagination.total, 0);
   assert.equal((await request("/workspace/tasks?q[x]=1")).status, 400);
+  assert.equal((await request("/workspace/tasks?excludeClosed=invalid")).status, 400);
   assert.equal((await request("/workspace/tasks?projectId=" + hiddenProject._id, member)).status, 403);
   const paged = await request("/workspace/tasks?limit=1", member);
   assert.equal(paged.data.pagination.total, 2);
@@ -67,6 +68,13 @@ test("document improvements: global search ACL, assignee control and category ma
   assert.ok(!JSON.stringify(memberGroups.data).includes(String(hidden._id)));
   const ownerGroups = await request("/workspace/assignees");
   assert.equal(ownerGroups.data.groups.reduce((sum, group) => sum + group.total, 0), 4);
+  const ownerGroup = ownerGroups.data.groups.find((group) => group.key === String(owner._id));
+  assert.equal(ownerGroup.closed, 1);
+  assert.equal(ownerGroup.taskTotal, ownerGroup.total - 1);
+  assert.ok(ownerGroup.tasks.every((task) => task.status !== "closed"));
+  const ownerVisibleTasks = await request("/workspace/tasks?assignee=" + owner._id + "&excludeClosed=true");
+  assert.ok(ownerVisibleTasks.data.tasks.every((task) => task.status !== "closed"));
+  assert.equal(ownerVisibleTasks.data.pagination.total, ownerGroup.taskTotal);
   const filtered = await request("/workspace/assignees?assignee=" + member._id);
   assert.equal(filtered.data.groups.length, 1);
   assert.equal(filtered.data.people.length, ownerGroups.data.people.length);
