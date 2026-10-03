@@ -11,10 +11,28 @@ const fiscalizationSchema = new mongoose.Schema(
     receiptId: { type: String, trim: true, default: "" },
     receiptUrl: { type: String, trim: true, default: "" },
     attempts: { type: Number, default: 0 },
+    automaticAttempts: { type: Number, default: 0 },
     lastAttemptAt: Date,
     completedAt: Date,
+    exhaustedAt: Date,
+    adminNotifiedAt: Date,
+    receiptEmailUsed: { type: String, trim: true, lowercase: true, default: "" },
     errorCode: { type: String, trim: true, default: "" },
-    errorMessage: { type: String, trim: true, default: "" }
+    errorMessage: { type: String, trim: true, default: "" },
+    attemptLog: {
+      type: [{
+        attempt: { type: Number, required: true },
+        trigger: { type: String, enum: ["webhook", "worker", "manual"], required: true },
+        action: { type: String, enum: ["create", "status"], required: true },
+        status: { type: String, enum: ["pending", "succeeded", "failed"], required: true },
+        email: { type: String, trim: true, lowercase: true, default: "" },
+        startedAt: { type: Date, required: true },
+        finishedAt: { type: Date, required: true },
+        errorCode: { type: String, trim: true, default: "" },
+        errorMessage: { type: String, trim: true, default: "" }
+      }],
+      default: []
+    }
   },
   { _id: false }
 );

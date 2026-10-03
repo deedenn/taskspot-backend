@@ -8,7 +8,8 @@ export const EMAIL_JOB_KINDS = Object.freeze([
   "invitation",
   "member_added",
   "task",
-  "reminder"
+  "reminder",
+  "billing_alert"
 ]);
 
 const EMAIL_PATTERN = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
@@ -25,6 +26,7 @@ function requiredContextFields(kind) {
   if (kind === "member_added") return ["projectId", "userId"];
   if (kind === "task") return ["projectId", "taskId", "userId"];
   if (kind === "reminder") return ["projectId", "taskId", "userId", "dueDate"];
+  if (kind === "billing_alert") return ["userId", "orderId"];
   return [];
 }
 

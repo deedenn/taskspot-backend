@@ -1,6 +1,7 @@
 import express from "express";
 import { requireSuperAdmin } from "../middleware/superAdmin.js";
 import { BillingRequest } from "../models/BillingRequest.js";
+import { BillingEvent } from "../models/BillingEvent.js";
 import { PaymentOrder } from "../models/PaymentOrder.js";
 import { PaymentRefund } from "../models/PaymentRefund.js";
 import { Organization } from "../models/Organization.js";
@@ -13,6 +14,9 @@ import { PLANS } from "../services/plans.js";
 import {
   addCalendarMonths,
   applyManualSubscriptionChange,
+  fiscalizationMaxAttempts,
+  fiscalizePaymentOrder,
+  fiscalizePaymentRefund,
   requestPaymentRefund
 } from "../services/subscriptions.js";
 import { overdueTaskFilter } from "../services/taskDeadline.js";
@@ -519,6 +523,52 @@ adminRouter.get("/payment-orders", asyncRoute(async (req, res) => {
       refunds: refundsByOrder.get(order._id.toString()) || []
     })),
     billing: billingIntegrationPayload()
+  });
+}));
+
+adminRouter.get("/payment-orders/:orderId", asyncRoute(async (req, res) => {
+  const order = await PaymentOrder.findById(req.params.orderId)
+    .populate("organization", "name plan planExpiresAt")
+    .populate("requestedBy", "name lastName email")
+    .lean();
+  if (!order) return res.status(404).json({ message: "Платёж не найден" });
+  const [refunds, events] = await Promise.all([
+    PaymentRefund.find({ paymentOrder: order._id })
+      .sort({ createdAt: -1 })
+      .populate("requestedBy", "name lastName email")
+      .lean(),
+    BillingEvent.find({
+      $or: [
+        { aggregateId: order._id },
+        { correlationId: String(order._id) }
+      ]
+    }).sort({ occurredAt: -1 }).limit(100).lean()
+  ]);
+  res.json({ paymentOrder: { ...order, refunds }, events, fiscalizationMaxAttempts: fiscalizationMaxAttempts() });
+}));
+
+adminRouter.post("/payment-orders/:orderId/fiscalization/retry", asyncRoute(async (req, res) => {
+  const order = await PaymentOrder.findById(req.params.orderId);
+  if (!order) return res.status(404).json({ message: "Платёж не найден" });
+  const refundId = String(req.body.refundId || "").trim();
+  const entity = refundId
+    ? await PaymentRefund.findOne({ _id: refundId, paymentOrder: order._id })
+    : order;
+  if (!entity) return res.status(404).json({ message: "Возврат не найден" });
+  if (refundId ? entity.status !== "succeeded" : !["paid", "partially_refunded", "refunded"].includes(order.status)) {
+    return res.status(409).json({ message: "Этот платёж пока нельзя фискализировать" });
+  }
+  if (entity.fiscalization?.status === "succeeded") {
+    return res.status(409).json({ message: "Чек уже сформирован" });
+  }
+  const result = refundId
+    ? await fiscalizePaymentRefund(entity._id, { trigger: "manual" })
+    : await fiscalizePaymentOrder(order._id, { trigger: "manual" });
+  res.json({
+    fiscalization: result.fiscalization,
+    message: result.fiscalization.status === "succeeded"
+      ? "Чек сформирован"
+      : "Повторная фискализация запущена"
   });
 }));
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addCalendarMonths, transitionFor } from "../src/services/subscriptions.js";
+import { addCalendarMonths, fiscalizationMaxAttempts, transitionFor } from "../src/services/subscriptions.js";
 import { limitExceeded } from "../src/services/plans.js";
 import { PLAN_VERSION, PLANS, publicPlan } from "../src/services/planCatalog.js";
 
@@ -36,4 +36,19 @@ test("subscription transition policy distinguishes activation, renewal, upgrade 
   assert.equal(transitionFor("team", "team"), "renew");
   assert.equal(transitionFor("team", "business"), "upgrade");
   assert.equal(transitionFor("business", "team"), "downgrade");
+});
+
+test("fiscalization retries have a bounded configurable limit", () => {
+  const previous = process.env.FISCALIZATION_MAX_ATTEMPTS;
+  try {
+    delete process.env.FISCALIZATION_MAX_ATTEMPTS;
+    assert.equal(fiscalizationMaxAttempts(), 12);
+    process.env.FISCALIZATION_MAX_ATTEMPTS = "4";
+    assert.equal(fiscalizationMaxAttempts(), 4);
+    process.env.FISCALIZATION_MAX_ATTEMPTS = "500";
+    assert.equal(fiscalizationMaxAttempts(), 50);
+  } finally {
+    if (previous === undefined) delete process.env.FISCALIZATION_MAX_ATTEMPTS;
+    else process.env.FISCALIZATION_MAX_ATTEMPTS = previous;
+  }
 });

@@ -957,11 +957,11 @@ if (!process.env.TEST_MONGODB_URI) {
       const owner = await register({ name: "Plan Transition Owner", email: `plan_transition_${Date.now()}@example.com` });
       const organization = await defaultOrganization(owner.token);
 
-      async function pay(plan, key) {
+      async function pay(plan, key, acceptImmediateUpgradeNoCredit = false) {
         const created = await request(`/api/organizations/${organization._id}/payment-orders`, {
           method: "POST",
           token: owner.token,
-          body: { plan, periodMonths: 1, idempotencyKey: key }
+          body: { plan, periodMonths: 1, idempotencyKey: key, acceptImmediateUpgradeNoCredit }
         });
         assert.equal(created.response.status, 201, created.data.message);
         const confirmed = await request(
@@ -973,9 +973,17 @@ if (!process.env.TEST_MONGODB_URI) {
       }
 
       await pay("team", `activate-team-${Date.now()}`);
-      const upgraded = await pay("business", `upgrade-business-${Date.now()}`);
+      const rejectedUpgrade = await request(`/api/organizations/${organization._id}/payment-orders`, {
+        method: "POST",
+        token: owner.token,
+        body: { plan: "business", periodMonths: 1, idempotencyKey: `upgrade-unconfirmed-${Date.now()}` }
+      });
+      assert.equal(rejectedUpgrade.response.status, 400);
+      assert.match(rejectedUpgrade.data.message, /остаток.*не компенсируется/i);
+      const upgraded = await pay("business", `upgrade-business-${Date.now()}`, true);
       assert.equal(upgraded.subscription.currentPlan, "business");
       assert.equal(upgraded.paymentOrder.transitionType, "upgrade");
+      assert.ok(upgraded.paymentOrder.upgradePolicyAcceptedAt);
 
       const downgraded = await pay("team", `downgrade-team-${Date.now()}`);
       assert.equal(downgraded.subscription.currentPlan, "business");

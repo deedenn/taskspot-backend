@@ -125,6 +125,8 @@ function paymentOrderPayload(order) {
     planName: order.planName,
     periodMonths: order.periodMonths,
     transitionType: order.transitionType,
+    upgradePolicyVersion: order.upgradePolicyVersion,
+    upgradePolicyAcceptedAt: order.upgradePolicyAcceptedAt,
     status: order.status,
     amountKopecks: order.amountKopecks,
     currency: order.currency,
@@ -289,7 +291,7 @@ organizationsRouter.post("/:organizationId/payment-orders", asyncRoute(async (re
     targetPlan: req.body.plan,
     periodMonths: Number(req.body.periodMonths),
     idempotencyKey: req.body.idempotencyKey,
-    receiptEmail: req.user.email
+    acceptImmediateUpgradeNoCredit: req.body.acceptImmediateUpgradeNoCredit === true
   });
 
   res.status(201).json({

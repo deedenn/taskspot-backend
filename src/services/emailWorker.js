@@ -56,6 +56,18 @@ export async function evaluateEmailJob(job, now) {
       emailVerifiedAt: null, emailVerificationExpiresAt: { $gt: now }, status: { $ne: "blocked" } }));
     return { send: valid, privacyRejected: false };
   }
+  if (context.kind === "billing_alert") {
+    if (!await recipientIdentityMatches(context.userId, recipient)) return { send: false, privacyRejected: true };
+    return {
+      send: Boolean(await User.exists({
+        _id: context.userId,
+        email: recipient,
+        isSuperAdmin: true,
+        status: "active"
+      })),
+      privacyRejected: false
+    };
+  }
   const project = await Project.findById(context.projectId);
   if (!project) return { send: false, privacyRejected: false };
   if (context.kind === "invitation") {

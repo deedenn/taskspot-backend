@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
+import { PaymentOrder } from "../src/models/PaymentOrder.js";
+import { User } from "../src/models/User.js";
 import { tochkaWebhookRouter } from "../src/routes/tochkaWebhook.js";
 import { billingIntegrationPayload } from "../src/services/billingProviders.js";
 import {
@@ -22,6 +25,7 @@ import {
   upsertWebhookConfiguration,
   verifyWebhookToken
 } from "../src/services/tochkaSbp.js";
+import { fiscalizePaymentOrder } from "../src/services/subscriptions.js";
 
 function withEnvironment(values, callback) {
   const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
@@ -287,6 +291,52 @@ test("DigitalKassa receipt contains agreed tax and service attributes", async ()
     assert.equal(request.options.headers.Authorization, `Basic ${Buffer.from("actor:token").toString("base64")}`);
     assert.equal(result.succeeded, true);
     assert.equal(result.receiptUrl, "https://receipt.example/1");
+  });
+});
+
+test("fiscalization reads the current profile email instead of an order snapshot", async (t) => {
+  await withEnvironment({
+    DIGITALKASSA_API_URL: "https://kassa.example/v2.1",
+    DIGITALKASSA_ACTOR_ID: "actor",
+    DIGITALKASSA_ACTOR_TOKEN: "token",
+    DIGITALKASSA_C_GROUP_ID: "3634"
+  }, async () => {
+    const userId = new mongoose.Types.ObjectId();
+    const order = new PaymentOrder({
+      organization: new mongoose.Types.ObjectId(),
+      requestedBy: userId,
+      targetPlan: "team",
+      planVersion: 2,
+      planName: "Команда",
+      periodMonths: 1,
+      transitionType: "activate",
+      status: "paid",
+      amountKopecks: 99000,
+      priceSnapshot: { plan: "team" },
+      idempotencyKey: "current-email-test",
+      isOpen: false,
+      expiresAt: new Date(Date.now() + 60000),
+      payment: { provider: "tochka_sbp", status: "succeeded", providerPaymentId: "qrc-email" }
+    });
+    t.mock.method(order, "save", async () => order);
+    t.mock.method(PaymentOrder, "findById", async () => order);
+    t.mock.method(User, "findById", () => ({
+      select: () => ({ lean: async () => ({ email: "current@example.com" }) })
+    }));
+    const previousFetch = globalThis.fetch;
+    let body;
+    globalThis.fetch = async (_url, options) => {
+      body = JSON.parse(options.body);
+      return new Response(JSON.stringify({ status: "pending" }), { status: 202 });
+    };
+    try {
+      const result = await fiscalizePaymentOrder(order._id, { trigger: "manual" });
+      assert.deepEqual(body.notify.emails, ["current@example.com"]);
+      assert.equal(result.fiscalization.receiptEmailUsed, "current@example.com");
+      assert.equal(result.fiscalization.attemptLog[0].email, "current@example.com");
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
   });
 });
 

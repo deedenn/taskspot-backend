@@ -8,7 +8,7 @@ const emailPayloadSchema = new mongoose.Schema({
 }, { _id: false, strict: "throw" });
 
 const emailContextSchema = new mongoose.Schema({
-  kind: { type: String, required: true, enum: ["verification", "password_reset", "admin_login", "invitation", "member_added", "task", "reminder"] },
+  kind: { type: String, required: true, enum: ["verification", "password_reset", "admin_login", "invitation", "member_added", "task", "reminder", "billing_alert"] },
   userId: String,
   projectId: String,
   taskId: String,
@@ -16,6 +16,8 @@ const emailContextSchema = new mongoose.Schema({
   token: String,
   tokenHash: String,
   dueDate: String,
+  orderId: String,
+  refundId: String,
   event: String,
   dedupeKey: { type: String, required: true }
 }, { _id: false, strict: "throw" });

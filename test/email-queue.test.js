@@ -169,6 +169,24 @@ test("privacy checks reject a recipient not bound to the user", async (t) => {
   assert.equal(sends, 0);
 });
 
+test("billing alerts are delivered only to the current active super administrator", async (t) => {
+  const worker = mockWorker(t, {
+    context: { kind: "billing_alert", userId: "admin", orderId: "order", dedupeKey: "billing-alert" },
+    mail: validMail("admin@example.com")
+  });
+  const filters = [];
+  User.exists.mock.mockImplementation(async (filter) => {
+    filters.push(filter);
+    if (filter.isSuperAdmin === undefined) return { _id: "admin" };
+    return filter.isSuperAdmin === true && filter.status === "active" ? { _id: "admin" } : null;
+  });
+  let sends = 0;
+  await processEmailJob({ now, send: async () => { sends += 1; } });
+  assert.equal(sends, 1);
+  assert.equal(worker.saved().status, "accepted");
+  assert.ok(filters.some((filter) => filter.isSuperAdmin === true && filter.email === "admin@example.com"));
+});
+
 test("privacy checks reject a task attached to another project", async (t) => {
   const worker = mockWorker(t, {
     context: { kind: "task", userId: "user", projectId: "project", taskId: "task", dedupeKey: "task-mismatch" }

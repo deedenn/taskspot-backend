@@ -16,6 +16,7 @@ import {
   receiptIdForRefund
 } from "./digitalKassa.js";
 import { PLANS } from "./planCatalog.js";
+import { enqueueEmail } from "./emailQueue.js";
 import {
   createDynamicQr,
   expectedMerchantId,
@@ -28,6 +29,13 @@ import {
 
 const OPEN_ORDER_TTL_MS = 30 * 60 * 1000;
 const QR_CREATION_LOCK_MS = 30 * 1000;
+const UPGRADE_NO_CREDIT_POLICY_VERSION = "2026-10-03";
+const FISCALIZATION_RETRY_INTERVAL_MS = 5 * 60 * 1000;
+const FISCALIZATION_LOG_LIMIT = 50;
+
+export function fiscalizationMaxAttempts() {
+  return Math.max(1, Math.min(50, Number(process.env.FISCALIZATION_MAX_ATTEMPTS) || 12));
+}
 
 function querySession(query, session) {
   return session ? query.session(session) : query;
@@ -395,7 +403,7 @@ async function createPaymentOrderRecord({
   targetPlan,
   periodMonths,
   idempotencyKey,
-  receiptEmail = "",
+  acceptImmediateUpgradeNoCredit = false,
   provider = "mock"
 }) {
   const plan = PLANS[targetPlan];
@@ -444,6 +452,13 @@ async function createPaymentOrderRecord({
         throw Object.assign(new Error("Текущий тариф уже действует без ограничения срока"), { statusCode: 409 });
       }
 
+      const transitionType = transitionFor(currentPeriod.plan, targetPlan);
+      if (transitionType === "upgrade" && acceptImmediateUpgradeNoCredit !== true) {
+        throw Object.assign(new Error(
+          "Подтвердите, что новый тариф начнёт действовать сразу, а остаток текущего оплаченного периода не компенсируется"
+        ), { statusCode: 400, code: "UPGRADE_POLICY_NOT_ACCEPTED" });
+      }
+
       const providerPaymentId = `${provider}_creating_${crypto.randomUUID()}`;
       const expiresAt = new Date(now.getTime() + OPEN_ORDER_TTL_MS);
       const [created] = await PaymentOrder.create([{
@@ -453,7 +468,7 @@ async function createPaymentOrderRecord({
         planVersion: plan.version,
         planName: plan.name,
         periodMonths,
-        transitionType: transitionFor(currentPeriod.plan, targetPlan),
+        transitionType,
         amountKopecks: plan.monthlyPriceKopecks * periodMonths,
         currency: "RUB",
         priceSnapshot: {
@@ -464,7 +479,10 @@ async function createPaymentOrderRecord({
           periodMonths
         },
         idempotencyKey,
-        receiptEmail: typeof receiptEmail === "string" ? receiptEmail.trim().toLowerCase() : "",
+        ...(transitionType === "upgrade" ? {
+          upgradePolicyVersion: UPGRADE_NO_CREDIT_POLICY_VERSION,
+          upgradePolicyAcceptedAt: now
+        } : {}),
         expiresAt,
         payment: {
           provider,
@@ -999,7 +1017,7 @@ export async function handleTochkaPaymentWebhook(payload) {
   });
 
   try {
-    await fiscalizePaymentOrder(order._id);
+    await fiscalizePaymentOrder(order._id, { trigger: "webhook" });
   } catch (error) {
     console.error("[taskspot:fiscalization]", { orderId: String(order._id), code: error.code || error.name });
   }
@@ -1087,53 +1105,102 @@ export async function reconcilePendingTochkaPayments(now = new Date()) {
   }
 }
 
-export async function fiscalizePaymentOrder(orderId) {
+function appendFiscalizationAttempt(document, entry) {
+  document.fiscalization.attemptLog = document.fiscalization.attemptLog || [];
+  document.fiscalization.attemptLog.push(entry);
+  if (document.fiscalization.attemptLog.length > FISCALIZATION_LOG_LIMIT) {
+    document.fiscalization.attemptLog.splice(0, document.fiscalization.attemptLog.length - FISCALIZATION_LOG_LIMIT);
+  }
+}
+
+async function notifyFiscalizationExhausted({ order, refund = null }) {
+  try {
+    const entity = refund || order;
+    if (!entity?.fiscalization?.exhaustedAt || entity.fiscalization.adminNotifiedAt) return;
+    const admins = await User.find({ isSuperAdmin: true, status: "active" }).select("_id email name").lean();
+    if (!admins.length) return;
+    const entityLabel = refund ? `возврата ${refund._id}` : `заказа ${order._id}`;
+    const errorText = entity.fiscalization.errorMessage || "DigitalKassa не завершила формирование чека";
+    await Promise.all(admins.map((admin) => enqueueEmail({
+      to: admin.email,
+      subject: `Taskspot: исчерпаны попытки фискализации ${entityLabel}`,
+      text: [
+        `Здравствуйте, ${admin.name || "администратор"}!`,
+        `Исчерпаны автоматические попытки фискализации ${entityLabel}.`,
+        `Организация: ${order.organization}.`,
+        `Ошибка: ${errorText}.`,
+        "Откройте карточку платежа в суперадминке и повторите фискализацию вручную после устранения причины."
+      ].join("\n\n")
+    }, {
+      kind: "billing_alert",
+      userId: String(admin._id),
+      orderId: String(order._id),
+      ...(refund ? { refundId: String(refund._id) } : {}),
+      dedupeKey: `billing:fiscalization-exhausted:${refund ? `refund:${refund._id}` : `order:${order._id}`}:admin:${admin._id}`
+    })));
+    entity.fiscalization.adminNotifiedAt = new Date();
+    await entity.save();
+  } catch (error) {
+    console.error("[taskspot:fiscalization]", {
+      event: "admin_notification_failed",
+      orderId: String(order?._id || ""),
+      refundId: String(refund?._id || ""),
+      code: error.code || error.name
+    });
+  }
+}
+
+function fiscalizationAction(fiscalization) {
+  return fiscalization.status === "pending" && fiscalization.attempts > 0 ? "status" : "create";
+}
+
+export async function fiscalizePaymentOrder(orderId, { trigger = "worker" } = {}) {
   const order = await PaymentOrder.findById(orderId);
-  if (!order || order.status !== "paid" || order.payment.provider === "mock") return null;
+  if (!order || !["paid", "partially_refunded", "refunded"].includes(order.status) || order.payment.provider === "mock") return null;
   if (order.fiscalization.status === "succeeded") return order;
-
-  const fiscalProvider = providerFor("digitalkassa_sbp");
-  if (!fiscalProvider.ready) {
-    const error = Object.assign(new Error("DigitalKassa не настроена"), { code: "DIGITALKASSA_NOT_CONFIGURED" });
-    order.fiscalization.status = "failed";
-    order.fiscalization.attempts += 1;
-    order.fiscalization.lastAttemptAt = new Date();
-    order.fiscalization.errorCode = error.code;
-    order.fiscalization.errorMessage = error.message;
-    await order.save();
-    throw error;
-  }
-
-  const user = order.receiptEmail ? null : await User.findById(order.requestedBy).select("email").lean();
-  const receiptEmail = order.receiptEmail || user?.email || "";
-  if (!receiptEmail) {
-    const error = Object.assign(new Error("Не найден email покупателя для чека"), { code: "RECEIPT_EMAIL_MISSING" });
-    order.fiscalization.status = "failed";
-    order.fiscalization.attempts += 1;
-    order.fiscalization.lastAttemptAt = new Date();
-    order.fiscalization.errorCode = error.code;
-    order.fiscalization.errorMessage = error.message;
-    await order.save();
-    throw error;
-  }
-
-  const previousStatus = order.fiscalization.status;
-  const previousAttempts = order.fiscalization.attempts;
+  const startedAt = new Date();
+  const action = fiscalizationAction(order.fiscalization);
+  const automatic = trigger !== "manual";
   order.fiscalization.status = "pending";
   order.fiscalization.receiptId = order.fiscalization.receiptId || receiptIdForOrder(order._id);
-  order.fiscalization.attempts += 1;
-  order.fiscalization.lastAttemptAt = new Date();
+  order.fiscalization.attempts = (order.fiscalization.attempts || 0) + 1;
+  if (automatic) order.fiscalization.automaticAttempts = (order.fiscalization.automaticAttempts || 0) + 1;
+  order.fiscalization.lastAttemptAt = startedAt;
   await order.save();
 
   try {
-    const result = previousStatus === "pending" && previousAttempts > 0
+    if (!providerFor("digitalkassa_sbp").ready) {
+      throw Object.assign(new Error("DigitalKassa не настроена"), { code: "DIGITALKASSA_NOT_CONFIGURED" });
+    }
+    let receiptEmail = "";
+    if (action === "create") {
+      const user = await User.findById(order.requestedBy).select("email").lean();
+      receiptEmail = user?.email || "";
+      if (!receiptEmail) {
+        throw Object.assign(new Error("Не найден актуальный email покупателя для чека"), { code: "RECEIPT_EMAIL_MISSING" });
+      }
+    }
+    const result = action === "status"
       ? await getReceiptStatus(order.fiscalization.receiptId)
       : await createSaleReceipt({ order, email: receiptEmail });
     order.fiscalization.status = result.succeeded ? "succeeded" : "pending";
     order.fiscalization.receiptUrl = result.receiptUrl || order.fiscalization.receiptUrl;
+    if (receiptEmail) order.fiscalization.receiptEmailUsed = receiptEmail;
     order.fiscalization.errorCode = "";
     order.fiscalization.errorMessage = "";
     if (result.succeeded) order.fiscalization.completedAt = new Date();
+    appendFiscalizationAttempt(order, {
+      attempt: order.fiscalization.attempts,
+      trigger,
+      action,
+      status: result.succeeded ? "succeeded" : "pending",
+      email: receiptEmail,
+      startedAt,
+      finishedAt: new Date()
+    });
+    if (!result.succeeded && automatic && order.fiscalization.automaticAttempts >= fiscalizationMaxAttempts()) {
+      order.fiscalization.exhaustedAt = order.fiscalization.exhaustedAt || new Date();
+    }
     await order.save();
 
     if (result.succeeded) {
@@ -1154,31 +1221,53 @@ export async function fiscalizePaymentOrder(orderId) {
         if (error.code !== 11000) throw error;
       }
     }
+    if (order.fiscalization.exhaustedAt) await notifyFiscalizationExhausted({ order });
     return order;
   } catch (error) {
-    order.fiscalization.status = "failed";
+    order.fiscalization.status = action === "status" ? "pending" : "failed";
     order.fiscalization.errorCode = error.code || error.name;
     order.fiscalization.errorMessage = error.message;
+    appendFiscalizationAttempt(order, {
+      attempt: order.fiscalization.attempts,
+      trigger,
+      action,
+      status: "failed",
+      startedAt,
+      finishedAt: new Date(),
+      errorCode: error.code || error.name,
+      errorMessage: error.message
+    });
+    if (automatic && order.fiscalization.automaticAttempts >= fiscalizationMaxAttempts()) {
+      order.fiscalization.exhaustedAt = order.fiscalization.exhaustedAt || new Date();
+    }
     await order.save();
+    if (order.fiscalization.exhaustedAt) await notifyFiscalizationExhausted({ order });
     throw error;
   }
 }
 
 export async function processPendingFiscalReceipts(now = new Date()) {
-  const retryBefore = new Date(now.getTime() - 5 * 60 * 1000);
+  const retryBefore = new Date(now.getTime() - FISCALIZATION_RETRY_INTERVAL_MS);
+  const maxAttempts = fiscalizationMaxAttempts();
   const orders = await PaymentOrder.find({
     status: { $in: ["paid", "partially_refunded", "refunded"] },
     "payment.provider": { $ne: "mock" },
     "fiscalization.status": { $in: ["pending", "failed"] },
-    $or: [
-      { "fiscalization.lastAttemptAt": { $exists: false } },
-      { "fiscalization.lastAttemptAt": { $lte: retryBefore } }
+    $and: [
+      { $or: [
+        { "fiscalization.automaticAttempts": { $exists: false } },
+        { "fiscalization.automaticAttempts": { $lt: maxAttempts } }
+      ] },
+      { $or: [
+        { "fiscalization.lastAttemptAt": { $exists: false } },
+        { "fiscalization.lastAttemptAt": { $lte: retryBefore } }
+      ] }
     ]
   }).select("_id").limit(20).lean();
 
   for (const order of orders) {
     try {
-      await fiscalizePaymentOrder(order._id);
+      await fiscalizePaymentOrder(order._id, { trigger: "worker" });
     } catch (error) {
       console.error("[taskspot:fiscalization]", { orderId: String(order._id), code: error.code || error.name });
     }
@@ -1287,59 +1376,76 @@ export async function finalizePaymentRefund(refundId, providerStatus = "Accepted
   return result;
 }
 
-export async function fiscalizePaymentRefund(refundId) {
+export async function fiscalizePaymentRefund(refundId, { trigger = "worker" } = {}) {
   const refund = await PaymentRefund.findById(refundId);
   if (!refund || refund.status !== "succeeded") return null;
   if (refund.fiscalization.status === "succeeded") return refund;
   const order = await PaymentOrder.findById(refund.paymentOrder);
   if (!order) throw Object.assign(new Error("Платёж возврата не найден"), { code: "REFUND_ORDER_MISSING" });
-  const fiscalProvider = providerFor("digitalkassa_sbp");
-  if (!fiscalProvider.ready) {
-    const error = Object.assign(new Error("DigitalKassa не настроена"), { code: "DIGITALKASSA_NOT_CONFIGURED" });
-    refund.fiscalization.status = "failed";
-    refund.fiscalization.attempts += 1;
-    refund.fiscalization.lastAttemptAt = new Date();
-    refund.fiscalization.errorCode = error.code;
-    refund.fiscalization.errorMessage = error.message;
-    await refund.save();
-    throw error;
-  }
-  const user = order.receiptEmail ? null : await User.findById(order.requestedBy).select("email").lean();
-  const receiptEmail = order.receiptEmail || user?.email || "";
-  if (!receiptEmail) {
-    const error = Object.assign(new Error("Не найден email покупателя для чека возврата"), { code: "RECEIPT_EMAIL_MISSING" });
-    refund.fiscalization.status = "failed";
-    refund.fiscalization.attempts += 1;
-    refund.fiscalization.lastAttemptAt = new Date();
-    refund.fiscalization.errorCode = error.code;
-    refund.fiscalization.errorMessage = error.message;
-    await refund.save();
-    throw error;
-  }
-
-  const previousStatus = refund.fiscalization.status;
-  const previousAttempts = refund.fiscalization.attempts;
+  const startedAt = new Date();
+  const action = fiscalizationAction(refund.fiscalization);
+  const automatic = trigger !== "manual";
   refund.fiscalization.status = "pending";
   refund.fiscalization.receiptId = refund.fiscalization.receiptId || receiptIdForRefund(refund._id);
-  refund.fiscalization.attempts += 1;
-  refund.fiscalization.lastAttemptAt = new Date();
+  refund.fiscalization.attempts = (refund.fiscalization.attempts || 0) + 1;
+  if (automatic) refund.fiscalization.automaticAttempts = (refund.fiscalization.automaticAttempts || 0) + 1;
+  refund.fiscalization.lastAttemptAt = startedAt;
   await refund.save();
   try {
-    const fiscalResult = previousStatus === "pending" && previousAttempts > 0
+    if (!providerFor("digitalkassa_sbp").ready) {
+      throw Object.assign(new Error("DigitalKassa не настроена"), { code: "DIGITALKASSA_NOT_CONFIGURED" });
+    }
+    let receiptEmail = "";
+    if (action === "create") {
+      const user = await User.findById(order.requestedBy).select("email").lean();
+      receiptEmail = user?.email || "";
+      if (!receiptEmail) {
+        throw Object.assign(new Error("Не найден актуальный email покупателя для чека возврата"), { code: "RECEIPT_EMAIL_MISSING" });
+      }
+    }
+    const fiscalResult = action === "status"
       ? await getReceiptStatus(refund.fiscalization.receiptId)
       : await createRefundReceipt({ order, refund, email: receiptEmail });
     refund.fiscalization.status = fiscalResult.succeeded ? "succeeded" : "pending";
     refund.fiscalization.receiptUrl = fiscalResult.receiptUrl || refund.fiscalization.receiptUrl;
+    if (receiptEmail) refund.fiscalization.receiptEmailUsed = receiptEmail;
     refund.fiscalization.errorCode = "";
     refund.fiscalization.errorMessage = "";
     if (fiscalResult.succeeded) refund.fiscalization.completedAt = new Date();
+    appendFiscalizationAttempt(refund, {
+      attempt: refund.fiscalization.attempts,
+      trigger,
+      action,
+      status: fiscalResult.succeeded ? "succeeded" : "pending",
+      email: receiptEmail,
+      startedAt,
+      finishedAt: new Date()
+    });
+    if (!fiscalResult.succeeded && automatic && refund.fiscalization.automaticAttempts >= fiscalizationMaxAttempts()) {
+      refund.fiscalization.exhaustedAt = refund.fiscalization.exhaustedAt || new Date();
+    }
     await refund.save();
+    if (refund.fiscalization.exhaustedAt) await notifyFiscalizationExhausted({ order, refund });
     return refund;
   } catch (error) {
-    refund.fiscalization.status = "failed";
+    refund.fiscalization.status = action === "status" ? "pending" : "failed";
     refund.fiscalization.errorCode = error.code || error.name;
     refund.fiscalization.errorMessage = error.message;
+    appendFiscalizationAttempt(refund, {
+      attempt: refund.fiscalization.attempts,
+      trigger,
+      action,
+      status: "failed",
+      startedAt,
+      finishedAt: new Date(),
+      errorCode: error.code || error.name,
+      errorMessage: error.message
+    });
+    if (automatic && refund.fiscalization.automaticAttempts >= fiscalizationMaxAttempts()) {
+      refund.fiscalization.exhaustedAt = refund.fiscalization.exhaustedAt || new Date();
+    }
     await refund.save();
+    if (refund.fiscalization.exhaustedAt) await notifyFiscalizationExhausted({ order, refund });
     throw error;
   }
 }
@@ -1525,17 +1631,24 @@ export async function reconcilePendingPaymentRefunds() {
 }
 
 export async function processPendingRefundReceipts(now = new Date()) {
-  const retryBefore = new Date(now.getTime() - 5 * 60 * 1000);
+  const retryBefore = new Date(now.getTime() - FISCALIZATION_RETRY_INTERVAL_MS);
+  const maxAttempts = fiscalizationMaxAttempts();
   const refunds = await PaymentRefund.find({
     status: "succeeded",
     "fiscalization.status": { $in: ["pending", "failed"] },
-    $or: [
-      { "fiscalization.lastAttemptAt": { $exists: false } },
-      { "fiscalization.lastAttemptAt": { $lte: retryBefore } }
+    $and: [
+      { $or: [
+        { "fiscalization.automaticAttempts": { $exists: false } },
+        { "fiscalization.automaticAttempts": { $lt: maxAttempts } }
+      ] },
+      { $or: [
+        { "fiscalization.lastAttemptAt": { $exists: false } },
+        { "fiscalization.lastAttemptAt": { $lte: retryBefore } }
+      ] }
     ]
   }).select("_id").limit(20).lean();
   for (const refund of refunds) {
-    try { await fiscalizePaymentRefund(refund._id); } catch (error) {
+    try { await fiscalizePaymentRefund(refund._id, { trigger: "worker" }); } catch (error) {
       console.error("[taskspot:refund-fiscalization]", { refundId: String(refund._id), code: error.code || error.name });
     }
   }
