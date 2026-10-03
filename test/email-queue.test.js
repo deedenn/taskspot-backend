@@ -5,6 +5,7 @@ import nodemailer from "nodemailer";
 import { EmailJob } from "../src/models/EmailJob.js";
 import { User } from "../src/models/User.js";
 import { Project } from "../src/models/Project.js";
+import { Task } from "../src/models/Task.js";
 import { enqueueEmail } from "../src/services/emailQueue.js";
 import { persistEmailWith, transferEmailIntent } from "../src/services/emailOutbox.js";
 import { processEmailJob, reconcileEmailStatuses, syncEmailStatus } from "../src/services/emailWorker.js";
@@ -12,6 +13,10 @@ import { deliverMail, sendEmailVerificationEmail } from "../src/services/email.j
 
 const now = new Date("2026-09-01T10:00:00Z");
 const finished = new Date("2026-09-01T10:03:00Z");
+const validMail = (to = "test@example.com") => ({ to, subject: "Test", text: "Test message" });
+const verificationContext = (overrides = {}) => ({
+  kind: "verification", userId: "user", tokenHash: "token-hash", dedupeKey: "verification-test", ...overrides
+});
 
 test("verification token and email intent are saved together; private outbox is not serialized", async (t) => {
   const user = new User({ name: "Test", email: "test@example.com", passwordHash: "hash", emailVerificationTokenHash: "token-hash" });
@@ -23,7 +28,8 @@ test("verification token and email intent are saved together; private outbox is 
     return user;
   });
   const result = await sendEmailVerificationEmail({ email: user.email, name: user.name, verificationUrl: "https://example.com/secret-link",
-    context: { kind: "verification", dedupeKey: "verify-user-token" }, dispatch: persistEmailWith(user, "emailOutbox") });
+    context: { kind: "verification", userId: "user", tokenHash: "token-hash", dedupeKey: "verify-user-token" },
+    dispatch: persistEmailWith(user, "emailOutbox") });
   assert.equal(result.queued, true);
   assert.equal(saves, 1);
   assert.equal(user.emailOutbox.context.dedupeKey, "verify-user-token");
@@ -43,7 +49,7 @@ test("a failed queue insert leaves the durable source intent for the next worker
   let clears = 0;
   const Model = { updateOne: async () => { clears += 1; } };
   await assert.rejects(transferEmailIntent(Model, { _id: "user", "emailOutbox.key": "key" }, "emailOutbox",
-    { mail: {}, context: { dedupeKey: "key" } }));
+    { mail: validMail(), context: verificationContext({ dedupeKey: "key" }) }));
   assert.equal(clears, 0);
 });
 
@@ -62,7 +68,7 @@ test("crash after queue insert is recovered with the same dedupe key and message
     assert.deepEqual(update, { $unset: { emailOutbox: "" } });
     if (++clears === 1) throw new Error("crash before clearing");
   } };
-  const intent = { mail: { to: "test@example.com" }, context: { dedupeKey: "key" } };
+  const intent = { mail: validMail(), context: verificationContext({ dedupeKey: "key" }) };
   await assert.rejects(transferEmailIntent(Model, filter, "emailOutbox", intent));
   await transferEmailIntent(Model, filter, "emailOutbox", intent);
   assert.equal(stored.size, 1);
@@ -72,19 +78,19 @@ test("crash after queue insert is recovered with the same dedupe key and message
 test("deduplicated accepted and failed jobs do not falsely report queued", async (t) => {
   for (const status of ["accepted", "failed", "cancelled", "processing"]) {
     const mock = t.mock.method(EmailJob, "findOneAndUpdate", async () => ({ _id: "job", status }));
-    const result = await enqueueEmail({}, { dedupeKey: "same" });
+    const result = await enqueueEmail(validMail(), verificationContext({ dedupeKey: "same" }));
     assert.equal(result.queued, status === "processing");
     assert.equal(result.failed, ["failed", "cancelled"].includes(status));
     mock.mock.restore();
   }
   t.mock.method(EmailJob, "findOneAndUpdate", async () => { throw { code: 11000 }; });
   t.mock.method(EmailJob, "findOne", async () => ({ _id: "job", status: "accepted" }));
-  assert.equal((await enqueueEmail({}, { dedupeKey: "same" })).status, "accepted");
+  assert.equal((await enqueueEmail(validMail(), verificationContext({ dedupeKey: "same" }))).status, "accepted");
 });
 
 function mockWorker(t, overrides = {}, loseLock = false) {
   const job = { _id: "job", messageId: "<stable@taskspot.ru>", attempts: 1,
-    context: {}, mail: { to: "test@example.com", text: "secret-token" }, ...overrides };
+    context: verificationContext(), mail: { to: "test@example.com", subject: "Test", text: "secret-token" }, ...overrides };
   let saved;
   let claim;
   t.mock.method(EmailJob, "findOneAndUpdate", (filter, update, options) => {
@@ -99,6 +105,7 @@ function mockWorker(t, overrides = {}, loseLock = false) {
   });
   t.mock.method(EmailJob, "updateOne", async () => ({}));
   t.mock.method(User, "updateOne", async () => ({}));
+  t.mock.method(User, "exists", async () => ({ _id: "user" }));
   t.mock.method(Project, "updateOne", async () => ({}));
   return { saved: () => saved, claim: () => claim };
 }
@@ -111,8 +118,8 @@ test("temporary SMTP errors retry after completion, not after claim time", async
 });
 
 test("database relevance failures do not consume SMTP attempts or discard the job", async (t) => {
-  const worker = mockWorker(t, { context: { kind: "verification" } });
-  t.mock.method(User, "exists", async () => { throw new Error("database unavailable, secret"); });
+  const worker = mockWorker(t);
+  User.exists.mock.mockImplementation(async () => { throw new Error("database unavailable, secret"); });
   let sends = 0;
   await processEmailJob({ now, clock: () => finished, send: async () => { sends += 1; } });
   assert.equal(sends, 0);
@@ -132,12 +139,73 @@ test("expired leases can be reclaimed; a lost lock cannot publish success", asyn
 });
 
 test("revoked invitations are cancelled without sending their link", async (t) => {
-  const worker = mockWorker(t, { context: { kind: "invitation", projectId: "project", invitationId: "invite", token: "old" } });
-  t.mock.method(Project, "findById", async () => ({ invitations: { id: () => ({ status: "pending", token: "new", expiresAt: finished }) } }));
+  const worker = mockWorker(t, { context: { kind: "invitation", projectId: "project", invitationId: "invite", token: "old",
+    dedupeKey: "invite" } });
+  t.mock.method(Project, "findById", async () => ({ invitations: { id: () => ({ status: "pending", token: "new",
+    email: "test@example.com", expiresAt: finished }) } }));
   await processEmailJob({ now, send: async () => assert.fail("revoked invitation sent") });
   assert.equal(worker.saved().status, "cancelled");
+  assert.equal(worker.saved().lastErrorCode, "");
   const filter = Project.updateOne.mock.calls[0].arguments[0];
   assert.equal(filter.invitations.$elemMatch.token, "old");
+});
+
+test("privacy checks reject an unknown job type", async (t) => {
+  let sends = 0;
+  const worker = mockWorker(t, { context: { kind: "unknown", dedupeKey: "unknown" } });
+  await processEmailJob({ now, send: async () => { sends += 1; } });
+  assert.equal(worker.saved().status, "cancelled");
+  assert.equal(worker.saved().lastErrorCode, "EMAIL_PRIVACY_REJECTED");
+  assert.equal(sends, 0);
+});
+
+test("privacy checks reject a recipient not bound to the user", async (t) => {
+  let sends = 0;
+  const worker = mockWorker(t, { context: verificationContext({ dedupeKey: "wrong-address" }),
+    mail: validMail("stranger@example.com") });
+  User.exists.mock.mockImplementation(async (filter) => filter.email === "owner@example.com" ? { _id: "user" } : null);
+  await processEmailJob({ now, send: async () => { sends += 1; } });
+  assert.equal(worker.saved().status, "cancelled");
+  assert.equal(sends, 0);
+});
+
+test("privacy checks reject a task attached to another project", async (t) => {
+  const worker = mockWorker(t, {
+    context: { kind: "task", userId: "user", projectId: "project", taskId: "task", dedupeKey: "task-mismatch" }
+  });
+  t.mock.method(Project, "findById", async () => ({ _id: "project", members: [{ user: "user", role: "admin" }] }));
+  t.mock.method(Task, "findById", async () => ({ _id: "task", project: "other-project", creator: "user", observers: [] }));
+  let sends = 0;
+  await processEmailJob({ now, send: async () => { sends += 1; } });
+  assert.equal(worker.saved().status, "cancelled");
+  assert.equal(worker.saved().lastErrorCode, "EMAIL_PRIVACY_REJECTED");
+  assert.equal(sends, 0);
+});
+
+test("task email checks the matching user preference before delivery", async (t) => {
+  const worker = mockWorker(t, {
+    context: { kind: "task", userId: "user", projectId: "project", taskId: "task", event: "task_comment",
+      dedupeKey: "comment-preference" }
+  });
+  t.mock.method(Project, "findById", async () => ({ _id: "project", members: [{ user: "user", role: "member" }] }));
+  t.mock.method(Task, "findById", async () => ({ _id: "task", project: "project", creator: "user", observers: [] }));
+  let preferenceFilter;
+  User.exists.mock.mockImplementation(async (filter) => {
+    if (filter["emailPreferences.comments"]) { preferenceFilter = filter; return null; }
+    return { _id: "user" };
+  });
+  let sends = 0;
+  await processEmailJob({ now, send: async () => { sends += 1; } });
+  assert.deepEqual(preferenceFilter["emailPreferences.comments"], { $ne: false });
+  assert.equal(worker.saved().status, "cancelled");
+  assert.equal(sends, 0);
+});
+
+test("queue rejects multiple recipients and incomplete privacy context", async () => {
+  await assert.rejects(enqueueEmail(validMail("one@example.com,two@example.com"), verificationContext()),
+    (error) => error.code === "EMAIL_RECIPIENT_INVALID");
+  await assert.rejects(enqueueEmail(validMail(), { kind: "task", userId: "user" }),
+    (error) => error.code === "EMAIL_CONTEXT_INVALID");
 });
 
 test("one failed status reconciliation does not stop following jobs", async (t) => {
@@ -167,16 +235,18 @@ test("SMTP acceptance is checked, transport closed, and logs contain no subject 
   const logs = [];
   for (const method of ["info", "error", "warn"]) t.mock.method(console, method, (...args) => logs.push(JSON.stringify(args)));
   let closes = 0;
-  let accepted = false;
+  let accepted = [];
   t.mock.method(nodemailer, "createTransport", () => ({
-    sendMail: async (mail) => { assert.equal(mail.subject, "private-subject"); return { accepted: accepted ? [mail.to] : [], messageId: mail.messageId }; },
+    sendMail: async (mail) => { assert.equal(mail.subject, "private-subject"); return { accepted, messageId: mail.messageId }; },
     close: () => { closes += 1; }
   }));
   const mail = { to: "test@example.com", subject: "private-subject", text: "secret-token", messageId: "<stable@taskspot.ru>" };
   await assert.rejects(deliverMail(mail), (error) => error.responseCode === 550);
-  accepted = true;
+  accepted = ["other@example.com"];
+  await assert.rejects(deliverMail(mail), (error) => error.responseCode === 550);
+  accepted = [mail.to];
   const result = await deliverMail(mail);
   assert.equal(result.messageId, mail.messageId);
-  assert.equal(closes, 2);
+  assert.equal(closes, 3);
   assert.doesNotMatch(logs.join("\n"), /private-subject|secret-token|secret-password/);
 });

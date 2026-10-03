@@ -37,7 +37,7 @@ async function notifyTaskOnce({ task, project, userId, event, message, dueDate }
   await sendTaskNotificationEmail({ email: user.email, projectName: project.name, taskDescription: task.description,
     message, taskUrl: `${baseUrl.replace(/\/$/, "")}/app/tasks/${task._id}`,
     context: { kind: dueDate ? "reminder" : "task", userId: idOf(user), projectId: idOf(project), taskId: idOf(task),
-      dueDate, dedupeKey: `notification:${notification._id}` } });
+      dueDate, event, dedupeKey: `notification:${notification._id}` } });
 }
 
 export function recurrenceGuard(source) {

@@ -75,13 +75,17 @@ export function receiptIdForOrder(orderId) {
   return `taskspot${String(orderId).replace(/[^a-zA-Z0-9]/g, "")}`.slice(0, 64);
 }
 
-export function buildSaleReceipt({ order, email }) {
-  const amountRubles = order.amountKopecks / 100;
+export function receiptIdForRefund(refundId) {
+  return `taskspotrefund${String(refundId).replace(/[^a-zA-Z0-9]/g, "")}`.slice(0, 64);
+}
+
+function receiptBody({ type, name, amountKopecks, email }) {
+  const amountRubles = amountKopecks / 100;
   return {
-    type: 1,
+    type,
     items: [{
       type: 4,
-      name: `Доступ к веб-сервису Taskspot по тарифу ${order.planName}`.slice(0, 128),
+      name: name.slice(0, 128),
       price: amountRubles,
       quantity: 1,
       amount: amountRubles,
@@ -96,6 +100,24 @@ export function buildSaleReceipt({ order, email }) {
     notify: { emails: [email] },
     loc: { billing_place: configuration().billingPlace }
   };
+}
+
+export function buildSaleReceipt({ order, email }) {
+  return receiptBody({
+    type: 1,
+    name: `Доступ к веб-сервису Taskspot по тарифу ${order.planName}`,
+    amountKopecks: order.amountKopecks,
+    email
+  });
+}
+
+export function buildRefundReceipt({ order, refund, email }) {
+  return receiptBody({
+    type: 2,
+    name: `Возврат оплаты доступа к веб-сервису Taskspot по тарифу ${order.planName}`,
+    amountKopecks: refund.amountKopecks,
+    email
+  });
 }
 
 function normalizedResult(receiptId, response) {
@@ -114,6 +136,16 @@ export async function createSaleReceipt({ order, email, fetchImpl = fetch }) {
   const response = await request(
     `/c_groups/${encodeURIComponent(config.groupId)}/receipts/${encodeURIComponent(receiptId)}`,
     { method: "POST", body: buildSaleReceipt({ order, email }), fetchImpl }
+  );
+  return normalizedResult(receiptId, response);
+}
+
+export async function createRefundReceipt({ order, refund, email, fetchImpl = fetch }) {
+  const config = configuration();
+  const receiptId = refund.fiscalization?.receiptId || receiptIdForRefund(refund._id);
+  const response = await request(
+    `/c_groups/${encodeURIComponent(config.groupId)}/receipts/${encodeURIComponent(receiptId)}`,
+    { method: "POST", body: buildRefundReceipt({ order, refund, email }), fetchImpl }
   );
   return normalizedResult(receiptId, response);
 }

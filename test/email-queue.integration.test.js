@@ -65,9 +65,13 @@ test("registration and invitation outbox survive reload and concurrent drain", {
   await processEmailJob({ send: async () => { sends += 1; } });
   assert.equal((await Project.findById(project._id)).invitations[0].emailStatus, "sent");
 
+  const currentProject = await Project.findById(project._id);
+  const currentInvitation = currentProject.invitations[0];
   const recovered = await EmailJob.create({
     dedupeKey: "interrupted-worker", messageId: "<interrupted@taskspot.ru>",
-    mail: { to: "test@example.com" }, status: "processing", attempts: 1,
+    mail: { to: currentInvitation.email, subject: "Invitation", text: "Invitation" },
+    context: { kind: "invitation", projectId: String(project._id), invitationId: String(currentInvitation._id),
+      token: currentInvitation.token, dedupeKey: "interrupted-worker" }, status: "processing", attempts: 1,
     leaseUntil: new Date(Date.now() - 1000), lockToken: "expired-lock"
   });
   await processEmailJob({ send: async (mail) => assert.equal(mail.messageId, recovered.messageId) });

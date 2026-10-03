@@ -1,12 +1,62 @@
 import crypto from "node:crypto";
 import { EmailJob } from "../models/EmailJob.js";
 
+export const EMAIL_JOB_KINDS = Object.freeze([
+  "verification",
+  "password_reset",
+  "admin_login",
+  "invitation",
+  "member_added",
+  "task",
+  "reminder"
+]);
+
+const EMAIL_PATTERN = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
+
+export function normalizeSingleEmailRecipient(value) {
+  if (typeof value !== "string") return "";
+  const recipient = value.trim().toLowerCase();
+  return recipient.length <= 254 && EMAIL_PATTERN.test(recipient) ? recipient : "";
+}
+
+function requiredContextFields(kind) {
+  if (["verification", "password_reset", "admin_login"].includes(kind)) return ["userId", "tokenHash"];
+  if (kind === "invitation") return ["projectId", "invitationId", "token"];
+  if (kind === "member_added") return ["projectId", "userId"];
+  if (kind === "task") return ["projectId", "taskId", "userId"];
+  if (kind === "reminder") return ["projectId", "taskId", "userId", "dueDate"];
+  return [];
+}
+
+export function validateEmailJob(mail, context = {}) {
+  const recipient = normalizeSingleEmailRecipient(mail?.to);
+  if (!recipient || mail?.cc !== undefined || mail?.bcc !== undefined) {
+    throw Object.assign(new Error("Email job must have exactly one recipient"), { code: "EMAIL_RECIPIENT_INVALID" });
+  }
+  if (typeof mail.subject !== "string" || !mail.subject.trim() ||
+      ![mail.text, mail.html].some((value) => typeof value === "string" && value.length)) {
+    throw Object.assign(new Error("Email job content is invalid"), { code: "EMAIL_CONTENT_INVALID" });
+  }
+  if (!EMAIL_JOB_KINDS.includes(context.kind) ||
+      requiredContextFields(context.kind).some((field) => typeof context[field] !== "string" || !context[field])) {
+    throw Object.assign(new Error("Email job context is invalid"), { code: "EMAIL_CONTEXT_INVALID" });
+  }
+  return {
+    to: recipient,
+    subject: mail.subject.trim(),
+    ...(typeof mail.text === "string" ? { text: mail.text } : {}),
+    ...(typeof mail.html === "string" ? { html: mail.html } : {})
+  };
+}
+
 export async function enqueueEmail(mail, context = {}) {
   const dedupeKey = context.dedupeKey || crypto.randomUUID();
+  const normalizedContext = { ...context, dedupeKey };
+  const normalizedMail = validateEmailJob(mail, normalizedContext);
   let job;
   try {
     job = await EmailJob.findOneAndUpdate({ dedupeKey }, { $setOnInsert: {
-      dedupeKey, mail, context,
+      dedupeKey, mail: normalizedMail, context: normalizedContext,
       messageId: `<${crypto.createHash("sha256").update(dedupeKey).digest("hex")}@taskspot.ru>`
     } }, { upsert: true, new: true, setDefaultsOnInsert: true });
   } catch (error) {

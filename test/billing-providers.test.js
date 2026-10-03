@@ -3,11 +3,22 @@ import crypto from "node:crypto";
 import test from "node:test";
 import jwt from "jsonwebtoken";
 import { tochkaWebhookRouter } from "../src/routes/tochkaWebhook.js";
-import { buildSaleReceipt, createSaleReceipt, receiptIdForOrder } from "../src/services/digitalKassa.js";
+import { billingIntegrationPayload } from "../src/services/billingProviders.js";
+import {
+  buildRefundReceipt,
+  buildSaleReceipt,
+  createRefundReceipt,
+  createSaleReceipt,
+  receiptIdForOrder,
+  receiptIdForRefund
+} from "../src/services/digitalKassa.js";
 import {
   createDynamicQr,
+  getRefundStatus,
   getQrPaymentStatuses,
+  normalizeIncomingPayment,
   rublesToKopecks,
+  startRefund,
   upsertWebhookConfiguration,
   verifyWebhookToken
 } from "../src/services/tochkaSbp.js";
@@ -55,6 +66,34 @@ test("Tochka creates a dynamic SBP QR and normalizes the response", async () => 
     assert.equal(result.qrcId, "qrc-1");
     assert.equal(result.paymentUrl, "https://qr.example/pay");
     assert.equal(result.qrImage, "data:image/png;base64,aW1hZ2U=");
+  });
+});
+
+test("production billing readiness requires Tochka, DigitalKassa, HTTPS webhook and workers", async () => {
+  await withEnvironment({
+    NODE_ENV: "production",
+    BILLING_PROVIDER: "tochka_sbp",
+    TOCHKA_JWT_TOKEN: "jwt-token",
+    TOCHKA_CLIENT_ID: "client-id",
+    TOCHKA_MERCHANT_ID: "merchant-id",
+    TOCHKA_ACCOUNT_ID: "40802810920000021178",
+    TOCHKA_BIC: "044525104",
+    DIGITALKASSA_ACTOR_ID: "actor",
+    DIGITALKASSA_ACTOR_TOKEN: "token",
+    DIGITALKASSA_C_GROUP_ID: "3634",
+    BILLING_WEBHOOK_URL: "https://api.taskspot.ru/api/webhooks/tochka/sbp",
+    BACKGROUND_WORKERS_ENABLED: "true"
+  }, async () => {
+    assert.equal(billingIntegrationPayload().ready, true);
+    process.env.BACKGROUND_WORKERS_ENABLED = "false";
+    const stoppedWorkers = billingIntegrationPayload();
+    assert.equal(stoppedWorkers.ready, false);
+    assert.ok(stoppedWorkers.missing.includes("фоновые workers"));
+    process.env.BACKGROUND_WORKERS_ENABLED = "true";
+    process.env.BILLING_WEBHOOK_URL = "http://api.taskspot.ru/webhook";
+    const insecureWebhook = billingIntegrationPayload();
+    assert.equal(insecureWebhook.ready, false);
+    assert.ok(insecureWebhook.missing.includes("HTTPS webhook"));
   });
 });
 
@@ -132,6 +171,58 @@ test("money parsing is exact and rejects ambiguous amounts", () => {
   assert.equal(rublesToKopecks("1.001"), null);
 });
 
+test("Tochka webhook preserves payment purpose for order recovery", () => {
+  const payload = normalizeIncomingPayment({
+    Data: {
+      webhookType: "incomingSbpPayment",
+      paymentType: "sbpPayment",
+      qrcId: "qrc-1",
+      purpose: "Доступ к Taskspot. Заказ 507f1f77bcf86cd799439011. НДС не облагается"
+    }
+  });
+  assert.equal(payload.purpose, "Доступ к Taskspot. Заказ 507f1f77bcf86cd799439011. НДС не облагается");
+});
+
+test("Tochka starts and checks a partial SBP refund", async () => {
+  await withEnvironment({
+    TOCHKA_API_URL: "https://tochka.example/uapi",
+    TOCHKA_JWT_TOKEN: "jwt-token",
+    TOCHKA_MERCHANT_ID: "merchant-1",
+    TOCHKA_ACCOUNT_ID: "40802810920000021178",
+    TOCHKA_BIC: "044525104"
+  }, async () => {
+    const requests = [];
+    const order = {
+      _id: "507f1f77bcf86cd799439011",
+      payment: { providerPaymentId: "qrc-1", refTransactionId: "ref-1", operationId: "trx-1" }
+    };
+    const refund = await startRefund({
+      order,
+      amountKopecks: 12345,
+      reason: "Возврат по обращению клиента",
+      fetchImpl: async (url, options) => {
+        requests.push({ url, method: options.method, body: JSON.parse(options.body) });
+        return new Response(JSON.stringify({ Data: { requestId: "refund-1", status: "InProgress" } }), { status: 200 });
+      }
+    });
+    assert.equal(requests[0].url, "https://tochka.example/uapi/sbp/v1.0/refund");
+    assert.equal(requests[0].body.Data.amount, "123.45");
+    assert.equal(requests[0].body.Data.accountCode, "40802810920000021178");
+    assert.equal(requests[0].body.Data.bankCode, "044525104");
+    assert.equal(requests[0].body.Data.refTransactionId, "ref-1");
+    assert.deepEqual(refund, { requestId: "refund-1", status: "InProgress" });
+
+    const status = await getRefundStatus("refund-1", {
+      fetchImpl: async (url, options) => {
+        requests.push({ url, method: options.method });
+        return new Response(JSON.stringify({ Data: { requestId: "refund-1", status: "Accepted" } }), { status: 200 });
+      }
+    });
+    assert.equal(requests[1].url, "https://tochka.example/uapi/sbp/v1.0/refund/refund-1");
+    assert.equal(status.status, "Accepted");
+  });
+});
+
 test("Tochka webhook setup edits an existing subscription", async () => {
   await withEnvironment({
     TOCHKA_API_URL: "https://tochka.example/uapi",
@@ -196,5 +287,40 @@ test("DigitalKassa receipt contains agreed tax and service attributes", async ()
     assert.equal(request.options.headers.Authorization, `Basic ${Buffer.from("actor:token").toString("base64")}`);
     assert.equal(result.succeeded, true);
     assert.equal(result.receiptUrl, "https://receipt.example/1");
+  });
+});
+
+test("DigitalKassa creates a return receipt for the refunded amount", async () => {
+  await withEnvironment({
+    DIGITALKASSA_API_URL: "https://kassa.example/v2.1",
+    DIGITALKASSA_ACTOR_ID: "actor",
+    DIGITALKASSA_ACTOR_TOKEN: "token",
+    DIGITALKASSA_C_GROUP_ID: "3634"
+  }, async () => {
+    const order = { _id: "order-1", planName: "Команда", amountKopecks: 99000 };
+    const refund = {
+      _id: "refund-1",
+      amountKopecks: 25000,
+      fiscalization: { receiptId: "" }
+    };
+    const receipt = buildRefundReceipt({ order, refund, email: "user@example.com" });
+    assert.equal(receipt.type, 2);
+    assert.equal(receipt.amount.cashless, 250);
+    assert.equal(receipt.items[0].amount, 250);
+    assert.deepEqual(receipt.notify.emails, ["user@example.com"]);
+
+    let request;
+    const result = await createRefundReceipt({
+      order,
+      refund,
+      email: "user@example.com",
+      fetchImpl: async (url, options) => {
+        request = { url, body: JSON.parse(options.body) };
+        return new Response(JSON.stringify({ service: { receipt_url: "https://receipt.example/refund" } }), { status: 201 });
+      }
+    });
+    assert.equal(request.url, `https://kassa.example/v2.1/c_groups/3634/receipts/${receiptIdForRefund(refund._id)}`);
+    assert.equal(request.body.type, 2);
+    assert.equal(result.succeeded, true);
   });
 });

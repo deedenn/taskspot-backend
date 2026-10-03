@@ -9,7 +9,7 @@ const paymentSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["creating", "pending", "succeeded", "failed", "expired", "cancelled", "refunded"],
+      enum: ["creating", "creation_unknown", "pending", "succeeded", "failed", "expired", "cancelled", "refunded"],
       default: "pending"
     },
     providerPaymentId: {
@@ -48,7 +48,13 @@ const paymentSchema = new mongoose.Schema(
     },
     lastCheckedAt: Date,
     expiresAt: Date,
-    succeededAt: Date
+    succeededAt: Date,
+    creationAttempts: { type: Number, default: 0 },
+    creationLastAttemptAt: Date,
+    creationLockedUntil: Date,
+    creationLockId: { type: String, trim: true, default: "" },
+    creationErrorCode: { type: String, trim: true, default: "" },
+    creationErrorMessage: { type: String, trim: true, default: "" }
   },
   { _id: false }
 );
@@ -90,7 +96,7 @@ const paymentOrderSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["awaiting_payment", "paid", "expired", "cancelled", "failed", "refunded"],
+      enum: ["awaiting_payment", "paid", "partially_refunded", "expired", "cancelled", "failed", "refunded"],
       default: "awaiting_payment"
     },
     amountKopecks: {
@@ -120,6 +126,9 @@ const paymentOrderSchema = new mongoose.Schema(
       required: true
     },
     paidAt: Date,
+    receiptEmail: { type: String, trim: true, lowercase: true, default: "" },
+    refundedAmountKopecks: { type: Number, min: 0, default: 0 },
+    refundReservedAmountKopecks: { type: Number, min: 0, default: 0 },
     cancelledAt: Date,
     payment: {
       type: paymentSchema,

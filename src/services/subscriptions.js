@@ -3,21 +3,31 @@ import mongoose from "mongoose";
 import { BillingEvent } from "../models/BillingEvent.js";
 import { Organization } from "../models/Organization.js";
 import { PaymentOrder } from "../models/PaymentOrder.js";
+import { PaymentRefund } from "../models/PaymentRefund.js";
 import { Subscription } from "../models/Subscription.js";
 import { SubscriptionPeriod } from "../models/SubscriptionPeriod.js";
 import { User } from "../models/User.js";
-import { activeBillingProvider, providerFor } from "./billingProviders.js";
-import { createSaleReceipt, getReceiptStatus, receiptIdForOrder } from "./digitalKassa.js";
+import { activeBillingProvider, billingIntegrationPayload, providerFor } from "./billingProviders.js";
+import {
+  createRefundReceipt,
+  createSaleReceipt,
+  getReceiptStatus,
+  receiptIdForOrder,
+  receiptIdForRefund
+} from "./digitalKassa.js";
 import { PLANS } from "./planCatalog.js";
 import {
   createDynamicQr,
   expectedMerchantId,
+  getRefundStatus,
   getQrPaymentStatuses,
   normalizeIncomingPayment,
-  rublesToKopecks
+  rublesToKopecks,
+  startRefund
 } from "./tochkaSbp.js";
 
 const OPEN_ORDER_TTL_MS = 30 * 60 * 1000;
+const QR_CREATION_LOCK_MS = 30 * 1000;
 
 function querySession(query, session) {
   return session ? query.session(session) : query;
@@ -385,6 +395,7 @@ async function createPaymentOrderRecord({
   targetPlan,
   periodMonths,
   idempotencyKey,
+  receiptEmail = "",
   provider = "mock"
 }) {
   const plan = PLANS[targetPlan];
@@ -453,6 +464,7 @@ async function createPaymentOrderRecord({
           periodMonths
         },
         idempotencyKey,
+        receiptEmail: typeof receiptEmail === "string" ? receiptEmail.trim().toLowerCase() : "",
         expiresAt,
         payment: {
           provider,
@@ -504,33 +516,91 @@ export function createMockPaymentOrder(values) {
   return createPaymentOrderRecord({ ...values, provider: "mock" });
 }
 
-export async function createPaymentOrder(values) {
-  const provider = activeBillingProvider();
-  if (!provider.ready || !["mock", "tochka_sbp"].includes(provider.key)) {
-    throw Object.assign(new Error("Платёжный провайдер временно недоступен"), { statusCode: 503 });
-  }
-  if (provider.key === "mock") return createMockPaymentOrder(values);
+function retryableQrCreationError(error) {
+  return ["TOCHKA_NETWORK_ERROR", "TOCHKA_TIMEOUT", "TOCHKA_INVALID_RESPONSE"].includes(error?.code)
+    || Number(error?.providerStatus) >= 500
+    || Number(error?.providerStatus) === 424;
+}
 
-  const order = await createPaymentOrderRecord({ ...values, provider: provider.key });
-  if (order.payment.status !== "creating") return order;
-  if (!order.$locals.paymentOrderCreated) return order;
+async function initializeTochkaPaymentOrder(orderOrId) {
+  const orderId = orderOrId?._id || orderOrId;
+  const now = new Date();
+  const lockId = crypto.randomUUID();
+  const lockedUntil = new Date(now.getTime() + QR_CREATION_LOCK_MS);
+  const claimed = await PaymentOrder.findOneAndUpdate(
+    {
+      _id: orderId,
+      status: "awaiting_payment",
+      isOpen: true,
+      "payment.provider": "tochka_sbp",
+      "payment.status": "creating",
+      "payment.creationAttempts": 0,
+      $or: [
+        { "payment.creationLockedUntil": { $exists: false } },
+        { "payment.creationLockedUntil": { $lte: now } }
+      ]
+    },
+    {
+      $set: {
+        "payment.status": "creating",
+        "payment.creationLockId": lockId,
+        "payment.creationLockedUntil": lockedUntil,
+        "payment.creationLastAttemptAt": now,
+        "payment.lastCheckedAt": now,
+        "payment.creationErrorCode": "",
+        "payment.creationErrorMessage": ""
+      },
+      $inc: { "payment.creationAttempts": 1 }
+    },
+    { new: true }
+  );
+  if (!claimed) {
+    await PaymentOrder.updateOne(
+      {
+        _id: orderId,
+        status: "awaiting_payment",
+        "payment.provider": "tochka_sbp",
+        "payment.status": "creating",
+        "payment.creationAttempts": { $gt: 0 },
+        "payment.creationLockedUntil": { $lte: now }
+      },
+      {
+        $set: {
+          "payment.status": "creation_unknown",
+          "payment.creationErrorCode": "TOCHKA_CREATION_RESULT_UNKNOWN",
+          "payment.creationErrorMessage": "Результат создания QR неизвестен; повторный запрос заблокирован до истечения заказа"
+        },
+        $unset: {
+          "payment.creationLockId": "",
+          "payment.creationLockedUntil": ""
+        }
+      }
+    );
+    return PaymentOrder.findById(orderId);
+  }
 
   try {
-    const qr = await createDynamicQr({ order });
+    const qr = await createDynamicQr({ order: claimed });
     const updatedOrder = await PaymentOrder.findOneAndUpdate(
-      { _id: order._id, "payment.status": "creating" },
+      { _id: claimed._id, "payment.creationLockId": lockId },
       {
         $set: {
           "payment.status": "pending",
           "payment.providerPaymentId": qr.qrcId,
           "payment.qrPayload": qr.qrPayload,
           "payment.paymentUrl": qr.paymentUrl,
-          "payment.qrImage": qr.qrImage
+          "payment.qrImage": qr.qrImage,
+          "payment.creationErrorCode": "",
+          "payment.creationErrorMessage": ""
+        },
+        $unset: {
+          "payment.creationLockId": "",
+          "payment.creationLockedUntil": ""
         }
       },
       { new: true }
     );
-    if (!updatedOrder) return PaymentOrder.findById(order._id);
+    if (!updatedOrder) return PaymentOrder.findById(claimed._id);
     try {
       await recordEvent({
         type: "PaymentQrCreated",
@@ -538,11 +608,11 @@ export async function createPaymentOrder(values) {
         aggregateId: updatedOrder._id,
         organizationId: updatedOrder.organization,
         actorType: "provider",
-        actorId: provider.key,
+        actorId: "tochka_sbp",
         correlationId: updatedOrder._id,
         causationId: qr.qrcId,
         idempotencyKey: `order:${updatedOrder._id}:qr-created`,
-        payload: { provider: provider.key, expiresAt: updatedOrder.expiresAt }
+        payload: { provider: "tochka_sbp", expiresAt: updatedOrder.expiresAt }
       });
     } catch (eventError) {
       if (eventError.code !== 11000) {
@@ -551,29 +621,55 @@ export async function createPaymentOrder(values) {
     }
     return updatedOrder;
   } catch (error) {
+    const retryable = retryableQrCreationError(error);
     await PaymentOrder.updateOne(
-      { _id: order._id, "payment.status": "creating" },
-      { $set: { status: "failed", isOpen: false, "payment.status": "failed" } }
+      { _id: claimed._id, "payment.creationLockId": lockId },
+      {
+        $set: {
+          ...(retryable ? {} : { status: "failed", isOpen: false }),
+          "payment.status": retryable ? "creation_unknown" : "failed",
+          "payment.creationErrorCode": error.code || error.name,
+          "payment.creationErrorMessage": error.message
+        },
+        $unset: {
+          "payment.creationLockId": "",
+          "payment.creationLockedUntil": ""
+        }
+      }
     );
     try {
       await recordEvent({
-        type: "PaymentInitializationFailed",
+        type: retryable ? "PaymentQrCreationDeferred" : "PaymentInitializationFailed",
         aggregateType: "payment_order",
-        aggregateId: order._id,
-        organizationId: order.organization,
+        aggregateId: claimed._id,
+        organizationId: claimed.organization,
         actorType: "provider",
-        actorId: provider.key,
-        correlationId: order._id,
-        idempotencyKey: `order:${order._id}:initialization-failed`,
+        actorId: "tochka_sbp",
+        correlationId: claimed._id,
+        idempotencyKey: `order:${claimed._id}:${retryable ? "qr-deferred" : "initialization-failed"}`,
         payload: { code: error.code || error.name }
       });
     } catch (eventError) {
       if (eventError.code !== 11000) {
-        console.error("[taskspot:billing-event]", { orderId: String(order._id), code: eventError.code || eventError.name });
+        console.error("[taskspot:billing-event]", { orderId: String(claimed._id), code: eventError.code || eventError.name });
       }
     }
+    if (retryable) return PaymentOrder.findById(claimed._id);
     throw error;
   }
+}
+
+export async function createPaymentOrder(values) {
+  const provider = activeBillingProvider();
+  const integration = billingIntegrationPayload();
+  if (!provider.ready || !["mock", "tochka_sbp"].includes(provider.key) || !integration.ready) {
+    throw Object.assign(new Error("Платёжный провайдер временно недоступен"), { statusCode: 503 });
+  }
+  if (provider.key === "mock") return createMockPaymentOrder(values);
+
+  const order = await createPaymentOrderRecord({ ...values, provider: provider.key });
+  if (order.payment.status !== "creating" || order.payment.creationAttempts > 0) return order;
+  return initializeTochkaPaymentOrder(order);
 }
 
 async function endCurrentPeriod(currentPeriod, status, now, reason, session) {
@@ -609,7 +705,7 @@ export async function fulfillPaidOrder({
       if (requestedByUserId && order.requestedBy.toString() !== requestedByUserId.toString()) {
         throw Object.assign(new Error("Подтвердить оплату может пользователь, создавший её"), { statusCode: 403 });
       }
-      if (order.status === "paid") {
+      if (["paid", "partially_refunded", "refunded"].includes(order.status)) {
         result = { order, repeated: true };
         return;
       }
@@ -822,10 +918,23 @@ export async function handleTochkaPaymentWebhook(payload) {
     return { handled: false, reason: "merchant_mismatch" };
   }
 
-  const order = await PaymentOrder.findOne({
+  let order = await PaymentOrder.findOne({
     "payment.provider": "tochka_sbp",
     "payment.providerPaymentId": payment.qrcId
   });
+  let recoveredFromPurpose = false;
+  if (!order) {
+    const orderId = payment.purpose.match(/Заказ\s+([a-f\d]{24})(?:\.|\s|$)/i)?.[1];
+    if (orderId) {
+      order = await PaymentOrder.findOne({
+        _id: orderId,
+        "payment.provider": "tochka_sbp",
+        status: "awaiting_payment",
+        "payment.status": { $in: ["creating", "creation_unknown"] }
+      });
+      recoveredFromPurpose = Boolean(order);
+    }
+  }
   if (!order) return { handled: false, reason: "order_not_found" };
 
   const amountKopecks = rublesToKopecks(payment.amountRubles);
@@ -847,6 +956,30 @@ export async function handleTochkaPaymentWebhook(payload) {
       if (error.code !== 11000) throw error;
     }
     return { handled: false, reason: "amount_mismatch" };
+  }
+
+  if (recoveredFromPurpose) {
+    order = await PaymentOrder.findOneAndUpdate(
+      {
+        _id: order._id,
+        status: "awaiting_payment",
+        "payment.status": { $in: ["creating", "creation_unknown"] }
+      },
+      {
+        $set: {
+          "payment.providerPaymentId": payment.qrcId,
+          "payment.status": "pending",
+          "payment.creationErrorCode": "",
+          "payment.creationErrorMessage": ""
+        },
+        $unset: {
+          "payment.creationLockId": "",
+          "payment.creationLockedUntil": ""
+        }
+      },
+      { new: true }
+    );
+    if (!order) return { handled: false, reason: "order_recovery_conflict" };
   }
 
   const duplicateOperation = await PaymentOrder.findOne({
@@ -907,7 +1040,12 @@ export async function reconcileTochkaPaymentOrder(orderOrId) {
   const order = typeof orderOrId === "object" && orderOrId?._id
     ? orderOrId
     : await PaymentOrder.findById(orderOrId);
-  if (!order || order.payment.provider !== "tochka_sbp" || order.status === "paid") return order;
+  if (!order || order.payment.provider !== "tochka_sbp" || ["paid", "partially_refunded", "refunded"].includes(order.status)) return order;
+  if (order.payment.status === "creating") {
+    return initializeTochkaPaymentOrder(order);
+  }
+  if (order.payment.status === "creation_unknown") return order;
+  if (order.payment.status !== "pending" || order.payment.providerPaymentId.includes("_creating_")) return order;
   const [status] = await getQrPaymentStatuses(order.payment.providerPaymentId);
   if (!status || status.qrcId !== order.payment.providerPaymentId) {
     await PaymentOrder.updateOne({ _id: order._id }, { $set: { "payment.lastCheckedAt": new Date() } });
@@ -921,7 +1059,6 @@ export async function reconcilePendingTochkaPayments(now = new Date()) {
   const checkedBefore = new Date(now.getTime() - 60 * 1000);
   const orders = await PaymentOrder.find({
     "payment.provider": "tochka_sbp",
-    "payment.providerPaymentId": { $not: /_creating_/ },
     status: { $in: ["awaiting_payment", "expired"] },
     createdAt: { $gte: createdAfter },
     $or: [
@@ -931,9 +1068,19 @@ export async function reconcilePendingTochkaPayments(now = new Date()) {
   }).limit(50);
   if (!orders.length) return;
 
-  const statuses = await getQrPaymentStatuses(orders.map((order) => order.payment.providerPaymentId));
+  const qrCreationOrders = orders.filter((order) => ["creating", "creation_unknown"].includes(order.payment.status));
+  for (const order of qrCreationOrders) {
+    try {
+      await initializeTochkaPaymentOrder(order);
+    } catch (error) {
+      console.error("[taskspot:payment-initialization]", { orderId: String(order._id), code: error.code || error.name });
+    }
+  }
+  const payableOrders = orders.filter((order) => order.payment.status === "pending" && !order.payment.providerPaymentId.includes("_creating_"));
+  if (!payableOrders.length) return;
+  const statuses = await getQrPaymentStatuses(payableOrders.map((order) => order.payment.providerPaymentId));
   const statusByQr = new Map(statuses.map((status) => [status.qrcId, status]));
-  for (const order of orders) {
+  for (const order of payableOrders) {
     const status = statusByQr.get(order.payment.providerPaymentId);
     if (status) await applyQrStatus(order, status);
     else await PaymentOrder.updateOne({ _id: order._id }, { $set: { "payment.lastCheckedAt": now } });
@@ -957,8 +1104,9 @@ export async function fiscalizePaymentOrder(orderId) {
     throw error;
   }
 
-  const user = await User.findById(order.requestedBy).select("email").lean();
-  if (!user?.email) {
+  const user = order.receiptEmail ? null : await User.findById(order.requestedBy).select("email").lean();
+  const receiptEmail = order.receiptEmail || user?.email || "";
+  if (!receiptEmail) {
     const error = Object.assign(new Error("Не найден email покупателя для чека"), { code: "RECEIPT_EMAIL_MISSING" });
     order.fiscalization.status = "failed";
     order.fiscalization.attempts += 1;
@@ -980,7 +1128,7 @@ export async function fiscalizePaymentOrder(orderId) {
   try {
     const result = previousStatus === "pending" && previousAttempts > 0
       ? await getReceiptStatus(order.fiscalization.receiptId)
-      : await createSaleReceipt({ order, email: user.email });
+      : await createSaleReceipt({ order, email: receiptEmail });
     order.fiscalization.status = result.succeeded ? "succeeded" : "pending";
     order.fiscalization.receiptUrl = result.receiptUrl || order.fiscalization.receiptUrl;
     order.fiscalization.errorCode = "";
@@ -1019,7 +1167,7 @@ export async function fiscalizePaymentOrder(orderId) {
 export async function processPendingFiscalReceipts(now = new Date()) {
   const retryBefore = new Date(now.getTime() - 5 * 60 * 1000);
   const orders = await PaymentOrder.find({
-    status: "paid",
+    status: { $in: ["paid", "partially_refunded", "refunded"] },
     "payment.provider": { $ne: "mock" },
     "fiscalization.status": { $in: ["pending", "failed"] },
     $or: [
@@ -1033,6 +1181,362 @@ export async function processPendingFiscalReceipts(now = new Date()) {
       await fiscalizePaymentOrder(order._id);
     } catch (error) {
       console.error("[taskspot:fiscalization]", { orderId: String(order._id), code: error.code || error.name });
+    }
+  }
+}
+
+async function revokeFullyRefundedPeriod({ order, session, now }) {
+  const period = await SubscriptionPeriod.findOne({ sourceOrder: order._id }).session(session);
+  if (!period || !["active", "scheduled"].includes(period.status)) return;
+  const subscription = await Subscription.findOne({ organization: order.organization }).session(session);
+  if (!subscription) return;
+
+  if (period.status === "scheduled") {
+    period.status = "cancelled";
+    period.endedAt = now;
+    period.endReason = "payment_refunded";
+    await period.save({ session });
+    if (subscription.scheduledPeriod?.toString() === period._id.toString()) {
+      subscription.scheduledPeriod = undefined;
+      subscription.revision += 1;
+      await subscription.save({ session });
+    }
+    return;
+  }
+
+  if (subscription.currentPeriod?.toString() !== period._id.toString()) return;
+  period.status = "cancelled";
+  period.endsAt = now;
+  period.endedAt = now;
+  period.endReason = "payment_refunded";
+  await period.save({ session });
+  const fallback = await createPeriod({
+    subscription: subscription._id,
+    organization: order.organization,
+    plan: "free",
+    status: "active",
+    startsAt: now,
+    activatedAt: now,
+    source: "system",
+    previousPeriod: period._id,
+    transitionType: "fallback",
+    note: "Переход на Free после полного возврата оплаты"
+  }, session);
+  subscription.currentPeriod = fallback._id;
+  subscription.currentPlan = "free";
+  subscription.revision += 1;
+  await subscription.save({ session });
+  const organization = await Organization.findById(order.organization).session(session);
+  if (organization) await mirrorOrganization(organization, subscription, fallback, { session });
+}
+
+export async function finalizePaymentRefund(refundId, providerStatus = "Accepted") {
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const refund = await PaymentRefund.findById(refundId).session(session);
+      if (!refund) throw Object.assign(new Error("Возврат не найден"), { statusCode: 404 });
+      if (refund.status === "succeeded") {
+        result = { refund, repeated: true };
+        return;
+      }
+      const order = await PaymentOrder.findById(refund.paymentOrder).session(session);
+      if (!order) throw Object.assign(new Error("Платёж возврата не найден"), { statusCode: 404 });
+      const now = new Date();
+      refund.status = "succeeded";
+      refund.providerStatus = providerStatus;
+      refund.completedAt = now;
+      refund.errorCode = "";
+      refund.errorMessage = "";
+      refund.fiscalization.status = "pending";
+      refund.fiscalization.receiptId = refund.fiscalization.receiptId || receiptIdForRefund(refund._id);
+      await refund.save({ session });
+
+      const totals = await PaymentRefund.aggregate([
+        { $match: { paymentOrder: order._id, status: "succeeded" } },
+        { $group: { _id: null, amount: { $sum: "$amountKopecks" } } }
+      ]).session(session);
+      const refundedAmountKopecks = Math.min(order.amountKopecks, totals[0]?.amount || refund.amountKopecks);
+      const fullyRefunded = refundedAmountKopecks >= order.amountKopecks;
+      order.refundedAmountKopecks = refundedAmountKopecks;
+      order.status = fullyRefunded ? "refunded" : "partially_refunded";
+      if (fullyRefunded) order.payment.status = "refunded";
+      await order.save({ session });
+      if (fullyRefunded) await revokeFullyRefundedPeriod({ order, session, now });
+
+      await recordEvent({
+        type: fullyRefunded ? "PaymentRefunded" : "PaymentPartiallyRefunded",
+        aggregateType: "payment_order",
+        aggregateId: order._id,
+        organizationId: order.organization,
+        actorType: "provider",
+        actorId: "tochka_sbp",
+        correlationId: order._id,
+        causationId: refund.providerRequestId,
+        idempotencyKey: `refund:${refund._id}:succeeded`,
+        payload: { refundId: refund._id, amountKopecks: refund.amountKopecks, refundedAmountKopecks },
+        session
+      });
+      result = { refund, order, fullyRefunded, repeated: false };
+    });
+  } finally {
+    await session.endSession();
+  }
+  result.refund.$session(null);
+  return result;
+}
+
+export async function fiscalizePaymentRefund(refundId) {
+  const refund = await PaymentRefund.findById(refundId);
+  if (!refund || refund.status !== "succeeded") return null;
+  if (refund.fiscalization.status === "succeeded") return refund;
+  const order = await PaymentOrder.findById(refund.paymentOrder);
+  if (!order) throw Object.assign(new Error("Платёж возврата не найден"), { code: "REFUND_ORDER_MISSING" });
+  const fiscalProvider = providerFor("digitalkassa_sbp");
+  if (!fiscalProvider.ready) {
+    const error = Object.assign(new Error("DigitalKassa не настроена"), { code: "DIGITALKASSA_NOT_CONFIGURED" });
+    refund.fiscalization.status = "failed";
+    refund.fiscalization.attempts += 1;
+    refund.fiscalization.lastAttemptAt = new Date();
+    refund.fiscalization.errorCode = error.code;
+    refund.fiscalization.errorMessage = error.message;
+    await refund.save();
+    throw error;
+  }
+  const user = order.receiptEmail ? null : await User.findById(order.requestedBy).select("email").lean();
+  const receiptEmail = order.receiptEmail || user?.email || "";
+  if (!receiptEmail) {
+    const error = Object.assign(new Error("Не найден email покупателя для чека возврата"), { code: "RECEIPT_EMAIL_MISSING" });
+    refund.fiscalization.status = "failed";
+    refund.fiscalization.attempts += 1;
+    refund.fiscalization.lastAttemptAt = new Date();
+    refund.fiscalization.errorCode = error.code;
+    refund.fiscalization.errorMessage = error.message;
+    await refund.save();
+    throw error;
+  }
+
+  const previousStatus = refund.fiscalization.status;
+  const previousAttempts = refund.fiscalization.attempts;
+  refund.fiscalization.status = "pending";
+  refund.fiscalization.receiptId = refund.fiscalization.receiptId || receiptIdForRefund(refund._id);
+  refund.fiscalization.attempts += 1;
+  refund.fiscalization.lastAttemptAt = new Date();
+  await refund.save();
+  try {
+    const fiscalResult = previousStatus === "pending" && previousAttempts > 0
+      ? await getReceiptStatus(refund.fiscalization.receiptId)
+      : await createRefundReceipt({ order, refund, email: receiptEmail });
+    refund.fiscalization.status = fiscalResult.succeeded ? "succeeded" : "pending";
+    refund.fiscalization.receiptUrl = fiscalResult.receiptUrl || refund.fiscalization.receiptUrl;
+    refund.fiscalization.errorCode = "";
+    refund.fiscalization.errorMessage = "";
+    if (fiscalResult.succeeded) refund.fiscalization.completedAt = new Date();
+    await refund.save();
+    return refund;
+  } catch (error) {
+    refund.fiscalization.status = "failed";
+    refund.fiscalization.errorCode = error.code || error.name;
+    refund.fiscalization.errorMessage = error.message;
+    await refund.save();
+    throw error;
+  }
+}
+
+async function failPaymentRefund(refundId, {
+  providerRequestId = "",
+  providerStatus = "",
+  errorCode = "",
+  errorMessage = ""
+} = {}) {
+  const session = await mongoose.startSession();
+  let refund;
+  try {
+    await session.withTransaction(async () => {
+      refund = await PaymentRefund.findOneAndUpdate(
+        { _id: refundId, status: { $in: ["creating", "pending", "unknown"] } },
+        {
+          $set: {
+            status: "failed",
+            ...(providerRequestId ? { providerRequestId } : {}),
+            providerStatus,
+            failedAt: new Date(),
+            errorCode,
+            errorMessage
+          }
+        },
+        { new: true, session }
+      );
+      if (!refund) {
+        refund = await PaymentRefund.findById(refundId).session(session);
+        return;
+      }
+      await PaymentOrder.updateOne(
+        { _id: refund.paymentOrder },
+        { $inc: { refundReservedAmountKopecks: -refund.amountKopecks } },
+        { session }
+      );
+    });
+  } finally {
+    await session.endSession();
+  }
+  refund?.$session(null);
+  return refund;
+}
+
+export async function requestPaymentRefund({ orderId, amountKopecks, actorId, reason = "", idempotencyKey }) {
+  if (typeof idempotencyKey !== "string" || idempotencyKey.length < 8 || idempotencyKey.length > 120) {
+    throw Object.assign(new Error("Некорректный ключ операции возврата"), { statusCode: 400 });
+  }
+  const normalizedAmount = Number(amountKopecks);
+  if (!Number.isInteger(normalizedAmount) || normalizedAmount <= 0) {
+    throw Object.assign(new Error("Сумма возврата должна быть указана в копейках"), { statusCode: 400 });
+  }
+  const normalizedReason = typeof reason === "string" ? reason.trim() : "";
+  if (normalizedReason.length < 3 || normalizedReason.length > 140) {
+    throw Object.assign(new Error("Укажите основание возврата длиной от 3 до 140 символов"), { statusCode: 400 });
+  }
+
+  const existing = await PaymentRefund.findOne({ paymentOrder: orderId, idempotencyKey });
+  if (existing) return existing;
+  const session = await mongoose.startSession();
+  let refund;
+  let createdRefund = false;
+  try {
+    await session.withTransaction(async () => {
+      const order = await PaymentOrder.findById(orderId).session(session);
+      if (!order || !["paid", "partially_refunded"].includes(order.status)) {
+        throw Object.assign(new Error("Возврат доступен только для оплаченного заказа"), { statusCode: 409 });
+      }
+      if (order.payment.provider !== "tochka_sbp" || order.payment.rail !== "sbp") {
+        throw Object.assign(new Error("Автоматический возврат доступен только для платежей СБП Точки"), { statusCode: 409 });
+      }
+      const reservedOrder = await PaymentOrder.findOneAndUpdate(
+        {
+          _id: order._id,
+          status: { $in: ["paid", "partially_refunded"] },
+          $expr: {
+            $lte: [
+              { $add: [{ $ifNull: ["$refundReservedAmountKopecks", 0] }, normalizedAmount] },
+              "$amountKopecks"
+            ]
+          }
+        },
+        { $inc: { refundReservedAmountKopecks: normalizedAmount } },
+        { new: true, session }
+      );
+      if (!reservedOrder) {
+        const remaining = Math.max(0, order.amountKopecks - (order.refundReservedAmountKopecks || 0));
+        throw Object.assign(new Error(`Доступно к возврату: ${(remaining / 100).toFixed(2)} ₽`), { statusCode: 409 });
+      }
+      [refund] = await PaymentRefund.create([{
+        organization: order.organization,
+        paymentOrder: order._id,
+        requestedBy: actorId,
+        idempotencyKey,
+        amountKopecks: normalizedAmount,
+        reason: normalizedReason
+      }], { session });
+      createdRefund = true;
+    });
+  } catch (error) {
+    if (error.code !== 11000) throw error;
+    refund = await PaymentRefund.findOne({ paymentOrder: orderId, idempotencyKey });
+    if (!refund) throw error;
+  } finally {
+    await session.endSession();
+  }
+  if (!createdRefund) return refund;
+
+  const order = await PaymentOrder.findById(orderId);
+  let providerResult;
+  try {
+    providerResult = await startRefund({ order, amountKopecks: normalizedAmount, reason: normalizedReason });
+  } catch (error) {
+    const unknown = ["TOCHKA_NETWORK_ERROR", "TOCHKA_TIMEOUT"].includes(error.code) || Number(error.providerStatus) >= 500;
+    refund = unknown
+      ? await PaymentRefund.findByIdAndUpdate(refund._id, {
+          $set: {
+            status: "unknown",
+            errorCode: error.code || error.name,
+            errorMessage: error.message
+          }
+        }, { new: true })
+      : await failPaymentRefund(refund._id, {
+          errorCode: error.code || error.name,
+          errorMessage: error.message
+        });
+    return refund;
+  }
+
+  if (providerResult.status === "Rejected") {
+    return failPaymentRefund(refund._id, {
+      providerRequestId: providerResult.requestId,
+      providerStatus: providerResult.status
+    });
+  }
+  refund = await PaymentRefund.findByIdAndUpdate(refund._id, {
+    $set: {
+      providerRequestId: providerResult.requestId,
+      providerStatus: providerResult.status,
+      status: "pending"
+    }
+  }, { new: true });
+  if (providerResult.status === "Accepted") {
+    try {
+      const finalized = await finalizePaymentRefund(refund._id, providerResult.status);
+      refund = finalized.refund;
+      try { await fiscalizePaymentRefund(refund._id); } catch (error) {
+        console.error("[taskspot:refund-fiscalization]", { refundId: String(refund._id), code: error.code || error.name });
+      }
+    } catch (error) {
+      refund = await PaymentRefund.findByIdAndUpdate(refund._id, {
+        $set: { errorCode: error.code || error.name, errorMessage: error.message }
+      }, { new: true });
+      console.error("[taskspot:refund-finalization]", { refundId: String(refund._id), code: error.code || error.name });
+    }
+  }
+  return refund;
+}
+
+export async function reconcilePendingPaymentRefunds() {
+  const refunds = await PaymentRefund.find({ status: "pending", providerRequestId: { $gt: "" } })
+    .sort({ updatedAt: 1 })
+    .limit(20);
+  for (const refund of refunds) {
+    try {
+      const providerResult = await getRefundStatus(refund.providerRequestId);
+      if (providerResult.status === "Accepted") {
+        await finalizePaymentRefund(refund._id, providerResult.status);
+        try { await fiscalizePaymentRefund(refund._id); } catch (error) {
+          console.error("[taskspot:refund-fiscalization]", { refundId: String(refund._id), code: error.code || error.name });
+        }
+      } else if (providerResult.status === "Rejected") {
+        await failPaymentRefund(refund._id, { providerStatus: providerResult.status });
+      } else {
+        refund.providerStatus = providerResult.status;
+        await refund.save();
+      }
+    } catch (error) {
+      console.error("[taskspot:refund-reconciliation]", { refundId: String(refund._id), code: error.code || error.name });
+    }
+  }
+}
+
+export async function processPendingRefundReceipts(now = new Date()) {
+  const retryBefore = new Date(now.getTime() - 5 * 60 * 1000);
+  const refunds = await PaymentRefund.find({
+    status: "succeeded",
+    "fiscalization.status": { $in: ["pending", "failed"] },
+    $or: [
+      { "fiscalization.lastAttemptAt": { $exists: false } },
+      { "fiscalization.lastAttemptAt": { $lte: retryBefore } }
+    ]
+  }).select("_id").limit(20).lean();
+  for (const refund of refunds) {
+    try { await fiscalizePaymentRefund(refund._id); } catch (error) {
+      console.error("[taskspot:refund-fiscalization]", { refundId: String(refund._id), code: error.code || error.name });
     }
   }
 }

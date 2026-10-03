@@ -78,6 +78,11 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: ""
     },
+    emailPreferences: {
+      taskUpdates: { type: Boolean, default: true },
+      comments: { type: Boolean, default: true },
+      reminders: { type: Boolean, default: true }
+    },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String, default: "" },
     workspaceProvisioningVersion: {

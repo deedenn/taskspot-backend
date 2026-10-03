@@ -7,11 +7,14 @@ import { drainEmailOutbox } from "./emailOutbox.js";
 import { validTimeZone } from "./taskSchedule.js";
 import { BillingEvent } from "../models/BillingEvent.js";
 import { PaymentOrder } from "../models/PaymentOrder.js";
+import { PaymentRefund } from "../models/PaymentRefund.js";
 import { Subscription } from "../models/Subscription.js";
 import { SubscriptionPeriod } from "../models/SubscriptionPeriod.js";
 import {
   expireOpenPaymentOrders,
   processPendingFiscalReceipts,
+  processPendingRefundReceipts,
+  reconcilePendingPaymentRefunds,
   reconcilePendingTochkaPayments,
   synchronizeExpiredSubscriptions
 } from "./subscriptions.js";
@@ -34,6 +37,7 @@ export async function startWorkers() {
     Task.createIndexes(),
     BillingEvent.createIndexes(),
     PaymentOrder.createIndexes(),
+    PaymentRefund.createIndexes(),
     Subscription.createIndexes(),
     SubscriptionPeriod.createIndexes(),
     DeviceSession.createIndexes(),
@@ -85,7 +89,9 @@ export async function startWorkers() {
       synchronizeExpiredSubscriptions(),
       expireOpenPaymentOrders(),
       reconcilePendingTochkaPayments(),
-      processPendingFiscalReceipts()
+      processPendingFiscalReceipts(),
+      reconcilePendingPaymentRefunds(),
+      processPendingRefundReceipts()
     ]);
   }, 60000);
   return async () => {

@@ -46,6 +46,14 @@ test("isolated API: reset replay/races, revoked JWT, admin OTP, reports ACL and 
   const login = await request("/auth/login", { email: user.email, password: "New-password-34" });
   assert.equal(login.status, 200);
   const regularToken = login.data.token;
+  const preferences = await request("/auth/email-preferences", {
+    emailPreferences: { taskUpdates: true, comments: false, reminders: false }
+  }, regularToken, "PATCH");
+  assert.equal(preferences.status, 200);
+  assert.deepEqual(preferences.data.user.emailPreferences, { taskUpdates: true, comments: false, reminders: false });
+  assert.equal((await request("/auth/email-preferences", {
+    emailPreferences: { taskUpdates: true, comments: false, reminders: "no" }
+  }, regularToken, "PATCH")).status, 400);
   await request("/auth/password/forgot", { email: user.email });
   const expired = await User.findById(user._id).select("+passwordReset");
   const expiredToken = new URL(expired.passwordReset.outbox.mail.text.match(/https?:\/\/\S+/)[0]).searchParams.get("token");

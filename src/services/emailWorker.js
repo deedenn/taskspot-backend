@@ -4,40 +4,90 @@ import { Project } from "../models/Project.js";
 import { User } from "../models/User.js";
 import { Task } from "../models/Task.js";
 import { deliverMail } from "./email.js";
-import { retryDelay, retryableEmailError, safeEmailError } from "./emailQueue.js";
-import { canViewTask, projectMember } from "./taskAccess.js";
+import { normalizeSingleEmailRecipient, retryDelay, retryableEmailError, safeEmailError, validateEmailJob } from "./emailQueue.js";
+import { canViewTask, idOf, projectMember } from "./taskAccess.js";
 
 const LEASE_MS = 5 * 60 * 1000;
 
-async function isRelevant(job, now) {
+function recipientMatches(value, expected) {
+  return normalizeSingleEmailRecipient(value) === normalizeSingleEmailRecipient(expected);
+}
+
+function activeRecipientFilter(userId, email, context = {}) {
+  const filter = {
+    _id: userId,
+    email,
+    status: { $nin: ["blocked", "inactive"] },
+    $or: [
+      { emailVerificationStatus: "verified" },
+      { emailVerifiedAt: { $ne: null } },
+      { emailVerificationStatus: { $exists: false } }
+    ]
+  };
+  if (context.kind === "reminder") filter["emailPreferences.reminders"] = { $ne: false };
+  if (context.kind === "task" && context.event === "task_comment") filter["emailPreferences.comments"] = { $ne: false };
+  if (context.kind === "task" && context.event !== "task_comment") filter["emailPreferences.taskUpdates"] = { $ne: false };
+  return filter;
+}
+
+async function recipientIdentityMatches(userId, recipient) {
+  return Boolean(await User.exists({ _id: userId, email: recipient }));
+}
+
+export async function evaluateEmailJob(job, now) {
   const context = job.context;
+  let recipient;
+  try {
+    recipient = validateEmailJob(job.mail, context).to;
+  } catch {
+    return { send: false, privacyRejected: true };
+  }
   if (["password_reset", "admin_login"].includes(context.kind)) {
     const field = context.kind === "password_reset" ? "passwordReset" : "adminChallenge";
-    return Boolean(await User.exists({ _id: context.userId, [field + ".tokenHash"]: context.tokenHash,
+    if (!await recipientIdentityMatches(context.userId, recipient)) return { send: false, privacyRejected: true };
+    const valid = Boolean(await User.exists({ _id: context.userId, [field + ".tokenHash"]: context.tokenHash,
       [field + ".expiresAt"]: { $gt: now }, status: "active",
       ...(field === "adminChallenge" ? { isSuperAdmin: true } : { emailVerificationStatus: "verified" }) }));
+    return { send: valid, privacyRejected: false };
   }
   if (context.kind === "verification") {
-    return Boolean(await User.exists({ _id: context.userId, emailVerificationTokenHash: context.tokenHash,
+    if (!await recipientIdentityMatches(context.userId, recipient)) return { send: false, privacyRejected: true };
+    const valid = Boolean(await User.exists({ _id: context.userId, emailVerificationTokenHash: context.tokenHash,
       emailVerifiedAt: null, emailVerificationExpiresAt: { $gt: now }, status: { $ne: "blocked" } }));
+    return { send: valid, privacyRejected: false };
   }
-  if (context.projectId) {
-    const project = await Project.findById(context.projectId);
-    if (!project) return false;
-    if (context.kind === "invitation") {
-      const invitation = project.invitations.id(context.invitationId);
-      return Boolean(invitation?.status === "pending" && invitation.token === context.token && invitation.expiresAt > now);
-    }
-    if (context.userId && !projectMember(project, context.userId)) return false;
-    if (context.taskId) {
-      const task = await Task.findById(context.taskId);
-      if (!task || !canViewTask(task, project, context.userId)) return false;
-      if (context.kind === "reminder" && (project.isArchived || project.archivedAt ||
-          ["review", "done", "closed", "cancelled"].includes(task.status) || task.dueDate?.toISOString() !== context.dueDate)) return false;
-    }
+  const project = await Project.findById(context.projectId);
+  if (!project) return { send: false, privacyRejected: false };
+  if (context.kind === "invitation") {
+    const invitation = project.invitations.id(context.invitationId);
+    if (!invitation) return { send: false, privacyRejected: false };
+    if (!recipientMatches(recipient, invitation.email)) return { send: false, privacyRejected: true };
+    return { send: Boolean(invitation.status === "pending" && invitation.token === context.token && invitation.expiresAt > now),
+      privacyRejected: false };
   }
-  if (context.userId && !await User.exists({ _id: context.userId, status: { $ne: "blocked" } })) return false;
-  return true;
+  if (context.kind === "member_added") {
+    if (!await recipientIdentityMatches(context.userId, recipient)) return { send: false, privacyRejected: true };
+    return { send: Boolean(projectMember(project, context.userId) && await User.exists(activeRecipientFilter(context.userId, recipient))),
+      privacyRejected: false };
+  }
+  if (!["task", "reminder"].includes(context.kind)) return { send: false, privacyRejected: true };
+  if (!await recipientIdentityMatches(context.userId, recipient)) return { send: false, privacyRejected: true };
+  if (!projectMember(project, context.userId) || !await User.exists(activeRecipientFilter(context.userId, recipient, context))) {
+    return { send: false, privacyRejected: false };
+  }
+  const task = await Task.findById(context.taskId);
+  if (!task) return { send: false, privacyRejected: false };
+  if (idOf(task.project) !== idOf(project)) return { send: false, privacyRejected: true };
+  if (!canViewTask(task, project, context.userId)) return { send: false, privacyRejected: false };
+  if (context.kind === "reminder" && (project.isArchived || project.archivedAt ||
+      ["review", "done", "closed", "cancelled"].includes(task.status) || task.dueDate?.toISOString() !== context.dueDate)) {
+    return { send: false, privacyRejected: false };
+  }
+  return { send: true, privacyRejected: false };
+}
+
+export async function isRelevantEmailJob(job, now) {
+  return (await evaluateEmailJob(job, now)).send;
 }
 
 export async function syncEmailStatus(job) {
@@ -82,8 +132,9 @@ export async function processEmailJob({ now = new Date(), send = deliverMail, cl
   let stage = "relevance";
   const maxAttempts = Math.max(1, Math.min(20, Number(process.env.EMAIL_MAX_ATTEMPTS) || 8));
   try {
-    if (!await isRelevant(job, now)) {
-      changes = { status: "cancelled", lastError: "" };
+    const relevance = await evaluateEmailJob(job, now);
+    if (!relevance.send) {
+      changes = { status: "cancelled", lastError: "", lastErrorCode: relevance.privacyRejected ? "EMAIL_PRIVACY_REJECTED" : "" };
     } else if (job.attempts > maxAttempts) {
       changes = { status: "failed", lastError: "Исчерпаны попытки отправки. Запросите новое письмо.", lastErrorCode: "ATTEMPTS_EXHAUSTED" };
     } else {

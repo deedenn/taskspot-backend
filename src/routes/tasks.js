@@ -98,7 +98,7 @@ function frontendUrl() {
   return process.env.CLIENT_URL || (process.env.NODE_ENV === "production" ? "https://taskspot.ru" : "http://localhost:5173");
 }
 
-async function notifyUser({ user, project, task, message }) {
+async function notifyUser({ user, project, task, message, event = "task_updated" }) {
   if (!user) return;
 
   const notification = await Notification.create({
@@ -108,7 +108,7 @@ async function notifyUser({ user, project, task, message }) {
     message
   });
 
-  await sendTaskEmail({ user, project, task, message, notificationId: notification._id });
+  await sendTaskEmail({ user, project, task, message, event, notificationId: notification._id });
 }
 
 async function sendLimitResponse(res, { organization, plan, usage, key, increment = 1, message }) {
@@ -116,7 +116,7 @@ async function sendLimitResponse(res, { organization, plan, usage, key, incremen
   return res.status(402).json(limitPayload({ organization, plan, usage, key, increment, message }));
 }
 
-async function sendTaskEmail({ user, project, task, message, notificationId }) {
+async function sendTaskEmail({ user, project, task, message, event, notificationId }) {
   try {
     const recipient = await User.findById(user);
     if (!recipient) return;
@@ -130,7 +130,7 @@ async function sendTaskEmail({ user, project, task, message, notificationId }) {
       taskDescription: taskDoc?.description || "Задача",
       message,
       taskUrl: `${frontendUrl().replace(/\/$/, "")}/app/tasks/${task}`,
-      context: { kind: "task", userId: String(user), projectId: String(project), taskId: String(task),
+      context: { kind: "task", userId: String(user), projectId: String(project), taskId: String(task), event,
         dedupeKey: `notification:${notificationId}` }
     });
   } catch (error) {
@@ -547,6 +547,7 @@ tasksRouter.post("/", async (req, res) => {
       user: resolvedAssignee.assignee,
       project: project._id,
       task: task._id,
+      event: "task_assigned",
       message: `Вам назначена задача в проекте «${project.name}»`
     });
   }
@@ -763,6 +764,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
         user: resolvedAssignee.assignee,
         project: req.project._id,
         task: req.task._id,
+        event: "task_assigned",
         message: `Вам назначена задача в проекте «${req.project.name}»`
       });
     }
@@ -884,6 +886,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       user: req.task.creator,
       project: req.project._id,
       task: req.task._id,
+      event: "task_review",
       message: `Задача «${req.task.description}» ожидает проверки`
     });
   }
@@ -893,6 +896,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       user: req.task.assignee,
       project: req.project._id,
       task: req.task._id,
+      event: "task_closed",
       message: `Задача «${req.task.description}» закрыта`
     });
   }
@@ -902,6 +906,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       user: req.task.assignee,
       project: req.project._id,
       task: req.task._id,
+      event: "task_returned",
       message: `Задача «${req.task.description}» возвращена на доработку`
     });
   }
@@ -913,6 +918,7 @@ tasksRouter.patch("/:taskId", loadTask, async (req, res) => {
       user: recipientId,
       project: req.project._id,
       task: req.task._id,
+      event: "task_cancelled",
       message: `Задача «${req.task.description}» отменена`
     })));
   }
@@ -947,6 +953,7 @@ tasksRouter.post("/:taskId/comments", loadTask, async (req, res) => {
         user: recipientId,
         project: req.project._id,
         task: req.task._id,
+        event: "task_comment",
         message: `Новый комментарий в задаче «${req.task.description}»`
       })
     )

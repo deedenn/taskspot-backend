@@ -1,6 +1,6 @@
 import net from "node:net";
 import nodemailer from "nodemailer";
-import { enqueueEmail, safeEmailError } from "./emailQueue.js";
+import { enqueueEmail, normalizeSingleEmailRecipient, safeEmailError } from "./emailQueue.js";
 
 const EMAIL_LOG_PREFIX = "[taskspot:email]";
 
@@ -159,6 +159,8 @@ function escapeHtml(value) {
 const sendMail = enqueueEmail;
 
 export async function deliverMail({ to, subject, text, html, messageId }) {
+  const recipient = normalizeSingleEmailRecipient(to);
+  if (!recipient) throw Object.assign(new Error("Email recipient is invalid"), { code: "EMAIL_RECIPIENT_INVALID" });
   const readiness = smtpReadiness();
 
   if (readiness.missing.length) {
@@ -192,13 +194,14 @@ export async function deliverMail({ to, subject, text, html, messageId }) {
       transporter = nodemailer.createTransport(options);
       const info = await transporter.sendMail({
         from: process.env.SMTP_FROM,
-        to,
+        to: recipient,
         subject,
         text,
         html,
         messageId
       });
-      if (!info.accepted?.length) {
+      const accepted = (info.accepted || []).map(normalizeSingleEmailRecipient).filter(Boolean);
+      if (accepted.length !== 1 || accepted[0] !== recipient) {
         throw Object.assign(new Error("Recipient rejected"), { code: "EENVELOPE", responseCode: 550 });
       }
 

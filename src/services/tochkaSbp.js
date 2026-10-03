@@ -12,6 +12,7 @@ let publicKeyCachedAt = 0;
 function configuration() {
   const configuredAccountId = process.env.TOCHKA_ACCOUNT_ID?.trim() || "";
   const bankCode = process.env.TOCHKA_BIC?.trim() || process.env.TOCHKA_BANK_CODE?.trim() || "";
+  const [accountCodeFromId, bankCodeFromId = ""] = configuredAccountId.split("/");
   return {
     apiUrl: (process.env.TOCHKA_API_URL || DEFAULT_API_URL).replace(/\/$/, ""),
     token: process.env.TOCHKA_JWT_TOKEN?.trim() || "",
@@ -20,6 +21,8 @@ function configuration() {
     accountId: configuredAccountId && !configuredAccountId.includes("/") && bankCode
       ? `${configuredAccountId}/${bankCode}`
       : configuredAccountId,
+    accountCode: accountCodeFromId,
+    bankCode: bankCode || bankCodeFromId,
     publicKeyUrl: process.env.TOCHKA_WEBHOOK_PUBLIC_KEY_URL?.trim() || DEFAULT_PUBLIC_KEY_URL,
     publicKey: process.env.TOCHKA_WEBHOOK_PUBLIC_KEY?.replace(/\\n/g, "\n").trim() || ""
   };
@@ -166,6 +169,71 @@ export async function getQrPaymentStatuses(qrcIds, { fetchImpl = fetch } = {}) {
   })) : [];
 }
 
+function refundAmount(amountKopecks) {
+  return (amountKopecks / 100).toFixed(2);
+}
+
+function normalizeRefundResponse(response) {
+  const data = unwrapResponse(response);
+  return {
+    requestId: String(data?.requestId || ""),
+    status: String(data?.status || "")
+  };
+}
+
+export async function startRefund({ order, amountKopecks, reason = "", fetchImpl = fetch }) {
+  const config = configuration();
+  if (!config.accountCode || !config.bankCode) {
+    throw integrationError("Для возврата не настроены счёт и БИК", {
+      statusCode: 503,
+      code: "TOCHKA_REFUND_ACCOUNT_MISSING"
+    });
+  }
+  if (!order?.payment?.providerPaymentId || (!order.payment.refTransactionId && !order.payment.operationId)) {
+    throw integrationError("У платежа нет идентификаторов для возврата", {
+      statusCode: 409,
+      code: "TOCHKA_REFUND_REFERENCE_MISSING"
+    });
+  }
+
+  const purpose = (reason?.trim() || `Возврат оплаты доступа к Taskspot. Заказ ${order._id}. Без НДС`).slice(0, 140);
+  const response = await request("/sbp/v1.0/refund", {
+    method: "POST",
+    fetchImpl,
+    body: {
+      Data: {
+        bankCode: config.bankCode,
+        accountCode: config.accountCode,
+        amount: refundAmount(amountKopecks),
+        currency: "RUB",
+        qrcId: order.payment.providerPaymentId,
+        purpose,
+        ...(order.payment.refTransactionId
+          ? { refTransactionId: order.payment.refTransactionId }
+          : { trxId: order.payment.operationId })
+      }
+    }
+  });
+  const result = normalizeRefundResponse(response);
+  if (!result.requestId || !result.status) {
+    throw integrationError("Банк Точка вернул неполные данные возврата", {
+      code: "TOCHKA_INVALID_REFUND_RESPONSE"
+    });
+  }
+  return result;
+}
+
+export async function getRefundStatus(requestId, { fetchImpl = fetch } = {}) {
+  if (!requestId) {
+    throw integrationError("Не задан идентификатор возврата", {
+      statusCode: 400,
+      code: "TOCHKA_REFUND_ID_MISSING"
+    });
+  }
+  const response = await request(`/sbp/v1.0/refund/${encodeURIComponent(requestId)}`, { fetchImpl });
+  return normalizeRefundResponse(response);
+}
+
 export async function getWebhookConfiguration({ fetchImpl = fetch } = {}) {
   const config = configuration();
   if (!config.clientId) {
@@ -279,7 +347,8 @@ export function normalizeIncomingPayment(payload) {
     merchantId: String(data?.merchantId || payload?.merchantId || ""),
     operationId: String(data?.operationId || payload?.operationId || ""),
     refTransactionId: String(data?.refTransactionId || payload?.refTransactionId || ""),
-    amountRubles: String(data?.amount || payload?.amount || "")
+    amountRubles: String(data?.amount || payload?.amount || ""),
+    purpose: String(data?.purpose || payload?.purpose || "")
   };
 }
 

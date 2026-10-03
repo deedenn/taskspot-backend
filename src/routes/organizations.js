@@ -10,7 +10,8 @@ import {
   confirmMockPayment,
   createPaymentOrder,
   reconcileTochkaPaymentOrder,
-  subscriptionPayload
+  subscriptionPayload,
+  synchronizeOrganizationSubscription
 } from "../services/subscriptions.js";
 
 export const organizationsRouter = express.Router();
@@ -58,7 +59,24 @@ function sanitizeBillingRequest(request) {
   };
 }
 
-async function organizationPayloadWithBilling(organization) {
+async function organizationPayloadWithBilling(organization, userId) {
+  const canManageBilling = isOrganizationAdmin(organization, userId);
+  if (!canManageBilling) {
+    await synchronizeOrganizationSubscription(organization);
+    const safeOrganization = organization.toObject({ versionKey: false });
+    delete safeOrganization.billingNote;
+    delete safeOrganization.planChangeReason;
+    delete safeOrganization.planSource;
+    return {
+      ...(await organizationPayload(organization, { synchronize: false })),
+      organization: safeOrganization,
+      canManageBilling: false,
+      paymentOrders: [],
+      activePaymentOrder: null,
+      billingRequests: [],
+      activeBillingRequest: null
+    };
+  }
   const subscriptionData = await subscriptionPayload(organization);
   const [payload, billingRequests] = await Promise.all([
     organizationPayload(organization, { synchronize: false }),
@@ -72,11 +90,27 @@ async function organizationPayloadWithBilling(organization) {
 
   return {
     ...payload,
-    ...subscriptionData,
+    canManageBilling: true,
+    subscription: subscriptionData.subscription,
+    paymentOrders: subscriptionData.paymentOrders.map(paymentOrderPayload),
+    activePaymentOrder: paymentOrderPayload(subscriptionData.activePaymentOrder),
     billingRequests: billingRequests.map(sanitizeBillingRequest),
     activeBillingRequest: sanitizeBillingRequest(
       billingRequests.find((request) => request.status === "pending") || billingRequests[0]
     )
+  };
+}
+
+function publicPayment(payment) {
+  if (!payment) return null;
+  return {
+    provider: payment.provider,
+    status: payment.status,
+    qrImage: payment.qrImage,
+    paymentUrl: payment.paymentUrl,
+    expiresAt: payment.expiresAt,
+    succeededAt: payment.succeededAt,
+    creationErrorCode: payment.creationErrorCode
   };
 }
 
@@ -97,7 +131,8 @@ function paymentOrderPayload(order) {
     expiresAt: order.expiresAt,
     paidAt: order.paidAt,
     cancelledAt: order.cancelledAt,
-    payment: order.payment,
+    refundedAmountKopecks: order.refundedAmountKopecks || 0,
+    payment: publicPayment(order.payment),
     fiscalization: order.fiscalization ? {
       status: order.fiscalization.status,
       receiptUrl: order.fiscalization.receiptUrl,
@@ -113,7 +148,7 @@ organizationsRouter.get("/", asyncRoute(async (req, res) => {
   const organizations = await Organization.find({ "members.user": req.user._id })
     .populate("members.user", "name lastName email")
     .sort({ updatedAt: -1 });
-  const payloads = await Promise.all(organizations.map(organizationPayloadWithBilling));
+  const payloads = await Promise.all(organizations.map((organization) => organizationPayloadWithBilling(organization, req.user._id)));
 
   res.json({
     organizations: payloads,
@@ -157,7 +192,6 @@ organizationsRouter.patch("/:organizationId", asyncRoute(async (req, res) => {
   if (!organization || !memberEntry(organization, req.user._id)) {
     return res.status(404).json({ message: "Organization not found" });
   }
-
   const member = memberEntry(organization, req.user._id);
   if (!["owner", "admin"].includes(member.role)) {
     return res.status(403).json({ message: "Organization admin role is required" });
@@ -254,13 +288,16 @@ organizationsRouter.post("/:organizationId/payment-orders", asyncRoute(async (re
     userId: req.user._id,
     targetPlan: req.body.plan,
     periodMonths: Number(req.body.periodMonths),
-    idempotencyKey: req.body.idempotencyKey
+    idempotencyKey: req.body.idempotencyKey,
+    receiptEmail: req.user.email
   });
 
   res.status(201).json({
     paymentOrder: paymentOrderPayload(order),
     testMode: order.payment.provider === "mock",
-    message: order.payment.provider === "mock"
+    message: order.payment.status === "creation_unknown"
+      ? "Банк не подтвердил создание QR. Повторный запрос заблокирован до истечения заказа."
+      : order.payment.provider === "mock"
       ? "Тестовый платёж создан. Подтвердите оплату, чтобы активировать тариф."
       : "QR-код создан. Тариф активируется автоматически после подтверждения оплаты банком."
   });
@@ -270,6 +307,9 @@ organizationsRouter.get("/:organizationId/payment-orders/:orderId", asyncRoute(a
   const organization = await Organization.findById(req.params.organizationId);
   if (!organization || !memberEntry(organization, req.user._id)) {
     return res.status(404).json({ message: "Компания не найдена" });
+  }
+  if (!isOrganizationAdmin(organization, req.user._id)) {
+    return res.status(403).json({ message: "История оплаты доступна только владельцу и администраторам компании" });
   }
   let order = await PaymentOrder.findOne({
     _id: req.params.orderId,
@@ -325,6 +365,17 @@ organizationsRouter.post("/:organizationId/payment-orders/:orderId/cancel", asyn
 
   if (!isOrganizationAdmin(organization, req.user._id)) {
     return res.status(403).json({ message: "Отменить платёж может владелец или администратор компании" });
+  }
+
+  const existingOrder = await PaymentOrder.findOne({
+    _id: req.params.orderId,
+    organization: organization._id
+  }).select("payment.provider status isOpen");
+  if (!existingOrder) return res.status(404).json({ message: "Платёж не найден" });
+  if (existingOrder.payment.provider !== "mock") {
+    return res.status(409).json({
+      message: "Боевой QR-код нельзя отменить локально. Закройте окно оплаты — QR автоматически истечёт."
+    });
   }
 
   const order = await cancelMockPayment({

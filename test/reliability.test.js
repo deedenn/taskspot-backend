@@ -46,7 +46,8 @@ test("SMTP retry policy retries temporary errors but not bad passwords or reject
 test("email worker records acceptance, retry and permanent failure without logging message contents", async () => {
   for (const scenario of ["accepted", "temporary", "permanent", "exhausted", "expired"]) {
     const job = { _id: "job", messageId: "<stable@taskspot.ru>", attempts: scenario === "exhausted" ? 20 : 1,
-      mail: { to: "test@example.com", text: "secret" }, context: scenario === "expired" ? { kind: "verification" } : {} };
+      mail: { to: "test@example.com", subject: "Test", text: "secret" },
+      context: { kind: "verification", userId: "user", tokenHash: "token", dedupeKey: `test-${scenario}` } };
     let updated;
     let sends = 0;
     mock.method(EmailJob, "findOneAndUpdate", (filter, update, options) => {
@@ -55,7 +56,7 @@ test("email worker records acceptance, retry and permanent failure without loggi
       return Promise.resolve(updated);
     });
     mock.method(EmailJob, "updateOne", async () => ({}));
-    mock.method(User, "exists", async () => null);
+    mock.method(User, "exists", async () => scenario === "expired" ? null : { _id: "user" });
     mock.method(User, "updateOne", async () => ({}));
     try {
       await processEmailJob({ now: new Date("2026-01-01Z"), send: async (mail) => {

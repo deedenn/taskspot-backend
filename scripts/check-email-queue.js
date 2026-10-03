@@ -14,7 +14,10 @@ try {
   if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is required");
   await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000, autoIndex: false, autoCreate: false });
   const now = new Date();
-  const counts = await EmailJob.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]);
+  const [counts, kinds] = await Promise.all([
+    EmailJob.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+    EmailJob.aggregate([{ $group: { _id: { kind: "$context.kind", status: "$status" }, count: { $sum: 1 } } }])
+  ]);
   const recentFailures = await EmailJob.find({ status: "failed" })
     .select("_id attempts lastErrorCode lastAttemptAt").sort({ updatedAt: -1 }).limit(20).lean();
   const oldestQueued = await EmailJob.findOne({ status: "queued" }).select("_id createdAt nextAttemptAt attempts").sort({ createdAt: 1 }).lean();
@@ -23,6 +26,8 @@ try {
     workersEnabled: process.env.BACKGROUND_WORKERS_ENABLED !== "false",
     maxAttempts: Math.max(1, Math.min(20, Number(process.env.EMAIL_MAX_ATTEMPTS) || 8)),
     counts: Object.fromEntries(counts.map((row) => [row._id, row.count])),
+    kinds: kinds.map((row) => ({ kind: row._id.kind || "unknown", status: row._id.status, count: row.count })),
+    privacyRejected: await EmailJob.countDocuments({ lastErrorCode: "EMAIL_PRIVACY_REJECTED" }),
     expiredLeases: await EmailJob.countDocuments({ status: "processing", leaseUntil: { $lte: now } }),
     unsynced: await EmailJob.countDocuments({ statusSynced: false, status: { $ne: "processing" } }),
     pendingUserIntents: await User.countDocuments({ "emailOutbox.key": { $exists: true } }),

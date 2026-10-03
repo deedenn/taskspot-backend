@@ -404,6 +404,22 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
   }
 });
 
+authRouter.patch("/email-preferences", requireAuth, async (req, res) => {
+  try {
+    const keys = ["taskUpdates", "comments", "reminders"];
+    const preferences = req.body?.emailPreferences;
+    if (!preferences || keys.some((key) => typeof preferences[key] !== "boolean") ||
+        Object.keys(preferences).some((key) => !keys.includes(key))) {
+      return res.status(400).json({ message: "Некорректные настройки email-уведомлений" });
+    }
+    req.user.emailPreferences = Object.fromEntries(keys.map((key) => [key, preferences[key]]));
+    await req.user.save();
+    res.json({ user: req.user });
+  } catch {
+    res.status(500).json({ message: "Не удалось сохранить настройки email-уведомлений" });
+  }
+});
+
 authRouter.patch("/password", requireAuth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;

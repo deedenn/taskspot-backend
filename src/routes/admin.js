@@ -2,6 +2,7 @@ import express from "express";
 import { requireSuperAdmin } from "../middleware/superAdmin.js";
 import { BillingRequest } from "../models/BillingRequest.js";
 import { PaymentOrder } from "../models/PaymentOrder.js";
+import { PaymentRefund } from "../models/PaymentRefund.js";
 import { Organization } from "../models/Organization.js";
 import { Project } from "../models/Project.js";
 import { Task } from "../models/Task.js";
@@ -9,7 +10,11 @@ import { User } from "../models/User.js";
 import { billingIntegrationPayload } from "../services/billingProviders.js";
 import { checkEmailTransport, emailRuntimeConfig } from "../services/email.js";
 import { PLANS } from "../services/plans.js";
-import { addCalendarMonths, applyManualSubscriptionChange } from "../services/subscriptions.js";
+import {
+  addCalendarMonths,
+  applyManualSubscriptionChange,
+  requestPaymentRefund
+} from "../services/subscriptions.js";
 import { overdueTaskFilter } from "../services/taskDeadline.js";
 import { dateKey } from "../services/taskSchedule.js";
 import { EmailJob } from "../models/EmailJob.js";
@@ -114,12 +119,19 @@ async function attachUserPlans(users) {
 adminRouter.use(requireSuperAdmin);
 
 adminRouter.get("/email/queue", asyncRoute(async (req, res) => {
-  const [counts, jobs] = await Promise.all([
+  const [counts, jobs, kinds, privacyRejected] = await Promise.all([
     EmailJob.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
     EmailJob.find().select("status attempts lastAttemptAt nextAttemptAt acceptedAt messageId lastError lastErrorCode")
-      .sort({ updatedAt: -1 }).limit(50).lean()
+      .sort({ updatedAt: -1 }).limit(50).lean(),
+    EmailJob.aggregate([{ $group: { _id: { kind: "$context.kind", status: "$status" }, count: { $sum: 1 } } }]),
+    EmailJob.countDocuments({ lastErrorCode: "EMAIL_PRIVACY_REJECTED" })
   ]);
-  res.json({ counts: Object.fromEntries(counts.map((row) => [row._id, row.count])), jobs });
+  res.json({
+    counts: Object.fromEntries(counts.map((row) => [row._id, row.count])),
+    kinds: kinds.map((row) => ({ kind: row._id.kind || "unknown", status: row._id.status, count: row.count })),
+    privacyRejected,
+    jobs
+  });
 }));
 
 adminRouter.post("/email/queue/:jobId/retry", asyncRoute(async (req, res) => {
@@ -180,6 +192,9 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     paymentOrdersByStatus,
     paymentRevenueAllTime,
     paymentRevenueInPeriod,
+    refundAmountAllTime,
+    refundAmountInPeriod,
+    refundsByStatus,
     fiscalizationByStatus,
     totalProjects,
     newProjects,
@@ -194,6 +209,7 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     completedTasks,
     previousCompletedTasks,
     emailQueueByStatus,
+    emailPrivacyRejected,
     serviceHttpMetrics,
     recentUsers
   ] = await Promise.all([
@@ -239,15 +255,24 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       { $group: { _id: "$status", count: { $sum: 1 } } }
     ]),
     PaymentOrder.aggregate([
-      { $match: { status: "paid", paidAt: { $lte: now }, amountKopecks: { $gt: 0 } } },
+      { $match: { status: { $in: ["paid", "partially_refunded", "refunded"] }, paidAt: { $lte: now }, amountKopecks: { $gt: 0 } } },
       { $group: { _id: null, amountKopecks: { $sum: "$amountKopecks" }, count: { $sum: 1 } } }
     ]),
     PaymentOrder.aggregate([
-      { $match: { status: "paid", paidAt: { $gte: since, $lt: now }, amountKopecks: { $gt: 0 } } },
+      { $match: { status: { $in: ["paid", "partially_refunded", "refunded"] }, paidAt: { $gte: since, $lt: now }, amountKopecks: { $gt: 0 } } },
       { $group: { _id: null, amountKopecks: { $sum: "$amountKopecks" }, count: { $sum: 1 } } }
     ]),
+    PaymentRefund.aggregate([
+      { $match: { status: "succeeded", completedAt: { $lte: now } } },
+      { $group: { _id: null, amountKopecks: { $sum: "$amountKopecks" } } }
+    ]),
+    PaymentRefund.aggregate([
+      { $match: { status: "succeeded", completedAt: { $gte: since, $lt: now } } },
+      { $group: { _id: null, amountKopecks: { $sum: "$amountKopecks" } } }
+    ]),
+    PaymentRefund.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
     PaymentOrder.aggregate([
-      { $match: { status: "paid" } },
+      { $match: { status: { $in: ["paid", "partially_refunded", "refunded"] } } },
       { $group: { _id: "$fiscalization.status", count: { $sum: 1 } } }
     ]),
     Project.countDocuments(),
@@ -263,6 +288,7 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     Task.countDocuments({ activities: { $elemMatch: { action: "status_changed", to: "closed", createdAt: { $gte: since, $lt: now } } } }),
     Task.countDocuments({ activities: { $elemMatch: { action: "status_changed", to: "closed", createdAt: { $gte: previousSince, $lt: since } } } }),
     EmailJob.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+    EmailJob.countDocuments({ lastErrorCode: "EMAIL_PRIVACY_REJECTED", updatedAt: { $gte: since, $lt: now } }),
     ServiceMetric.aggregate([
       { $match: { bucket: { $gte: new Date(now.getTime() - 24 * 60 * 60 * 1000), $lte: now } } },
       { $group: {
@@ -307,15 +333,22 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
     .filter((item) => item.plan !== "free")
     .reduce((sum, item) => sum + item.activeOrganizations, 0);
   const paymentStatuses = countByKey(paymentOrdersByStatus);
+  const refundStatuses = countByKey(refundsByStatus);
   const fiscalStatuses = countByKey(fiscalizationByStatus);
   const emailStatuses = countByKey(emailQueueByStatus);
-  const completedPaymentAttempts = ["paid", "failed", "expired", "cancelled", "refunded"]
+  const completedPaymentAttempts = ["paid", "partially_refunded", "failed", "expired", "cancelled", "refunded"]
     .reduce((sum, status) => sum + (paymentStatuses[status] || 0), 0);
-  const paidPaymentOrdersInPeriod = paymentStatuses.paid || 0;
-  const paymentRevenuePeriod = (paymentRevenueInPeriod[0]?.amountKopecks || 0) / 100;
+  const paidPaymentOrdersInPeriod = (paymentStatuses.paid || 0)
+    + (paymentStatuses.partially_refunded || 0)
+    + (paymentStatuses.refunded || 0);
+  const paymentRevenuePeriod = (
+    (paymentRevenueInPeriod[0]?.amountKopecks || 0) - (refundAmountInPeriod[0]?.amountKopecks || 0)
+  ) / 100;
   const manualRevenuePeriod = manualRevenueInPeriod[0]?.amount || 0;
   const receivedInPeriod = paymentRevenuePeriod + manualRevenuePeriod;
-  const receivedAllTime = (paymentRevenueAllTime[0]?.amountKopecks || 0) / 100 + (manualRevenueAllTime[0]?.amount || 0);
+  const receivedAllTime = (
+    (paymentRevenueAllTime[0]?.amountKopecks || 0) - (refundAmountAllTime[0]?.amountKopecks || 0)
+  ) / 100 + (manualRevenueAllTime[0]?.amount || 0);
   const paymentCountInPeriod = (paymentRevenueInPeriod[0]?.count || 0) + (manualRevenueInPeriod[0]?.count || 0);
   const billingIntegration = billingIntegrationPayload();
   const httpMetrics = serviceHttpMetrics[0] || {};
@@ -323,7 +356,12 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
   const serverErrorRate = httpMetrics.requests
     ? Math.round(httpMetrics.serverErrors / httpMetrics.requests * 1000) / 10
     : 0;
-  const operationProblems = (fiscalStatuses.failed || 0) + (emailStatuses.failed || 0) + (httpMetrics.serverErrors || 0);
+  const operationProblems = (fiscalStatuses.failed || 0)
+    + (refundStatuses.failed || 0)
+    + (refundStatuses.unknown || 0)
+    + (emailStatuses.failed || 0)
+    + emailPrivacyRejected
+    + (httpMetrics.serverErrors || 0);
 
   res.json({
     periodDays,
@@ -372,6 +410,9 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       failedPaymentOrdersInPeriod: (paymentStatuses.failed || 0) + (paymentStatuses.expired || 0),
       fiscalizationPending: fiscalStatuses.pending || 0,
       fiscalizationFailed: fiscalStatuses.failed || 0,
+      refundPending: refundStatuses.pending || 0,
+      refundUnknown: refundStatuses.unknown || 0,
+      refundFailed: refundStatuses.failed || 0,
       integration: billingIntegration
     },
     projects: {
@@ -399,6 +440,7 @@ adminRouter.get("/overview", asyncRoute(async (req, res) => {
       billingReady: billingIntegration.ready,
       emailQueued: emailStatuses.queued || 0,
       emailFailed: emailStatuses.failed || 0,
+      emailPrivacyRejected,
       fiscalizationPending: fiscalStatuses.pending || 0,
       fiscalizationFailed: fiscalStatuses.failed || 0,
       paymentOrdersAwaiting: pendingPaymentOrders,
@@ -444,7 +486,7 @@ adminRouter.get("/payment-orders", asyncRoute(async (req, res) => {
   const filter = {};
 
   if (status !== "all") {
-    if (!["awaiting_payment", "paid", "expired", "cancelled", "failed", "refunded"].includes(status)) {
+    if (!["awaiting_payment", "paid", "partially_refunded", "expired", "cancelled", "failed", "refunded"].includes(status)) {
       return res.status(400).json({ message: "Некорректный статус платежа" });
     }
     filter.status = status;
@@ -457,7 +499,50 @@ adminRouter.get("/payment-orders", asyncRoute(async (req, res) => {
     .populate("requestedBy", "name lastName email")
     .lean();
 
-  res.json({ paymentOrders, billing: billingIntegrationPayload() });
+  const refunds = await PaymentRefund.find({
+    paymentOrder: { $in: paymentOrders.map((order) => order._id) }
+  })
+    .sort({ createdAt: -1 })
+    .populate("requestedBy", "name lastName email")
+    .lean();
+  const refundsByOrder = new Map();
+  for (const refund of refunds) {
+    const orderId = refund.paymentOrder.toString();
+    const current = refundsByOrder.get(orderId) || [];
+    current.push(refund);
+    refundsByOrder.set(orderId, current);
+  }
+
+  res.json({
+    paymentOrders: paymentOrders.map((order) => ({
+      ...order,
+      refunds: refundsByOrder.get(order._id.toString()) || []
+    })),
+    billing: billingIntegrationPayload()
+  });
+}));
+
+adminRouter.post("/payment-orders/:orderId/refunds", asyncRoute(async (req, res) => {
+  const refund = await requestPaymentRefund({
+    orderId: req.params.orderId,
+    amountKopecks: req.body.amountKopecks,
+    actorId: req.user._id,
+    reason: req.body.reason,
+    idempotencyKey: req.body.idempotencyKey
+  });
+  await refund.populate("requestedBy", "name lastName email");
+
+  const statusCode = ["pending", "unknown"].includes(refund.status) ? 202 : 201;
+  res.status(statusCode).json({
+    refund,
+    message: refund.status === "succeeded"
+      ? "Возврат выполнен, чек возврата формируется"
+      : refund.status === "pending"
+        ? "Возврат принят банком и ожидает завершения"
+        : refund.status === "unknown"
+          ? "Статус запроса неизвестен. Повторный возврат заблокирован до ручной сверки с банком."
+          : "Банк отклонил возврат"
+  });
 }));
 
 adminRouter.patch("/billing-requests/:requestId", asyncRoute(async (req, res) => {
