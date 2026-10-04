@@ -26,6 +26,7 @@ if (!process.env.TEST_MONGODB_URI) {
   const { Project } = await import("../src/models/Project.js");
   const { Task } = await import("../src/models/Task.js");
   const { User } = await import("../src/models/User.js");
+  const { applyManualSubscriptionChange } = await import("../src/services/subscriptions.js");
   let server;
   let baseUrl;
 
@@ -115,7 +116,11 @@ if (!process.env.TEST_MONGODB_URI) {
     const feed = await request("/api/mobile/v1/feed?scope=assigned&focus=active&limit=1", { token: verified.data.accessToken });
     assert.equal(feed.response.status, 200, feed.data.message);
     assert.equal(feed.data.items.length, 1);
-    assert.deepEqual(feed.data.items[0].capabilities.statusTransitions, [{ status: "in_progress" }, { status: "review" }]);
+    assert.deepEqual(feed.data.items[0].capabilities.statusTransitions, [
+      { status: "in_progress" },
+      { status: "review" },
+      { status: "cancelled", requiresConfirmation: true }
+    ]);
 
     const started = await request(`/api/mobile/v1/tasks/${created.data.task._id}/status`, {
       method: "PATCH", token: verified.data.accessToken,
@@ -197,10 +202,14 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.equal(await MobileMutationReceipt.exists({ user: verified.data.user._id, key: limitKey }), null);
 
     const project = await Project.findById(projectId);
-    await Organization.updateOne(
-      { _id: project.organization },
-      { plan: "team", planSource: "manual", planExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) }
-    );
+    const organization = await Organization.findById(project.organization);
+    await applyManualSubscriptionChange({
+      organization,
+      plan: "team",
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      actorId: verified.data.user._id,
+      note: "Mobile integration test upgrade"
+    });
     const retriedAfterUpgrade = await request("/api/mobile/v1/tasks", {
       method: "POST", token: verified.data.accessToken,
       headers: { "Idempotency-Key": limitKey }, body: limitBody

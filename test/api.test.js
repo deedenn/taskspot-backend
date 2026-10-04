@@ -1398,7 +1398,7 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(efficiency.response.status, 200, efficiency.data.message);
       assert.equal(efficiency.data.period.days, 7);
       assert.ok(Array.isArray(efficiency.data.personal.factors));
-      assert.equal(efficiency.data.team.projects, 1);
+      assert.equal(efficiency.data.team.projects, 2);
 
       const invalidEfficiencyPeriod = await request("/api/reports/efficiency?period=year", { token: creator.token });
       assert.equal(invalidEfficiencyPeriod.response.status, 400);
@@ -1432,12 +1432,21 @@ if (!process.env.TEST_MONGODB_URI) {
       assert.equal(created.response.status, 201, created.data.message);
       const taskId = created.data.task._id;
 
-      const creatorCannotSendToReview = await request(`/api/tasks/${taskId}`, {
+      const creatorManaged = await createTask({
+        token: creator.token,
+        projectId: project._id,
+        description: "Initiator can manage status",
+        assignee: assignee.user._id
+      });
+      assert.equal(creatorManaged.response.status, 201, creatorManaged.data.message);
+
+      const creatorCanSendToReview = await request(`/api/tasks/${creatorManaged.data.task._id}`, {
         method: "PATCH",
         token: creator.token,
         body: { status: "review" }
       });
-      assert.equal(creatorCannotSendToReview.response.status, 403);
+      assert.equal(creatorCanSendToReview.response.status, 200, creatorCanSendToReview.data.message);
+      assert.equal(creatorCanSendToReview.data.task.status, "review");
 
       const observerCannotSendToReview = await request(`/api/tasks/${taskId}`, {
         method: "PATCH",

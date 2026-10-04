@@ -151,7 +151,7 @@ reportsRouter.get("/control", asyncRoute(async (req, res) => {
     if (task.status === "closed") current.closed += 1;
     else if (task.status === "cancelled") current.cancelled += 1;
     else current.active += 1;
-    if (isOverdue(task, today)) current.overdue += 1;
+    if (isOverdue(task, now)) current.overdue += 1;
     if (["review", "done"].includes(task.status)) current.review += 1;
 
     projectMap.set(key, current);

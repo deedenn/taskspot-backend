@@ -25,7 +25,10 @@ function asyncRoute(handler) {
 }
 
 function memberEntry(organization, userId) {
-  return organization.members.find((member) => member.user.toString() === userId.toString());
+  const expectedUserId = String(userId?._id || userId || "");
+  return organization.members.find(
+    (member) => String(member.user?._id || member.user || "") === expectedUserId
+  );
 }
 
 function isOrganizationAdmin(organization, userId) {
