@@ -98,6 +98,23 @@ test("isolated API: reset replay/races, revoked JWT, admin OTP, reports ACL and 
   assert.equal((await User.findById(admin._id)).mustChangePassword, false);
   assert.equal((await request("/auth/me", null, temporaryLogin.data.token)).status, 401);
 
+  const legacyPasswordHash = await bcrypt.hash("qwerty12345", 12);
+  const beforeLegacyMigration = await User.findById(admin._id);
+  await User.updateOne({ _id: admin._id }, {
+    $set: { passwordHash: legacyPasswordHash, mustChangePassword: false },
+    $unset: { adminChallenge: "" }
+  });
+  const legacyStart = await request("/auth/login", { email: admin.email, password: "qwerty12345" });
+  assert.equal(legacyStart.status, 200);
+  assert.equal(legacyStart.data.requiresAdminCode, true);
+  const migratedLegacyAdmin = await User.findById(admin._id).select("+adminChallenge");
+  assert.equal(migratedLegacyAdmin.mustChangePassword, true);
+  assert.equal(migratedLegacyAdmin.sessionVersion, beforeLegacyMigration.sessionVersion + 1);
+  const legacyCode = migratedLegacyAdmin.adminChallenge.outbox.mail.text.match(/\d{6}/)[0];
+  const legacyLogin = await request("/auth/login/code", { challengeId: legacyStart.data.challengeId, code: legacyCode });
+  assert.equal(legacyLogin.status, 200);
+  assert.equal(legacyLogin.data.user.mustChangePassword, true);
+
   const outsider = await User.create({ name: "Outsider", email: "other@example.test", passwordHash: "unused" });
   const project = await Project.create({ name: "Shared", createdBy: outsider._id, members: [{ user: outsider._id, role: "admin" }, { user: user._id, role: "member" }] });
   const hidden = await Project.create({ name: "Private", createdBy: outsider._id, members: [{ user: outsider._id, role: "admin" }] });

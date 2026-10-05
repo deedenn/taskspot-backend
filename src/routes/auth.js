@@ -335,7 +335,7 @@ authRouter.post("/login", authLimiter, async (req, res) => {
     const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
     if (!normalizedEmail || typeof password !== "string" || Buffer.byteLength(password, "utf8") > 72) return res.status(401).json({ message: "Invalid email or password" });
-    const user = await User.findOne({ email: normalizedEmail });
+    let user = await User.findOne({ email: normalizedEmail });
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ message: "Invalid email or password" });
@@ -354,7 +354,30 @@ authRouter.post("/login", authLimiter, async (req, res) => {
     }
 
     if (user.isSuperAdmin) {
-      if (!strongPassword(password, true) && !user.mustChangePassword) return res.status(403).json({ message: "Обновите пароль администратора через серверную команду настройки" });
+      if (!strongPassword(password, true) && !user.mustChangePassword) {
+        const legacyPasswordHash = user.passwordHash;
+        user = await User.findOneAndUpdate({
+          _id: user._id,
+          passwordHash: legacyPasswordHash,
+          status: "active",
+          isSuperAdmin: true,
+          mustChangePassword: { $ne: true }
+        }, {
+          $set: { mustChangePassword: true },
+          $inc: { sessionVersion: 1 },
+          $unset: { adminChallenge: "" }
+        }, { new: true }) || await User.findOne({
+          _id: user._id,
+          passwordHash: legacyPasswordHash,
+          status: "active",
+          isSuperAdmin: true,
+          mustChangePassword: true
+        });
+
+        if (!user) {
+          return res.status(409).json({ message: "Учётные данные администратора уже изменены. Повторите вход." });
+        }
+      }
       return res.json(await startAdminChallenge(user));
     }
     user.lastLoginAt = new Date();

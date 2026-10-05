@@ -121,6 +121,11 @@ if (!process.env.TEST_MONGODB_URI) {
       { status: "review" },
       { status: "cancelled", requiresConfirmation: true }
     ]);
+    const unconfirmedCancellation = await request(`/api/mobile/v1/tasks/${created.data.task._id}/status`, {
+      method: "PATCH", token: verified.data.accessToken,
+      headers: { "Idempotency-Key": `cancel-unconfirmed-${suffix}`, "If-Match": '"0"' }, body: { status: "cancelled" }
+    });
+    assert.equal(unconfirmedCancellation.response.status, 400);
 
     const started = await request(`/api/mobile/v1/tasks/${created.data.task._id}/status`, {
       method: "PATCH", token: verified.data.accessToken,
@@ -185,6 +190,12 @@ if (!process.env.TEST_MONGODB_URI) {
     assert.equal(closed.response.status, 200, closed.data.message);
     const closedFeed = await request("/api/mobile/v1/feed?focus=closed", { token: verified.data.accessToken });
     assert.equal(closedFeed.data.items.some((item) => item._id === created.data.task._id), true);
+    const cancelled = await request(`/api/mobile/v1/tasks/${created.data.task._id}/status`, {
+      method: "PATCH", token: verified.data.accessToken,
+      headers: { "Idempotency-Key": `cancel-${suffix}`, "If-Match": '"5"' }, body: { status: "cancelled", confirmed: true }
+    });
+    assert.equal(cancelled.response.status, 200, cancelled.data.message);
+    assert.equal(cancelled.data.task.status, "cancelled");
 
     await Task.insertMany(Array.from({ length: 50 }, (_, index) => ({
       project: projectId,
