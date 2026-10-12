@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "admin:email": "node scripts/change-admin-email.js",
     "admin:setup": "node scripts/setup-admin.js",
-    "dev": "node --watch src/server.js",
+    "dev": "node src/server.js",
     "start": "node src/server.js",
     "tasks:schedule": "node scripts/check-task-schedules.js",
     "email:queue": "node scripts/check-email-queue.js",

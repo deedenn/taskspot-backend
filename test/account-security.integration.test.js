@@ -9,6 +9,7 @@ import { Project } from "../src/models/Project.js";
 import { Task } from "../src/models/Task.js";
 import { ProductEvent } from "../src/models/ProductEvent.js";
 import { setupAdmin } from "../src/services/adminSetup.js";
+import { changeAdminEmail } from "../src/services/adminEmail.js";
 import { sessionToken } from "../src/services/accountSecurity.js";
 
 test("isolated API: reset replay/races, revoked JWT, admin OTP, reports ACL and analytics dedupe", {
@@ -114,6 +115,22 @@ test("isolated API: reset replay/races, revoked JWT, admin OTP, reports ACL and 
   const legacyLogin = await request("/auth/login/code", { challengeId: legacyStart.data.challengeId, code: legacyCode });
   assert.equal(legacyLogin.status, 200);
   assert.equal(legacyLogin.data.user.mustChangePassword, true);
+
+  const emailChange = await changeAdminEmail({
+    currentEmail: admin.email,
+    email: "new-admin@example.test"
+  });
+  assert.deepEqual(emailChange, { updated: true });
+  const emailChangedLogin = await request("/auth/login", {
+    email: "new-admin@example.test",
+    password: "qwerty12345"
+  });
+  assert.equal(emailChangedLogin.status, 200);
+  const emailChangedAdmin = await User.findById(admin._id).select("+adminChallenge");
+  assert.equal(emailChangedAdmin.adminChallenge.outbox.mail.to, "new-admin@example.test");
+  await request("/auth/password/forgot", { email: "new-admin@example.test" });
+  const resetForChangedEmail = await User.findById(admin._id).select("+passwordReset");
+  assert.equal(resetForChangedEmail.passwordReset.outbox.mail.to, "new-admin@example.test");
 
   const outsider = await User.create({ name: "Outsider", email: "other@example.test", passwordHash: "unused" });
   const project = await Project.create({ name: "Shared", createdBy: outsider._id, members: [{ user: outsider._id, role: "admin" }, { user: user._id, role: "member" }] });
