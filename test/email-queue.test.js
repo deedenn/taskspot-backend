@@ -117,6 +117,26 @@ test("temporary SMTP errors retry after completion, not after claim time", async
   assert.equal(worker.saved().nextAttemptAt.toISOString(), "2026-09-01T10:04:00.000Z");
 });
 
+test("email worker reads fields from a Mongoose email subdocument", async (t) => {
+  const document = new EmailJob({
+    dedupeKey: "mongoose-mail",
+    messageId: "<mongoose-mail@taskspot.ru>",
+    mail: { to: "test@example.com", subject: "Subject", text: "Text", html: "<p>Text</p>" },
+    context: verificationContext({ dedupeKey: "mongoose-mail" })
+  });
+  const worker = mockWorker(t, { messageId: document.messageId, mail: document.mail });
+  let delivered;
+  await processEmailJob({ now, send: async (mail) => { delivered = mail; } });
+  assert.deepEqual(delivered, {
+    to: "test@example.com",
+    subject: "Subject",
+    text: "Text",
+    html: "<p>Text</p>",
+    messageId: "<mongoose-mail@taskspot.ru>"
+  });
+  assert.equal(worker.saved().status, "accepted");
+});
+
 test("database relevance failures do not consume SMTP attempts or discard the job", async (t) => {
   const worker = mockWorker(t);
   User.exists.mock.mockImplementation(async () => { throw new Error("database unavailable, secret"); });

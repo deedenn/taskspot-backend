@@ -151,7 +151,13 @@ export async function processEmailJob({ now = new Date(), send = deliverMail, cl
       changes = { status: "failed", lastError: "Исчерпаны попытки отправки. Запросите новое письмо.", lastErrorCode: "ATTEMPTS_EXHAUSTED" };
     } else {
       stage = "smtp";
-      await send({ ...job.mail, messageId: job.messageId });
+      await send({
+        to: job.mail.to,
+        subject: job.mail.subject,
+        text: job.mail.text,
+        html: job.mail.html,
+        messageId: job.messageId
+      });
       changes = { status: "accepted", acceptedAt: clock(), lastError: "", lastErrorCode: "" };
     }
   } catch (error) {
